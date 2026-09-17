@@ -1,0 +1,23 @@
+# IDE files (regenerated from the .uproject)
+.vs/
+.vscode/
+.idea/
+*.sln
+*.slnx
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
+*.xcodeproj
+*.xcworkspace
+
+# Unreal Engine generated / cache folders
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+Plugins/*/Binaries/
+Plugins/*/Intermediate/
+
+# Crash dumps
+*.dmp

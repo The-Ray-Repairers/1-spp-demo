@@ -1,0 +1,53 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+using UnrealBuildTool;
+
+public class SL_Test : ModuleRules
+{
+	public SL_Test(ReadOnlyTargetRules Target) : base(Target)
+	{
+		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+
+		PublicDependencyModuleNames.AddRange(new string[] {
+			"Core",
+			"CoreUObject",
+			"Engine",
+			"InputCore",
+			"EnhancedInput",
+			"AIModule",
+			"StateTreeModule",
+			"GameplayStateTreeModule",
+			"UMG",
+			"Slate"
+		});
+
+		PrivateDependencyModuleNames.AddRange(new string[] {
+			"RenderCore"
+		});
+
+		PublicIncludePaths.AddRange(new string[] {
+			"SL_Test",
+			"SL_Test/Variant_Platforming",
+			"SL_Test/Variant_Platforming/Animation",
+			"SL_Test/Variant_Combat",
+			"SL_Test/Variant_Combat/AI",
+			"SL_Test/Variant_Combat/Animation",
+			"SL_Test/Variant_Combat/Gameplay",
+			"SL_Test/Variant_Combat/Interfaces",
+			"SL_Test/Variant_Combat/UI",
+			"SL_Test/Variant_SideScrolling",
+			"SL_Test/Variant_SideScrolling/AI",
+			"SL_Test/Variant_SideScrolling/Gameplay",
+			"SL_Test/Variant_SideScrolling/Interfaces",
+			"SL_Test/Variant_SideScrolling/UI"
+		});
+
+		// Uncomment if you are using Slate UI
+		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
+
+		// Uncomment if you are using online features
+		// PrivateDependencyModuleNames.Add("OnlineSubsystem");
+
+		// To include OnlineSubsystemSteam, add it to the plugins section in your uproject file with the Enabled attribute set to true
+	}
+}
