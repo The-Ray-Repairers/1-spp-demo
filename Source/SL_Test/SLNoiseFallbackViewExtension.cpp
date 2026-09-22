@@ -20,6 +20,8 @@ static TAutoConsoleVariable<float> CVarSLNoiseFallbackScale(
 	TEXT("Applies on the render thread — changes take effect the next frame."),
 	ECVF_RenderThreadSafe);
 
+extern TAutoConsoleVariable<int32> CVarSLPathTracerTargetSPP;
+
 // -----------------------------------------------------------------------
 // Bind the C++ shader class to the HLSL entry point.
 // /Project is mapped to <ProjectDir>/Shaders/ by FSL_TestModule::StartupModule().
@@ -101,6 +103,7 @@ FScreenPassTexture FSLNoiseFallbackViewExtension::ApplyNoise_RenderThread(
 	PassParameters->InputTexture    = SceneColor.Texture;
 	PassParameters->FrameIndex      = FrameNumber;
 	PassParameters->NoiseScale      = Scale;
+	PassParameters->TargetSPP       = static_cast<float>(CVarSLPathTracerTargetSPP.GetValueOnRenderThread());
 	PassParameters->RenderTargets[0] = FRenderTargetBinding(
 		OutputTexture, ERenderTargetLoadAction::ENoAction);
 

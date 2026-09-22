@@ -35,6 +35,8 @@ public:
 		SHADER_PARAMETER(uint32, FrameIndex)
 		/** Overall noise intensity (SL.NoiseFallback.Scale). */
 		SHADER_PARAMETER(float, NoiseScale)
+		/** Target samples per pixel (SL.PathTracer.TargetSPP) to emulate variance reduction. */
+		SHADER_PARAMETER(float, TargetSPP)
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()
 

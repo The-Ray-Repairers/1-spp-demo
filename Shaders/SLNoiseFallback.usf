@@ -25,6 +25,7 @@ Texture2D<float4> InputTexture;   // linear-HDR scene colour, loaded by texel
 
 uint  FrameIndex;   // View.Family->FrameNumber — drives temporal decorrelation
 float NoiseScale;   // overall noise intensity (SL.NoiseFallback.Scale, default 1.0)
+float TargetSPP;    // target samples per pixel (SL.PathTracer.TargetSPP, default 1.0)
 
 // ---------------------------------------------------------------------------
 // Wang hash — scrambles a 32-bit seed into a high-quality pseudo-random int.
@@ -74,7 +75,9 @@ void MainPS(
     float nb = StandardNormal(HashToFloat(WangHash(seed + 4u)), HashToFloat(WangHash(seed + 5u)));
 
     // Poisson shot noise: std-dev = sqrt(L) * scale.
-    float3 shotNoise = float3(nr, ng, nb) * sqrt(max(SceneColor.rgb, 0.0)) * NoiseScale;
+    // Emulating N samples reduces variance by 1/N, and thus standard deviation by 1/sqrt(N).
+    float SPPScale = 1.0f / max(sqrt(TargetSPP), 1.0f);
+    float3 shotNoise = float3(nr, ng, nb) * sqrt(max(SceneColor.rgb, 0.0)) * NoiseScale * SPPScale;
 
     // Clamp to non-negative (photon counts can't be negative); preserve alpha.
     OutColor = float4(max(SceneColor.rgb + shotNoise, 0.0), SceneColor.a);

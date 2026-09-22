@@ -24,6 +24,12 @@ static TAutoConsoleVariable<int32> CVarSLPathTracerResetEveryFrame(
 	TEXT("1: reset every frame (default)"),
 	ECVF_Default);
 
+TAutoConsoleVariable<int32> CVarSLPathTracerTargetSPP(
+	TEXT("SL.PathTracer.TargetSPP"),
+	1,
+	TEXT("Target Samples Per Pixel for the real-time path tracer or its software fallback.\n"),
+	ECVF_Default);
+
 FSLPathTracerResetViewExtension::FSLPathTracerResetViewExtension(const FAutoRegister& AutoRegister, UWorld* InWorld)
 	: FWorldSceneViewExtension(AutoRegister, InWorld)
 {
@@ -62,6 +68,8 @@ void USLPathTracerSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		return;
 	}
 
+	const int32 TargetSPP = CVarSLPathTracerTargetSPP.GetValueOnGameThread();
+
 	if (!IsRayTracingEnabled())
 	{
 		UE_LOG(LogSL_Test, Warning,
@@ -85,14 +93,20 @@ void USLPathTracerSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 				     "-- output is NOT physically-based  "));
 			GEngine->AddOnScreenDebugMessage(
 				0xA011, 3600.f, FColor::Orange,
-				TEXT("  Hardware ray tracing unavailable. "
-				     "Noise approximates 1-spp variance. "
-				     "Adjust: SL.NoiseFallback.Scale (default 1.0)  "));
+				FString::Printf(TEXT("  Hardware ray tracing unavailable. "
+				     "Noise approximates %d-spp variance. "
+				     "Adjust: SL.NoiseFallback.Scale (default 1.0)  "), TargetSPP));
 		}
 		return;
 	}
 
 	// Normal path: enable the built-in path tracer for the game viewport.
+	// Override the engine's built-in SamplesPerPixel so our CVar acts as the central control.
+	if (IConsoleVariable* EngineSPPCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.PathTracing.SamplesPerPixel")))
+	{
+		EngineSPPCVar->Set(TargetSPP, ECVF_SetByProjectSetting);
+	}
+
 	// Equivalent to the "Enable Path Tracing" Blueprint node.
 	UKismetRenderingLibrary::EnablePathTracing(true);
 }
