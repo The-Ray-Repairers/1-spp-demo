@@ -7,7 +7,7 @@
 		{
 			"Name": "SL_Test",
 			"Type": "Runtime",
-			"LoadingPhase": "Default",
+			"LoadingPhase": "PostConfigInit",
 			"AdditionalDependencies": [
 				"Engine",
 				"AIModule",

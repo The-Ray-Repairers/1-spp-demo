@@ -1,5 +1,6 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+using System.IO;
 using UnrealBuildTool;
 
 public class SL_Test : ModuleRules
@@ -22,7 +23,9 @@ public class SL_Test : ModuleRules
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] {
-			"RenderCore"
+			"RenderCore",
+			"Renderer",   // FRDGBuilder, FScreenPassTexture, AddDrawScreenPass, FPostProcessingInputs
+			"RHI",        // TStaticSamplerState, FRHICopyTextureInfo
 		});
 
 		PublicIncludePaths.AddRange(new string[] {

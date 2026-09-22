@@ -1,0 +1,81 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+//
+// SLNoiseFallback.usf
+// Injects Poisson shot noise into the linear-HDR scene colour before
+// tonemapping, approximating the per-pixel variance of a real 1-spp
+// path-traced frame.  Used by FSLNoiseFallbackViewExtension when hardware
+// ray tracing is unavailable.
+//
+// Noise model
+// -----------
+//   sigma(L) = sqrt(L) * NoiseScale
+//
+// Each channel gets an independent N(0,1) draw (Box-Muller) scaled by the
+// square-root of that channel's luminance.  This matches the Poisson shot-
+// noise statistics of a single-sample Monte Carlo estimator.
+
+#include "/Engine/Public/Platform.ush"
+
+// Top-left corner of the viewport in the full render-target texture (pixels).
+// FPixelShaderUtils::AddFullscreenPass sets SV_Position relative to (0,0) of
+// the viewport, so we add this offset to get the correct texel address.
+uint2             ViewportOffset;
+
+Texture2D<float4> InputTexture;   // linear-HDR scene colour, loaded by texel
+
+uint  FrameIndex;   // View.Family->FrameNumber — drives temporal decorrelation
+float NoiseScale;   // overall noise intensity (SL.NoiseFallback.Scale, default 1.0)
+
+// ---------------------------------------------------------------------------
+// Wang hash — scrambles a 32-bit seed into a high-quality pseudo-random int.
+// ---------------------------------------------------------------------------
+uint WangHash(uint s)
+{
+    s = (s ^ 61u) ^ (s >> 16u);
+    s *= 9u;
+    s ^= s >> 4u;
+    s *= 0x27d4eb2du;
+    s ^= s >> 15u;
+    return s;
+}
+
+// Maps a hashed uint to a float in (0, 1).  Avoids exact 0 to protect log().
+float HashToFloat(uint h)
+{
+    return (float(h & 0x00FFFFFFu) + 0.5) * (1.0 / float(0x01000000u));
+}
+
+// Box-Muller: two independent U(0,1) samples -> one N(0,1) sample.
+float StandardNormal(float u0, float u1)
+{
+    return sqrt(-2.0 * log(u0)) * cos(6.28318530718 * u1);
+}
+
+// ---------------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------------
+void MainPS(
+    float4 SvPosition : SV_Position,
+    out float4 OutColor : SV_Target0)
+{
+    // SV_Position is relative to the viewport top-left.
+    // Adding ViewportOffset gives the absolute texel coordinate in the texture.
+    int2   TexelCoord = int2(SvPosition.xy) + int2(ViewportOffset);
+    float4 SceneColor = InputTexture.Load(int3(TexelCoord, 0));
+
+    // Build a unique seed per pixel per frame using nested Wang hashes.
+    uint px   = (uint)TexelCoord.x;
+    uint py   = (uint)TexelCoord.y;
+    uint seed = WangHash(px + WangHash(py + WangHash(FrameIndex)));
+
+    // Six uniform samples -> three independent N(0,1) values, one per channel.
+    float nr = StandardNormal(HashToFloat(WangHash(seed + 0u)), HashToFloat(WangHash(seed + 1u)));
+    float ng = StandardNormal(HashToFloat(WangHash(seed + 2u)), HashToFloat(WangHash(seed + 3u)));
+    float nb = StandardNormal(HashToFloat(WangHash(seed + 4u)), HashToFloat(WangHash(seed + 5u)));
+
+    // Poisson shot noise: std-dev = sqrt(L) * scale.
+    float3 shotNoise = float3(nr, ng, nb) * sqrt(max(SceneColor.rgb, 0.0)) * NoiseScale;
+
+    // Clamp to non-negative (photon counts can't be negative); preserve alpha.
+    OutColor = float4(max(SceneColor.rgb + shotNoise, 0.0), SceneColor.a);
+}

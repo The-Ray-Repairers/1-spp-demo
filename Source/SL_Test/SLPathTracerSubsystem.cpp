@@ -47,6 +47,7 @@ void USLPathTracerSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void USLPathTracerSubsystem::Deinitialize()
 {
+	NoiseFallbackViewExtension.Reset();
 	ResetViewExtension.Reset();
 
 	Super::Deinitialize();
@@ -63,10 +64,35 @@ void USLPathTracerSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 	if (!IsRayTracingEnabled())
 	{
-		UE_LOG(LogSL_Test, Warning, TEXT("SL.PathTracer: hardware ray tracing is not available on this machine, the path tracer stays off."));
+		UE_LOG(LogSL_Test, Warning,
+			TEXT("SL.PathTracer: hardware ray tracing is not available — "
+			     "activating the software noise fallback (see SLNoiseFallbackViewExtension)."));
+
+		// Activate the software fallback: injects Poisson shot noise before the
+		// tonemapper each frame to approximate the visual appearance of a real 1-spp
+		// path-traced output.  The two on-screen messages make it unmistakable to any
+		// developer that this is NOT the physically-based solution.
+		NoiseFallbackViewExtension =
+			FSceneViewExtensions::NewExtension<FSLNoiseFallbackViewExtension>(GetWorld());
+
+		if (GEngine)
+		{
+			// Key 0xA010 / 0xA011: arbitrary stable IDs so repeated PIE sessions
+			// don't stack duplicate messages.
+			GEngine->AddOnScreenDebugMessage(
+				0xA010, 3600.f, FColor::Red,
+				TEXT("  !! SOFTWARE NOISE FALLBACK ACTIVE !! "
+				     "-- output is NOT physically-based  "));
+			GEngine->AddOnScreenDebugMessage(
+				0xA011, 3600.f, FColor::Orange,
+				TEXT("  Hardware ray tracing unavailable. "
+				     "Noise approximates 1-spp variance. "
+				     "Adjust: SL.NoiseFallback.Scale (default 1.0)  "));
+		}
 		return;
 	}
 
-	// Equivalent to the "Enable Path Tracing" Blueprint node: sets the PathTracing show flag on the game viewport.
+	// Normal path: enable the built-in path tracer for the game viewport.
+	// Equivalent to the "Enable Path Tracing" Blueprint node.
 	UKismetRenderingLibrary::EnablePathTracing(true);
 }

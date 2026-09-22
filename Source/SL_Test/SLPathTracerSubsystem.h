@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "SceneViewExtension.h"
 #include "Subsystems/WorldSubsystem.h"
+#include "SLNoiseFallbackViewExtension.h"
 #include "SLPathTracerSubsystem.generated.h"
 
 /**
@@ -39,4 +40,12 @@ public:
 
 private:
 	TSharedPtr<FSLPathTracerResetViewExtension, ESPMode::ThreadSafe> ResetViewExtension;
+
+	/**
+	 * Non-null only when hardware ray tracing is unavailable.
+	 * Injects Poisson shot noise before the tonemapper so that the viewport
+	 * visually approximates 1-spp path-traced output on machines that lack DXR.
+	 * A persistent on-screen warning is also shown whenever this is active.
+	 */
+	TSharedPtr<FSLNoiseFallbackViewExtension, ESPMode::ThreadSafe> NoiseFallbackViewExtension;
 };

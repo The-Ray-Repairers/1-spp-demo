@@ -5,11 +5,14 @@
 *.sln
 *.slnx
 *.suo
+*.db
+*.opendb
 *.user
 *.VC.db
 *.VC.opendb
 *.xcodeproj
 *.xcworkspace
+*.uproject.local
 
 # Unreal Engine generated / cache folders
 Binaries/
@@ -18,6 +21,8 @@ Intermediate/
 Saved/
 Plugins/*/Binaries/
 Plugins/*/Intermediate/
+DerivedDataCache/
+Build/
 
 # Crash dumps
 *.dmp
