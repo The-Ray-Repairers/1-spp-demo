@@ -28,6 +28,13 @@ TAutoConsoleVariable<int32> CVarSLPathTracerTargetSPP(
 	TEXT("SL.PathTracer.TargetSPP"),
 	1,
 	TEXT("Target Samples Per Pixel for the real-time path tracer or its software fallback.\n"),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* Var)
+	{
+		if (IConsoleVariable* EngineSPPCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.PathTracing.SamplesPerPixel")))
+		{
+			EngineSPPCVar->Set(Var->GetInt(), ECVF_SetByConsole);
+		}
+	}),
 	ECVF_Default);
 
 FSLPathTracerResetViewExtension::FSLPathTracerResetViewExtension(const FAutoRegister& AutoRegister, UWorld* InWorld)
@@ -104,7 +111,7 @@ void USLPathTracerSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	// Override the engine's built-in SamplesPerPixel so our CVar acts as the central control.
 	if (IConsoleVariable* EngineSPPCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.PathTracing.SamplesPerPixel")))
 	{
-		EngineSPPCVar->Set(TargetSPP, ECVF_SetByProjectSetting);
+		EngineSPPCVar->Set(TargetSPP, ECVF_SetByConsole);
 	}
 
 	// Equivalent to the "Enable Path Tracing" Blueprint node.
