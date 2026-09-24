@@ -1,8 +1,6 @@
 ## 1-SPP Demo: SL Developer Console Commands
-
-This project adds several custom CVars to control the path tracer and the software noise fallback. You can tweak these at runtime by pressing `~` (tilde) in the editor or packaged game to open the developer console.
+### This project adds several custom CVars to control the path tracer and the software noise fallback. You can tweak these at runtime by pressing `~` (tilde) in the editor or packaged game to open the developer console.
 ---
-
 ### `SL.PathTracer.AutoEnable`
 **Default:** `1`
 
@@ -40,18 +38,36 @@ Controls the overall intensity of the software noise fallback. **Note:** This is
 * Changes to this value apply on the render thread and take effect on the very next frame.
 
 ## 1-SPP Denoiser Testing Commands
-These commands are built into UE5 raytracer, and allows the user to test different types of denoisers. Before testing, make sure to run `SL.PathTracer.ResetEveryFrame 0`
+### These commands are built into UE5 raytracer, and allows the user to test different types of denoisers. Before testing, make sure to run `SL.PathTracer.ResetEveryFrame 0`
 ---
-## OIDN (spatial)
+## Enable 
+SL.PathTracer.ResetEveryFrame 0
+
+## Enable special denoiser
+```
 r.PathTracing.TemporalDenoiser 0
 r.PathTracing.SpatialDenoiser 1
 r.PathTracing.SpatialDenoiser.Type 0
-r.PathTracing.Denoiser.Name OIDN
 r.PathTracing.Denoiser 1
+```
 
-## NFOR (temporal)
+## Enable temporal denoiser
+```
 r.PathTracing.TemporalDenoiser 1
 r.PathTracing.SpatialDenoiser 0
 r.PathTracing.SpatialDenoiser.Type 1
-r.PathTracing.TemporalDenoiser.Name NFOR
 r.PathTracing.Denoiser 1
+```
+
+## Spatial Denoisers
+(Default)
+```
+r.PathTracing.Denoiser.Name OIDN
+```
+
+## Temporal Denoisers
+(Default)
+```
+r.PathTracing.TemporalDenoiser.Name NFOR
+```
+
