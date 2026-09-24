@@ -1,9 +1,6 @@
-# 1-SPP Demo: Developer Console Commands
-
-This project adds several custom console variables (CVars) to control the path tracer and the software noise fallback. You can tweak these at runtime by pressing `~` (tilde) in the editor or packaged game to open the developer console.
-
+## 1-SPP Demo: SL Developer Console Commands
+### This project adds several custom CVars to control the path tracer and the software noise fallback. You can tweak these at runtime by pressing `~` (tilde) in the editor or packaged game to open the developer console.
 ---
-
 ### `SL.PathTracer.AutoEnable`
 **Default:** `1`
 
@@ -111,3 +108,39 @@ This project features a fully modular denoising pipeline (`ISLDenoiserPass`). If
 Live Coding applies C++ changes while the engine is running, but Unreal requires all shader types and their struct memory layouts to be strictly registered at startup (`PostConfigInit`). Modifying these via Live Coding will result in an assertion failure or a crash (e.g., `Assertion failed: !AreShaderTypesInitialized()` or `required shader parameter [...] was not set`).
 
 *You can freely use Live Coding to hot-reload logic changes inside your C++ `Apply` methods, or use `Ctrl+Shift+.` in the editor to hot-reload `.usf` shader files!*
+
+---
+
+## 1-SPP Denoiser Testing Commands
+### These commands are built into UE5 raytracer, and allows the user to test different types of denoisers. Before testing, make sure to run `SL.PathTracer.ResetEveryFrame 0`
+---
+## Enable 
+SL.PathTracer.ResetEveryFrame 0
+
+## Enable special denoiser
+```
+r.PathTracing.TemporalDenoiser 0
+r.PathTracing.SpatialDenoiser 1
+r.PathTracing.SpatialDenoiser.Type 0
+r.PathTracing.Denoiser 1
+```
+
+## Enable temporal denoiser
+```
+r.PathTracing.TemporalDenoiser 1
+r.PathTracing.SpatialDenoiser 0
+r.PathTracing.SpatialDenoiser.Type 1
+r.PathTracing.Denoiser 1
+```
+
+## Spatial Denoisers
+(Default)
+```
+r.PathTracing.Denoiser.Name OIDN
+```
+
+## Temporal Denoisers
+(Default)
+```
+r.PathTracing.TemporalDenoiser.Name NFOR
+```
