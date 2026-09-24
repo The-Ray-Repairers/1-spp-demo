@@ -32,8 +32,8 @@
 			"Enabled": true
 		},
 		{
-			"Name": "NFORDenoise",
-			"Enabled": false
+			"Name": "NeuralRendering",
+			"Enabled": true
 		}
 	]
 }
