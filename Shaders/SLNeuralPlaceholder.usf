@@ -1,0 +1,191 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+//
+// SLNeuralPlaceholder.usf
+// Neural Denoiser PLACEHOLDER — diagnostic shader that reads all five
+// G-Buffer inputs a real neural denoiser would consume and produces a
+// clearly-identifiable debug visualisation.
+//
+// Inputs wired from C++ (FSLNeuralPlaceholderPS::FParameters):
+//   NoisyColor      — the noisy 1-spp scene colour (linear HDR)
+//   AlbedoTexture   — GBufferC (base color / albedo)
+//   NormalsTexture  — GBufferA (world-space normals, encoded)
+//   DepthTexture    — SceneDepthTexture (hardware depth)
+//   VelocityTexture — GBufferVelocityTexture (screen-space motion vectors)
+//
+// DebugMode selects the visualisation:
+//   0  Composite: 2×3 tiled grid showing all five inputs + a placeholder output
+//   1  Noisy Color (with purple tint to mark it as "processed")
+//   2  Albedo only
+//   3  World Normals only (remapped to 0–1)
+//   4  Linear Depth only (normalised for visibility)
+//   5  Motion Vectors only (visualised as RG colour)
+//
+// Usage:
+//   SL.Denoiser.Method 3
+//   SL.Denoiser.Neural.DebugMode 0   (or 1-5 to isolate a buffer)
+
+#include "/Engine/Public/Platform.ush"
+
+// --- Parameters (must match FSLNeuralPlaceholderPS::FParameters) ---
+uint2    ViewportOffset;
+float2   InvTextureSize;
+
+Texture2D<float4> NoisyColor;
+SamplerState      InputSampler;
+
+Texture2D<float4> AlbedoTexture;
+Texture2D<float4> NormalsTexture;
+Texture2D<float4> DepthTexture;
+Texture2D<float4> VelocityTexture;
+
+int DebugMode;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Visualise hardware depth for the diagnostic view.
+// UE5 uses reversed-Z: near plane = 1.0, far plane / sky = 0.0.
+// We use the raw value directly so near objects appear bright and
+// far objects / sky appear dark.  A pow curve brings out mid-range detail.
+// A depth of exactly 0 (sky or unbound fallback texture) is shown as black.
+float3 VisualiseDepth(float RawDepth)
+{
+    if (RawDepth <= 0.0)
+        return float3(0, 0, 0);   // sky / fallback → black
+
+    float Vis = pow(RawDepth, 0.25);  // perceptual curve (near=bright, far=dark)
+    return float3(Vis, Vis, Vis);
+}
+
+// Visualise a 2D motion vector as colour (R = horizontal, G = vertical).
+// Scale up for visibility and bias so zero motion = dark gray.
+float3 VisualiseVelocity(float2 MV)
+{
+    float2 Scaled = MV * 50.0 + 0.5;     // amplify & bias
+    return float3(saturate(Scaled.x), saturate(Scaled.y), 0.3);
+}
+
+// Draw a thin grid line between tiles (returns 1 inside the border).
+float GridBorder(float2 TileUV, float BorderWidth)
+{
+    float2 Edge = step(TileUV, BorderWidth) + step(1.0 - BorderWidth, TileUV);
+    return saturate(Edge.x + Edge.y);
+}
+
+// ---------------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------------
+void MainPS(
+    float4 SvPosition : SV_Position,
+    out float4 OutColor : SV_Target0)
+{
+    float2 UV = (SvPosition.xy + ViewportOffset) * InvTextureSize;
+
+    // Sample all five inputs at the current pixel.
+    float4 Noisy   = NoisyColor.SampleLevel(InputSampler, UV, 0);
+    float4 Albedo  = AlbedoTexture.SampleLevel(InputSampler, UV, 0);
+    float4 Normal  = NormalsTexture.SampleLevel(InputSampler, UV, 0);
+    float  Depth   = DepthTexture.SampleLevel(InputSampler, UV, 0).r;
+    float2 Vel     = VelocityTexture.SampleLevel(InputSampler, UV, 0).rg;
+
+    // ---- Single-buffer isolation modes ----
+    if (DebugMode == 1)
+    {
+        // Noisy colour with a subtle purple tint so it's visually distinct
+        OutColor = float4(Noisy.rgb * float3(0.9, 0.7, 1.0), 1.0);
+        return;
+    }
+    if (DebugMode == 2)
+    {
+        OutColor = float4(Albedo.rgb, 1.0);
+        return;
+    }
+    if (DebugMode == 3)
+    {
+        // World normals: remap from [-1,1] to [0,1] for display
+        OutColor = float4(Normal.rgb * 0.5 + 0.5, 1.0);
+        return;
+    }
+    if (DebugMode == 4)
+    {
+        OutColor = float4(VisualiseDepth(Depth), 1.0);
+        return;
+    }
+    if (DebugMode == 5)
+    {
+        OutColor = float4(VisualiseVelocity(Vel), 1.0);
+        return;
+    }
+
+    // ---- DebugMode 0: Composite 2×3 tiled grid ----
+    //
+    //  ┌──────────────┬──────────────┐
+    //  │ Noisy Color  │   Albedo     │
+    //  ├──────────────┼──────────────┤
+    //  │ Normals      │   Depth      │
+    //  ├──────────────┼──────────────┤
+    //  │ Velocity     │  "Denoised"  │
+    //  └──────────────┴──────────────┘
+    //
+    //  The bottom-right tile shows a simple placeholder "denoised" result:
+    //  noisy colour demodulated by albedo, lightly blurred by the sampler,
+    //  then remodulated — proving the pipeline is end-to-end functional.
+
+    // Determine which tile this pixel belongs to.
+    float2 TileCoord = UV * float2(2.0, 3.0);  // scale UV to 2×3 grid
+    int2   Tile      = int2(floor(TileCoord));
+    float2 TileUV    = frac(TileCoord);         // UV within the tile [0,1]
+
+    // Sample at the tile's local UV so each tile shows the full image.
+    float2 SampleUV = TileUV;
+    float4 TileNoisy  = NoisyColor.SampleLevel(InputSampler, SampleUV, 0);
+    float4 TileAlbedo = AlbedoTexture.SampleLevel(InputSampler, SampleUV, 0);
+    float4 TileNormal = NormalsTexture.SampleLevel(InputSampler, SampleUV, 0);
+    float  TileDepth  = DepthTexture.SampleLevel(InputSampler, SampleUV, 0).r;
+    float2 TileVel    = VelocityTexture.SampleLevel(InputSampler, SampleUV, 0).rg;
+
+    float3 TileColor = float3(0, 0, 0);
+
+    // Top row
+    if (Tile.y == 0)
+    {
+        if (Tile.x == 0)
+            TileColor = TileNoisy.rgb;                        // Noisy Color
+        else
+            TileColor = TileAlbedo.rgb;                       // Albedo
+    }
+    // Middle row
+    else if (Tile.y == 1)
+    {
+        if (Tile.x == 0)
+            TileColor = TileNormal.rgb * 0.5 + 0.5;          // Normals (remapped)
+        else
+            TileColor = VisualiseDepth(TileDepth);            // Depth
+    }
+    // Bottom row
+    else
+    {
+        if (Tile.x == 0)
+        {
+            TileColor = VisualiseVelocity(TileVel);           // Velocity
+        }
+        else
+        {
+            // Placeholder "denoised" output:
+            // Demodulate noisy by albedo, apply simple clamp, remodulate.
+            float3 SafeAlbedo = max(TileAlbedo.rgb, 0.01);
+            float3 Demodulated = TileNoisy.rgb / SafeAlbedo;
+            float3 Clamped = clamp(Demodulated, 0.0, 5.0);   // rough outlier removal
+            TileColor = Clamped * SafeAlbedo;
+            // Add a subtle green tint so it's identifiable as "neural output"
+            TileColor *= float3(0.85, 1.0, 0.85);
+        }
+    }
+
+    // Draw thin cyan grid lines between tiles.
+    float Border = GridBorder(TileUV, 0.005);
+    TileColor = lerp(TileColor, float3(0.0, 0.8, 1.0), Border * 0.8);
+
+    OutColor = float4(TileColor, 1.0);
+}

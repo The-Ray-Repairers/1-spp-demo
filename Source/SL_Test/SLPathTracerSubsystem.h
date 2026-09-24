@@ -29,7 +29,7 @@ public:
  * Both behaviours can be toggled at runtime with the SL.PathTracer.* console variables.
  */
 UCLASS()
-class USLPathTracerSubsystem : public UWorldSubsystem
+class USLPathTracerSubsystem : public UTickableWorldSubsystem
 {
 	GENERATED_BODY()
 
@@ -37,6 +37,8 @@ public:
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
 	virtual void OnWorldBeginPlay(UWorld& InWorld) override;
+	virtual void Tick(float DeltaTime) override;
+	virtual TStatId GetStatId() const override;
 
 private:
 	TSharedPtr<FSLPathTracerResetViewExtension, ESPMode::ThreadSafe> ResetViewExtension;

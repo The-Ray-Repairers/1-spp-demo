@@ -122,5 +122,20 @@ FScreenPassTexture FSLNoiseFallbackViewExtension::ApplyNoise_RenderThread(
 
 	// Return the noisy texture as the new scene colour.
 	// The tonemapper (and all subsequent post-process passes) will receive this.
-	return FScreenPassTexture(OutputTexture, ViewRect);
+	FScreenPassTexture NoisyOutput = FScreenPassTexture(OutputTexture, ViewRect);
+
+	// -----------------------------------------------------------------
+	// Denoiser pass  —  selected at runtime by SL.Denoiser.Method.
+	// The denoiser receives the noisy linear-HDR output and may replace
+	// it with a filtered version before the tonemapper consumes it.
+	//
+	// We also forward the scene texture uniform buffer so advanced
+	// denoisers (Neural, SVGF) can access Albedo, Normals, Depth, and
+	// Motion Vectors from the G-Buffer.
+	// -----------------------------------------------------------------
+	FSLDenoiserContext DenoiserContext;
+	DenoiserContext.SceneColor    = NoisyOutput;
+	DenoiserContext.SceneTextures = Inputs.SceneTextures;
+
+	return GetActiveDenoiser()->Apply(GraphBuilder, View, DenoiserContext);
 }

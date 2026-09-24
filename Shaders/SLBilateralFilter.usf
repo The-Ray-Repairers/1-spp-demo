@@ -1,0 +1,82 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+//
+// SLBilateralFilter.usf
+// Edge-preserving denoiser — part of the SL denoiser pipeline.
+//
+// Usage
+// -----
+//   SL.Denoiser.Method 2
+//   SL.Denoiser.Bilateral.SigmaSpatial <f>
+//   SL.Denoiser.Bilateral.SigmaColor <f>
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float4> InputTexture;
+SamplerState      InputSampler;
+float2            InvTextureSize;
+uint2             ViewportOffset;
+float             SigmaSpatial;
+float             SigmaColor;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+#define MAX_KERNEL_RADIUS 5
+
+// Spatial Gaussian weight based on pixel distance
+float SpatialWeight(float d2)
+{
+    return exp(-0.5 * d2 / max(SigmaSpatial * SigmaSpatial, 1e-5));
+}
+
+// Range/Color Gaussian weight based on squared color difference
+float ColorWeight(float4 c1, float4 c2)
+{
+    float3 diff = c1.rgb - c2.rgb;
+    // Luminance-weighted or straight euclidean difference
+    float d2 = dot(diff, diff);
+    return exp(-0.5 * d2 / max(SigmaColor * SigmaColor, 1e-8));
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+void MainPS(
+    float4 SvPosition : SV_Position,
+    out float4 OutColor : SV_Target0)
+{
+    float2 UV = (SvPosition.xy + ViewportOffset) * InvTextureSize;
+    
+    // Calculate radius dynamically based on SigmaSpatial, cap at MAX_KERNEL_RADIUS
+    int Radius = clamp((int)ceil(2.0 * SigmaSpatial), 1, MAX_KERNEL_RADIUS);
+    
+    float4 CenterColor = InputTexture.SampleLevel(InputSampler, UV, 0);
+    
+    float4 ColorSum = float4(0, 0, 0, 0);
+    float  WeightSum = 0.0;
+    
+    for (int y = -Radius; y <= Radius; ++y)
+    {
+        for (int x = -Radius; x <= Radius; ++x)
+        {
+            float2 Offset = float2(x, y);
+            float2 TapUV = UV + (Offset * InvTextureSize);
+            
+            float4 TapColor = InputTexture.SampleLevel(InputSampler, TapUV, 0);
+            
+            // Spatial weight (distance from center squared)
+            float Ws = SpatialWeight(dot(Offset, Offset));
+            
+            // Color weight (difference from center pixel)
+            float Wc = ColorWeight(CenterColor, TapColor);
+            
+            float W = Ws * Wc;
+            
+            ColorSum  += TapColor * W;
+            WeightSum += W;
+        }
+    }
+    
+    OutColor = ColorSum / max(WeightSum, 1e-10);
+    OutColor.a = CenterColor.a; // Preserve original alpha
+}

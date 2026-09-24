@@ -11,6 +11,7 @@
 #include "GlobalShader.h"
 #include "ShaderParameterStruct.h"
 #include "RHIStaticStates.h"
+#include "SLDenoiser.h"             // ISLDenoiserPass, GetDenoiserForMethod
 
 /**
  * Global pixel shader that adds Poisson shot noise to the scene colour.

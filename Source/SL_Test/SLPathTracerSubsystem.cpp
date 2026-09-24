@@ -2,6 +2,7 @@
 
 #include "SLPathTracerSubsystem.h"
 #include "SL_Test.h"
+#include "SLDenoiser.h"
 #include "Engine/World.h"
 #include "HAL/IConsoleManager.h"
 #include "Kismet/KismetRenderingLibrary.h"
@@ -36,6 +37,8 @@ TAutoConsoleVariable<int32> CVarSLPathTracerTargetSPP(
 		}
 	}),
 	ECVF_Default);
+
+extern TAutoConsoleVariable<int32> CVarSLDenoiserMethod;
 
 FSLPathTracerResetViewExtension::FSLPathTracerResetViewExtension(const FAutoRegister& AutoRegister, UWorld* InWorld)
 	: FWorldSceneViewExtension(AutoRegister, InWorld)
@@ -116,4 +119,45 @@ void USLPathTracerSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 	// Equivalent to the "Enable Path Tracing" Blueprint node.
 	UKismetRenderingLibrary::EnablePathTracing(true);
+}
+
+void USLPathTracerSubsystem::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+	if (GEngine && GetWorld() && !GetWorld()->IsNetMode(NM_DedicatedServer))
+	{
+		const int32 MethodInt = CVarSLDenoiserMethod.GetValueOnGameThread();
+		FString MethodName;
+		
+		switch (MethodInt)
+		{
+		case 0:
+			MethodName = TEXT("None (Passthrough)");
+			break;
+		case 1:
+			MethodName = TEXT("Gaussian Blur");
+			break;
+		case 2:
+			MethodName = TEXT("Bilateral Filter");
+			break;
+		case 3:
+			MethodName = TEXT("Neural Placeholder");
+			break;
+		default:
+			MethodName = FString::Printf(TEXT("Unknown (%d)"), MethodInt);
+			break;
+		}
+
+		// Key 0xA012: Stable ID so we overwrite the same message every frame
+		// instead of spamming the screen with new lines.
+		GEngine->AddOnScreenDebugMessage(
+			0xA012, 0.0f, FColor::Cyan,
+			FString::Printf(TEXT("  Denoiser Active: %s (Method %d)  "), *MethodName, MethodInt));
+	}
+}
+
+TStatId USLPathTracerSubsystem::GetStatId() const
+{
+	RETURN_QUICK_DECLARE_CYCLE_STAT(USLPathTracerSubsystem, STATGROUP_Tickables);
 }

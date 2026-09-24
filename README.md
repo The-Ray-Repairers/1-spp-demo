@@ -39,3 +39,75 @@ Controls the overall intensity of the software noise fallback. **Note:** This is
 * `0`: Disables the noise injection completely.
 * `1.0`: Default intensity (mathematically matched to 1-spp Monte Carlo variance).
 * Changes to this value apply on the render thread and take effect on the very next frame.
+
+---
+
+### `SL.Denoiser.Method`
+**Default:** `0`
+
+Selects the denoising algorithm to apply over the 1-spp frame (after noise injection). This provides a modular way to swap out denoising techniques.
+* `0`: None (passthrough, no filtering).
+* `1`: Separable Gaussian Blur.
+* `2`: Edge-preserving Bilateral Filter.
+* `3`: Neural Denoiser Placeholder — diagnostic pass that reads all G-Buffer auxiliary inputs (Albedo, Normals, Depth, Motion Vectors) and outputs a debug visualisation. See `SL.Denoiser.Neural.DebugMode`.
+
+---
+
+### `SL.Denoiser.GaussianBlur.Sigma`
+**Default:** `1.5`
+
+Controls the standard deviation (in pixels) of the Gaussian blur kernel when `SL.Denoiser.Method` is set to `1`.
+* Larger values produce a blurrier, smoother image.
+* The kernel radius is automatically scaled based on this sigma (`ceil(3 * sigma)` clamped to a maximum radius of 9).
+
+---
+
+### `SL.Denoiser.Bilateral.SigmaSpatial`
+**Default:** `2.0`
+
+Controls the spatial standard deviation (in pixels) of the Bilateral Filter kernel when `SL.Denoiser.Method` is set to `2`.
+* Larger values increase the size of the blur neighborhood.
+
+---
+
+### `SL.Denoiser.Bilateral.SigmaColor`
+**Default:** `0.1`
+
+Controls the color standard deviation of the Bilateral Filter kernel when `SL.Denoiser.Method` is set to `2`.
+* Larger values allow pixels with larger color differences to be blended together, reducing the edge-preserving effect.
+* Smaller values preserve sharp edges better but may leave more noise.
+
+---
+
+### `SL.Denoiser.Neural.DebugMode`
+**Default:** `0`
+
+Controls the visualisation output of the Neural Denoiser Placeholder when `SL.Denoiser.Method` is set to `3`.
+
+* `0`: **Composite diagnostic** — a 2×3 tiled grid showing all five G-Buffer inputs plus a placeholder "denoised" output:
+  * Top-left: Noisy Color | Top-right: Albedo
+  * Mid-left: World Normals | Mid-right: Linear Depth
+  * Bottom-left: Motion Vectors | Bottom-right: Placeholder denoised (demodulate/remodulate)
+* `1`: Noisy Color only (with a purple tint to mark it as "processed").
+* `2`: Albedo only.
+* `3`: World Normals only (remapped to 0–1 for display).
+* `4`: Linear Depth only (perceptually normalised).
+* `5`: Motion Vectors only (visualised as red/green colour).
+
+---
+
+## Developer Notes
+
+### On-Screen Debug Messages
+The active denoising method is continuously displayed in cyan text at the top-left of the viewport. This automatically updates when changing `SL.Denoiser.Method` via the developer console.
+
+### Live Coding Limitations & Custom Denoisers
+This project features a fully modular denoising pipeline (`ISLDenoiserPass`). If you decide to add your own denoisers (e.g., SVGF or neural nets), please be aware of Unreal Engine's **Live Coding restrictions** regarding C++ shader classes:
+
+**You MUST close the Unreal Editor and perform a normal IDE build if you:**
+1. Introduce a brand new `IMPLEMENT_GLOBAL_SHADER` macro.
+2. Add, remove, or reorder parameters inside a `BEGIN_SHADER_PARAMETER_STRUCT`.
+
+Live Coding applies C++ changes while the engine is running, but Unreal requires all shader types and their struct memory layouts to be strictly registered at startup (`PostConfigInit`). Modifying these via Live Coding will result in an assertion failure or a crash (e.g., `Assertion failed: !AreShaderTypesInitialized()` or `required shader parameter [...] was not set`).
+
+*You can freely use Live Coding to hot-reload logic changes inside your C++ `Apply` methods, or use `Ctrl+Shift+.` in the editor to hot-reload `.usf` shader files!*

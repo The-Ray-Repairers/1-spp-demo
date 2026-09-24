@@ -1,0 +1,92 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+//
+// SLGaussianBlur.usf
+// Separable Gaussian blur denoiser — part of the SL denoiser pipeline.
+//
+// Two entry points share this file:
+//   MainPS_H  — horizontal (X-axis) blur pass
+//   MainPS_V  — vertical   (Y-axis) blur pass
+//
+// Kernel
+// ------
+// We evaluate a 1-D Gaussian with the given sigma on the render thread and
+// sample a fixed-radius neighbourhood (radius = ceil(3*sigma) clamped to
+// MAX_KERNEL_RADIUS).  Bilinear hardware filtering is leveraged to halve the
+// number of texture fetches by pairing adjacent taps.
+//
+// Usage
+// -----
+//   SL.Denoiser.Method 1                  — enable this denoiser
+//   SL.Denoiser.GaussianBlur.Sigma <f>    — adjust standard deviation (pixels)
+
+#include "/Engine/Public/Platform.ush"
+
+// ---------------------------------------------------------------------------
+// Shader parameters (matched by FSLGaussianBlurPS_H / FSLGaussianBlurPS_V)
+// ---------------------------------------------------------------------------
+Texture2D<float4> InputTexture;
+SamplerState      InputSampler;
+float2            InvTextureSize;  // (1/W, 1/H) of the full render-target
+uint2             ViewportOffset;
+float             Sigma;           // Gaussian sigma in pixels
+
+// ---------------------------------------------------------------------------
+// Kernel helpers
+// ---------------------------------------------------------------------------
+// Maximum half-width of the blur kernel (in full-pixel taps each side of centre).
+// Keeping this low avoids excessive ALU.  At sigma=3 the error is < 0.3%.
+#define MAX_KERNEL_RADIUS 9
+
+// Evaluate a 1-D un-normalised Gaussian weight for a tap at offset d pixels.
+float GaussianWeight(float d)
+{
+    return exp(-0.5 * (d * d) / max(Sigma * Sigma, 1e-5));
+}
+
+// ---------------------------------------------------------------------------
+// Shared blur logic
+// Blurs InputTexture along the axis given by 'dir' (e.g. float2(1,0) or float2(0,1)).
+// UV is the normalised texture coordinate of the current fragment.
+// ---------------------------------------------------------------------------
+float4 BlurAlongAxis(float2 UV, float2 dir)
+{
+    // Compute the integer kernel radius clamped to MAX_KERNEL_RADIUS.
+    // Using 3*sigma covers 99.7% of the Gaussian mass.
+    int Radius = clamp((int)ceil(3.0 * Sigma), 1, MAX_KERNEL_RADIUS);
+
+    float4 ColourSum  = float4(0, 0, 0, 0);
+    float  WeightSum  = 0.0;
+
+    for (int i = -Radius; i <= Radius; ++i)
+    {
+        float  w   = GaussianWeight((float)i);
+        float2 tap = UV + dir * (float2(i, i) * InvTextureSize);
+        ColourSum  += InputTexture.SampleLevel(InputSampler, tap, 0) * w;
+        WeightSum  += w;
+    }
+
+    return ColourSum / max(WeightSum, 1e-10);
+}
+
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
+
+/** Horizontal (X-axis) blur pass. */
+void MainPS_H(
+    float4 SvPosition : SV_Position,
+    out float4 OutColor : SV_Target0)
+{
+    // Convert raster position to normalised UV (centre of pixel).
+    float2 UV = (SvPosition.xy + ViewportOffset) * InvTextureSize;
+    OutColor  = BlurAlongAxis(UV, float2(1.0, 0.0));
+}
+
+/** Vertical (Y-axis) blur pass. */
+void MainPS_V(
+    float4 SvPosition : SV_Position,
+    out float4 OutColor : SV_Target0)
+{
+    float2 UV = (SvPosition.xy + ViewportOffset) * InvTextureSize;
+    OutColor  = BlurAlongAxis(UV, float2(0.0, 1.0));
+}
