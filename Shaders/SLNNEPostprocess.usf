@@ -1,0 +1,24 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// SLNNEPostprocess.usf
+
+#include "/Engine/Public/Platform.ush"
+
+Buffer<float> InputTensor;
+RWTexture2D<float4> OutputTexture;
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    if (DispatchThreadId.x >= 224 || DispatchThreadId.y >= 224) return;
+
+    // The candy-9-clean model outputs RGB in [0, 255] and NCHW format (1x3x224x224)
+    uint IndexR = 0 * 224 * 224 + DispatchThreadId.y * 224 + DispatchThreadId.x;
+    uint IndexG = 1 * 224 * 224 + DispatchThreadId.y * 224 + DispatchThreadId.x;
+    uint IndexB = 2 * 224 * 224 + DispatchThreadId.y * 224 + DispatchThreadId.x;
+
+    float r = InputTensor[IndexR] / 255.0f;
+    float g = InputTensor[IndexG] / 255.0f;
+    float b = InputTensor[IndexB] / 255.0f;
+
+    OutputTexture[DispatchThreadId.xy] = float4(r, g, b, 1.0f);
+}

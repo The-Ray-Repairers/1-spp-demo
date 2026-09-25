@@ -1,0 +1,17 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// SLNNEUpsample.usf
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float4> InputTexture;
+SamplerState InputSampler;
+float2 InvTextureSize;
+uint2 ViewportOffset;
+
+void MainPS(
+    float4 SvPosition : SV_Position,
+    out float4 OutColor : SV_Target0)
+{
+    float2 UV = (SvPosition.xy - ViewportOffset) * InvTextureSize;
+    OutColor = InputTexture.SampleLevel(InputSampler, UV, 0);
+}

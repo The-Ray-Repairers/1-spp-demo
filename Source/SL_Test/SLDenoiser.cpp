@@ -17,6 +17,9 @@
 #include "RHIStaticStates.h"      // TStaticSamplerState
 #include "HAL/IConsoleManager.h"
 #include "SystemTextures.h"       // GSystemTextures — black/white fallback textures
+#include "NNE.h"
+#include "NNERuntimeRDG.h"
+#include "NNEModelData.h"
 
 // ---------------------------------------------------------------------------
 // Console variables
@@ -31,6 +34,7 @@ TAutoConsoleVariable<int32> CVarSLDenoiserMethod(
 	TEXT("  1: GaussianBlur       — separable Gaussian blur (see SL.Denoiser.GaussianBlur.Sigma)\n")
 	TEXT("  2: BilateralFilter    — edge-preserving blur (see SL.Denoiser.Bilateral.*)\n")
 	TEXT("  3: NeuralPlaceholder  — diagnostic pass reading all G-Buffer inputs (see SL.Denoiser.Neural.DebugMode)\n")
+	TEXT("  4: NNE Candy Model    — direct C++ inference of ONNX model via NNERuntimeRDG\n")
 	TEXT("Changes take effect on the next rendered frame."),
 	ECVF_RenderThreadSafe);
 
@@ -76,6 +80,9 @@ IMPLEMENT_GLOBAL_SHADER(FSLGaussianBlurPS_H,     "/Project/SLGaussianBlur.usf", 
 IMPLEMENT_GLOBAL_SHADER(FSLGaussianBlurPS_V,     "/Project/SLGaussianBlur.usf",             "MainPS_V", SF_Pixel);
 IMPLEMENT_GLOBAL_SHADER(FSLBilateralFilterPS,    "/Project/SLBilateralFilter.usf",          "MainPS",   SF_Pixel);
 IMPLEMENT_GLOBAL_SHADER(FSLNeuralPlaceholderPS,  "/Project/SLNeuralPlaceholder.usf",        "MainPS",   SF_Pixel);
+IMPLEMENT_GLOBAL_SHADER(FSLNNEPreprocessCS,      "/Project/SLNNEPreprocess.usf",            "MainCS",   SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSLNNEPostprocessCS,     "/Project/SLNNEPostprocess.usf",           "MainCS",   SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSLNNEUpsamplePS,        "/Project/SLNNEUpsample.usf",              "MainPS",   SF_Pixel);
 
 // ---------------------------------------------------------------------------
 // FSLDenoiserGaussianBlur::Apply
@@ -266,6 +273,138 @@ FScreenPassTexture FSLDenoiserNeuralPlaceholder::Apply(
 }
 
 // ---------------------------------------------------------------------------
+// FSLDenoiserNNE::Apply
+// Runs candy-9-clean model using NNERuntimeRDG directly in C++
+// ---------------------------------------------------------------------------
+FScreenPassTexture FSLDenoiserNNE::Apply(
+	FRDGBuilder&          GraphBuilder,
+	const FSceneView&     View,
+	const FSLDenoiserContext& Context)
+{
+	const FScreenPassTexture& Input = Context.SceneColor;
+	if (!Input.IsValid()) return Input;
+
+	// 0. Load the model and create the instance once
+	static UNNEModelData* ModelData = nullptr;
+	static TSharedPtr<UE::NNE::IModelInstanceRDG> ModelInstance;
+	static bool bInitFailed = false;
+
+	if (!ModelInstance.IsValid() && !bInitFailed)
+	{
+		ModelData = LoadObject<UNNEModelData>(nullptr, TEXT("/Game/ML/candy-9-clean.candy-9-clean"));
+		if (!ModelData)
+		{
+			UE_LOG(LogTemp, Error, TEXT("SLDenoiserNNE: Failed to load /Game/ML/candy-9-clean"));
+			bInitFailed = true;
+			return Input;
+		}
+
+		TWeakInterfacePtr<INNERuntimeRDG> Runtime = UE::NNE::GetRuntime<INNERuntimeRDG>(TEXT("NNERuntimeORTDml"));
+		if (!Runtime.IsValid())
+		{
+			UE_LOG(LogTemp, Error, TEXT("SLDenoiserNNE: NNERuntimeORTDml is not available"));
+			bInitFailed = true;
+			return Input;
+		}
+
+		TSharedPtr<UE::NNE::IModelRDG> Model = Runtime->CreateModelRDG(ModelData);
+		if (Model.IsValid())
+		{
+			ModelInstance = Model->CreateModelInstanceRDG();
+			if (ModelInstance.IsValid())
+			{
+				TArray<UE::NNE::FTensorShape> InputShapes = { UE::NNE::FTensorShape::Make({1, 3, 224, 224}) };
+				ModelInstance->SetInputTensorShapes(InputShapes);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error, TEXT("SLDenoiserNNE: Failed to create IModelInstanceRDG"));
+				bInitFailed = true;
+				return Input;
+			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Error, TEXT("SLDenoiserNNE: Failed to create IModelRDG"));
+			bInitFailed = true;
+			return Input;
+		}
+	}
+
+	if (!ModelInstance.IsValid()) return Input;
+
+	const ERHIFeatureLevel::Type FeatureLevel = View.FeatureLevel;
+
+	// 1. Preprocess: copy texture into 224x224 buffer
+	FRDGBufferDesc InputTensorDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(float), 1 * 3 * 224 * 224);
+	FRDGBufferRef InputTensorBuffer = GraphBuilder.CreateBuffer(InputTensorDesc, TEXT("NNEInputTensor"));
+
+	{
+		FSLNNEPreprocessCS::FParameters* Params = GraphBuilder.AllocParameters<FSLNNEPreprocessCS::FParameters>();
+		Params->InputTexture = Input.Texture;
+		Params->InputSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		Params->OutputTensor = GraphBuilder.CreateUAV(InputTensorBuffer, PF_R32_FLOAT);
+		Params->InvOutputSize = FVector2f(1.0f / 224.0f, 1.0f / 224.0f);
+
+		TShaderMapRef<FSLNNEPreprocessCS> ComputeShader(GetGlobalShaderMap(FeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("NNEPreprocess"), ComputeShader, Params, FIntVector(224 / 8, 224 / 8, 1));
+	}
+
+	// 2. Inference
+	FRDGBufferDesc OutputTensorDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(float), 1 * 3 * 224 * 224);
+	FRDGBufferRef OutputTensorBuffer = GraphBuilder.CreateBuffer(OutputTensorDesc, TEXT("NNEOutputTensor"));
+
+	TArray<UE::NNE::FTensorBindingRDG> InputBindings;
+	UE::NNE::FTensorBindingRDG InBinding;
+	InBinding.Buffer = InputTensorBuffer;
+	InputBindings.Add(InBinding);
+
+	TArray<UE::NNE::FTensorBindingRDG> OutputBindings;
+	UE::NNE::FTensorBindingRDG OutBinding;
+	OutBinding.Buffer = OutputTensorBuffer;
+	OutputBindings.Add(OutBinding);
+
+	ModelInstance->EnqueueRDG(GraphBuilder, InputBindings, OutputBindings);
+
+	// 3. Postprocess: unpack buffer to 224x224 texture
+	FRDGTextureDesc TensorTexDesc = FRDGTextureDesc::Create2D(FIntPoint(224, 224), PF_FloatRGBA, FClearValueBinding::Black, TexCreate_UAV | TexCreate_ShaderResource);
+	FRDGTextureRef TensorTexture = GraphBuilder.CreateTexture(TensorTexDesc, TEXT("NNETensorTexture"));
+
+	{
+		FSLNNEPostprocessCS::FParameters* Params = GraphBuilder.AllocParameters<FSLNNEPostprocessCS::FParameters>();
+		Params->InputTensor = GraphBuilder.CreateSRV(OutputTensorBuffer, PF_R32_FLOAT);
+		Params->OutputTexture = GraphBuilder.CreateUAV(TensorTexture);
+
+		TShaderMapRef<FSLNNEPostprocessCS> ComputeShader(GetGlobalShaderMap(FeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("NNEPostprocess"), ComputeShader, Params, FIntVector(224 / 8, 224 / 8, 1));
+	}
+
+	// 4. Upsample: stretch 224x224 texture back to screen resolution
+	FRDGTextureDesc OutputDesc = Input.Texture->Desc;
+	FRDGTextureRef OutputTexture = GraphBuilder.CreateTexture(OutputDesc, TEXT("NNEUpsampleOutput"));
+
+	{
+		FSLNNEUpsamplePS::FParameters* Params = GraphBuilder.AllocParameters<FSLNNEUpsamplePS::FParameters>();
+		Params->InputTexture = TensorTexture;
+		Params->InputSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		Params->InvTextureSize = FVector2f(1.0f / Input.ViewRect.Width(), 1.0f / Input.ViewRect.Height());
+		Params->ViewportOffset = FUintVector2(Input.ViewRect.Min.X, Input.ViewRect.Min.Y);
+		Params->RenderTargets[0] = FRenderTargetBinding(OutputTexture, ERenderTargetLoadAction::ENoAction);
+
+		TShaderMapRef<FSLNNEUpsamplePS> PixelShader(GetGlobalShaderMap(FeatureLevel));
+		FPixelShaderUtils::AddFullscreenPass(
+			GraphBuilder,
+			GetGlobalShaderMap(FeatureLevel),
+			RDG_EVENT_NAME("NNEUpsample"),
+			PixelShader,
+			Params,
+			Input.ViewRect);
+	}
+
+	return FScreenPassTexture(OutputTexture, Input.ViewRect);
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 ISLDenoiserPass* GetDenoiserForMethod(ESLDenoiserMethod Method)
@@ -276,6 +415,7 @@ ISLDenoiserPass* GetDenoiserForMethod(ESLDenoiserMethod Method)
 	static FSLDenoiserGaussianBlur       s_GaussianBlur;
 	static FSLDenoiserBilateralFilter    s_BilateralFilter;
 	static FSLDenoiserNeuralPlaceholder  s_NeuralPlaceholder;
+	static FSLDenoiserNNE                s_NNE;
 
 	switch (Method)
 	{
@@ -287,6 +427,9 @@ ISLDenoiserPass* GetDenoiserForMethod(ESLDenoiserMethod Method)
 
 	case ESLDenoiserMethod::NeuralPlaceholder:
 		return &s_NeuralPlaceholder;
+
+	case ESLDenoiserMethod::NNE:
+		return &s_NNE;
 
 	case ESLDenoiserMethod::None:
 	default:
