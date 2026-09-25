@@ -19,7 +19,8 @@ public class SL_Test : ModuleRules
 			"StateTreeModule",
 			"GameplayStateTreeModule",
 			"UMG",
-			"Slate"
+			"Slate",
+			"NNE"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] {

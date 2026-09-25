@@ -34,6 +34,10 @@
 		{
 			"Name": "NeuralRendering",
 			"Enabled": true
+		},
+		{
+			"Name": "NNERuntimeRDG",
+			"Enabled": true
 		}
 	]
 }

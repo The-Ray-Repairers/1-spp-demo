@@ -144,6 +144,9 @@ void USLPathTracerSubsystem::Tick(float DeltaTime)
 		case 3:
 			MethodName = TEXT("Neural Placeholder");
 			break;
+		case 4:
+			MethodName = TEXT("NNE Candy Model");
+			break;
 		default:
 			MethodName = FString::Printf(TEXT("Unknown (%d)"), MethodInt);
 			break;

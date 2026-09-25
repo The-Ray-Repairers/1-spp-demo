@@ -37,6 +37,9 @@ enum class ESLDenoiserMethod : int32
 
 	/** Neural Denoiser placeholder — reads all G-Buffer auxiliary inputs. */
 	NeuralPlaceholder = 3,
+
+	/** NNE Candy 9 Model — direct C++ inference */
+	NNE = 4,
 };
 
 // ---------------------------------------------------------------------------
@@ -246,6 +249,72 @@ public:
 };
 
 class FSLDenoiserNeuralPlaceholder final : public ISLDenoiserPass
+{
+public:
+	virtual FScreenPassTexture Apply(
+		FRDGBuilder&          GraphBuilder,
+		const FSceneView&     View,
+		const FSLDenoiserContext& Context) override;
+};
+
+// ---------------------------------------------------------------------------
+// NNE Denoiser (method 4)
+// ---------------------------------------------------------------------------
+
+class FSLNNEPreprocessCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSLNNEPreprocessCS);
+	SHADER_USE_PARAMETER_STRUCT(FSLNNEPreprocessCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, InputSampler)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, OutputTensor)
+		SHADER_PARAMETER(FVector2f, InvOutputSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P)
+	{
+		return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+class FSLNNEPostprocessCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSLNNEPostprocessCS);
+	SHADER_USE_PARAMETER_STRUCT(FSLNNEPostprocessCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, InputTensor)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P)
+	{
+		return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+class FSLNNEUpsamplePS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSLNNEUpsamplePS);
+	SHADER_USE_PARAMETER_STRUCT(FSLNNEUpsamplePS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, InputSampler)
+		SHADER_PARAMETER(FVector2f, InvTextureSize)
+		SHADER_PARAMETER(FUintVector2, ViewportOffset)
+		RENDER_TARGET_BINDING_SLOTS()
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P)
+	{
+		return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+class FSLDenoiserNNE final : public ISLDenoiserPass
 {
 public:
 	virtual FScreenPassTexture Apply(
