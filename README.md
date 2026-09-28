@@ -43,7 +43,7 @@ Controls the overall intensity of the software noise fallback. **Note:** This is
 ## Enable 
 SL.PathTracer.ResetEveryFrame 0
 
-## Enable special denoiser
+## Enable spatial denoiser
 ```
 r.PathTracing.TemporalDenoiser 0
 r.PathTracing.SpatialDenoiser 1
@@ -70,4 +70,11 @@ r.PathTracing.Denoiser.Name OIDN
 ```
 r.PathTracing.TemporalDenoiser.Name NFOR
 ```
+
+
+## GM Tools: one-click test groups
+
+Run the game and enter `gm` in the developer console. Click **Minimize** to collapse the panel to a small **GM** button; click it or enter `gm` again to restore the panel. The **1-SPP Denoiser Testing** group contains **Enable spatial denoiser (OIDN)** and **Enable temporal denoiser (NFOR)** buttons. Each runs the corresponding sequence above, including `SL.PathTracer.ResetEveryFrame 0` and the denoiser name selection.
+
+To configure another button, edit `/Game/Debug/GMTools/DA_RenderGMTools`: add an entry, choose **Command Batch** for `Control`, and add one full console command per `Commands` array element. Commands run in array order on click. The panel shows a short execution status; per-command results are written to the Output Log. Execution stops on failure without rolling back earlier commands. Descriptions and command text remain in the configuration asset and are hidden in the runtime UI. Existing numeric controls remain available.
 
