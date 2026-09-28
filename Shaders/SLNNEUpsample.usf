@@ -1,17 +1,24 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 // SLNNEUpsample.usf
+//
+// Stretches the 224x224 NNE output texture back to fill the full viewport.
+// UV is computed so that (ViewportMin → ViewportMax) maps to (0,0) → (1,1)
+// on the small input texture.
 
 #include "/Engine/Public/Platform.ush"
 
 Texture2D<float4> InputTexture;
 SamplerState InputSampler;
-float2 InvTextureSize;
-uint2 ViewportOffset;
+float2 InvTextureSize;   // = 1 / ViewportSize  (NOT 1/224)
+uint2 ViewportOffset;    // = ViewRect.Min
 
 void MainPS(
     float4 SvPosition : SV_Position,
     out float4 OutColor : SV_Target0)
 {
-    float2 UV = (SvPosition.xy - ViewportOffset) * InvTextureSize;
+    // SvPosition ranges from ViewRect.Min to ViewRect.Max.
+    // Subtracting ViewportOffset and multiplying by 1/ViewportSize
+    // maps the full viewport to UV [0,1] across the 224x224 texture.
+    float2 UV = (SvPosition.xy - float2(ViewportOffset)) * InvTextureSize;
     OutColor = InputTexture.SampleLevel(InputSampler, UV, 0);
 }

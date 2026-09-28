@@ -387,7 +387,7 @@ FScreenPassTexture FSLDenoiserNNE::Apply(
 		FSLNNEUpsamplePS::FParameters* Params = GraphBuilder.AllocParameters<FSLNNEUpsamplePS::FParameters>();
 		Params->InputTexture = TensorTexture;
 		Params->InputSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-		Params->InvTextureSize = FVector2f(1.0f / Input.ViewRect.Width(), 1.0f / Input.ViewRect.Height());
+		Params->InvTextureSize = FVector2f(1.0f / (float)Input.ViewRect.Width(), 1.0f / (float)Input.ViewRect.Height());
 		Params->ViewportOffset = FUintVector2(Input.ViewRect.Min.X, Input.ViewRect.Min.Y);
 		Params->RenderTargets[0] = FRenderTargetBinding(OutputTexture, ERenderTargetLoadAction::ENoAction);
 
