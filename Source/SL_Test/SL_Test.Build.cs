@@ -24,6 +24,8 @@ public class SL_Test : ModuleRules
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] {
+			"SlateCore",
+			"DeveloperSettings",
 			"RenderCore",
 			"Renderer",   // FRDGBuilder, FScreenPassTexture, AddDrawScreenPass, FPostProcessingInputs
 			"RHI",        // TStaticSamplerState, FRHICopyTextureInfo

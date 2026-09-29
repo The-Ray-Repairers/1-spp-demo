@@ -2,12 +2,37 @@
 
 
 #include "SL_TestPlayerController.h"
+#include "Debug/GMTools/SLGMToolsComponent.h"
+#include "Engine/Console.h"
+#include "Engine/GameViewportClient.h"
+#include "TimerManager.h"
 #include "EnhancedInputSubsystems.h"
 #include "Engine/LocalPlayer.h"
 #include "InputMappingContext.h"
 #include "Blueprint/UserWidget.h"
 #include "SL_Test.h"
 #include "Widgets/Input/SVirtualJoystick.h"
+
+ASL_TestPlayerController::ASL_TestPlayerController()
+{
+	GMTools = CreateDefaultSubobject<USLGMToolsComponent>(TEXT("GMTools"));
+}
+
+void ASL_TestPlayerController::gm()
+{
+	if (!IsLocalPlayerController()) return;
+	// Console submission restores viewport focus. Open on the following tick so
+	// that restoration cannot steal focus from the panel's UI input mode.
+	GetWorldTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(this, [this]
+	{
+		if (ULocalPlayer* Player = GetLocalPlayer())
+		{
+			if (Player->ViewportClient && Player->ViewportClient->ViewportConsole)
+				Player->ViewportClient->ViewportConsole->FakeGotoState(NAME_None);
+		}
+		GMTools->OpenPanel();
+	}));
+}
 
 void ASL_TestPlayerController::BeginPlay()
 {
