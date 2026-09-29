@@ -287,15 +287,19 @@ FScreenPassTexture FSLDenoiserNNE::Apply(
 	// 0. Load the model and create the instance once
 	static UNNEModelData* ModelData = nullptr;
 	static TSharedPtr<UE::NNE::IModelInstanceRDG> ModelInstance;
-	static bool bInitFailed = false;
 
-	if (!ModelInstance.IsValid() && !bInitFailed)
+
+	if (!ModelInstance.IsValid())
 	{
-		ModelData = LoadObject<UNNEModelData>(nullptr, TEXT("/Game/ML/candy-9-clean.candy-9-clean"));
+		ModelData = LoadObject<UNNEModelData>(nullptr, TEXT("/Game/ML/candy-9-clean"));
+		if (!ModelData)
+		{
+			ModelData = LoadObject<UNNEModelData>(nullptr, TEXT("/Game/ML/candy-9-clean.candy-9-clean"));
+		}
+		
 		if (!ModelData)
 		{
 			UE_LOG(LogTemp, Error, TEXT("SLDenoiserNNE: Failed to load /Game/ML/candy-9-clean"));
-			bInitFailed = true;
 			return Input;
 		}
 
@@ -303,7 +307,6 @@ FScreenPassTexture FSLDenoiserNNE::Apply(
 		if (!Runtime.IsValid())
 		{
 			UE_LOG(LogTemp, Error, TEXT("SLDenoiserNNE: NNERuntimeORTDml is not available"));
-			bInitFailed = true;
 			return Input;
 		}
 
@@ -319,14 +322,12 @@ FScreenPassTexture FSLDenoiserNNE::Apply(
 			else
 			{
 				UE_LOG(LogTemp, Error, TEXT("SLDenoiserNNE: Failed to create IModelInstanceRDG"));
-				bInitFailed = true;
 				return Input;
 			}
 		}
 		else
 		{
 			UE_LOG(LogTemp, Error, TEXT("SLDenoiserNNE: Failed to create IModelRDG"));
-			bInitFailed = true;
 			return Input;
 		}
 	}
