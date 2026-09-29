@@ -47,6 +47,7 @@ Selects the denoising algorithm to apply over the 1-spp frame (after noise injec
 * `1`: Separable Gaussian Blur.
 * `2`: Edge-preserving Bilateral Filter.
 * `3`: Neural Denoiser Placeholder — diagnostic pass that reads all G-Buffer auxiliary inputs (Albedo, Normals, Depth, Motion Vectors) and outputs a debug visualisation. See `SL.Denoiser.Neural.DebugMode`.
+* `4`: NNE Candy Model — an ONNX-based neural denoiser integrated directly into the C++ Render Dependency Graph (RDG). Note: because this style transfer network expects display-referred images in [0,255], selecting this method automatically locks auto-exposure (`r.DefaultFeature.AutoExposure 0`) to prevent a blown-out feedback loop.
 
 ---
 

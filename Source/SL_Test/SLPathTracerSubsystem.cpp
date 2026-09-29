@@ -128,6 +128,22 @@ void USLPathTracerSubsystem::Tick(float DeltaTime)
 	if (GEngine && GetWorld() && !GetWorld()->IsNetMode(NM_DedicatedServer))
 	{
 		const int32 MethodInt = CVarSLDenoiserMethod.GetValueOnGameThread();
+		
+		static int32 LastMethodInt = -1;
+		if (MethodInt != LastMethodInt)
+		{
+			// NNE Candy Model requires fixed exposure since it's trained on display-referred sRGB.
+			if (IConsoleVariable* AutoExposureCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.DefaultFeature.AutoExposure")))
+			{
+				AutoExposureCVar->Set(MethodInt == 4 ? 0 : 1, ECVF_SetByConsole);
+			}
+			if (IConsoleVariable* ExposureCompCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.EyeAdaptation.ExposureCompensation")))
+			{
+				ExposureCompCVar->Set(MethodInt == 4 ? 1.0f : 0.0f, ECVF_SetByConsole);
+			}
+			LastMethodInt = MethodInt;
+		}
+
 		FString MethodName;
 		
 		switch (MethodInt)
