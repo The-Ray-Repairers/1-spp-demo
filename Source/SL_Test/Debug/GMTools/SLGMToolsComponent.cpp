@@ -130,6 +130,112 @@ namespace
 		FText Status;
 	};
 
+	class SGMRadioGroupRow : public SCompoundWidget
+	{
+	public:
+		SLATE_BEGIN_ARGS(SGMRadioGroupRow) {} SLATE_ARGUMENT(FSLGMToolEntry, Entry) SLATE_END_ARGS()
+		void Construct(const FArguments& Args)
+		{
+			Entry = Args._Entry;
+			TSharedRef<SVerticalBox> ButtonList = SNew(SVerticalBox);
+			for (const FSLGMRadioOption& Opt : Entry.RadioOptions)
+			{
+				const int32 OptionValue = Opt.Value;
+				const FText OptionLabel = Opt.Label;
+				ButtonList->AddSlot().AutoHeight().Padding(0, 2)
+				[
+					SNew(SButton)
+					.IsEnabled_Lambda([this] { return CanEdit(); })
+					.ButtonColorAndOpacity_Lambda([this, OptionValue] {
+						return IsActive(OptionValue)
+							? FLinearColor(0.1f, 0.55f, 0.95f, 1.f)   // active: blue
+							: FLinearColor(0.25f, 0.3f, 0.38f, 1.f); // inactive: grey
+					})
+					.ForegroundColor(FLinearColor::White)
+					.ContentPadding(FMargin(12, 6))
+					.OnClicked_Lambda([this, OptionValue] {
+						ApplyOption(OptionValue);
+						return FReply::Handled();
+					})
+					[
+						SNew(SHorizontalBox)
+						+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0,0,8,0)
+						[
+							SNew(STextBlock)
+							.TextStyle(&FGMToolsStyle::Get().Body)
+							.Text_Lambda([this, OptionValue] {
+								return FText::FromString(IsActive(OptionValue) ? TEXT("●") : TEXT("○"));
+							})
+						]
+						+ SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center)
+						[
+							SNew(STextBlock)
+							.TextStyle(&FGMToolsStyle::Get().Body)
+							.Text(OptionLabel)
+							.AutoWrapText(true)
+						]
+					]
+				];
+			}
+			ChildSlot
+			[
+				SNew(SBorder).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+				.BorderBackgroundColor(FGMToolsStyle::Get().RowBackground).ForegroundColor(FLinearColor::White).Padding(12)
+				[
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot().AutoHeight()
+					[
+						SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(Entry.Label)
+					]
+					+ SVerticalBox::Slot().AutoHeight().Padding(0, 6)
+					[
+						ButtonList
+					]
+					+ SVerticalBox::Slot().AutoHeight()
+					[
+						SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body)
+						.Text_Lambda([this] { return Status; }).AutoWrapText(true)
+					]
+				]
+			];
+		}
+	private:
+		bool CanEdit() const { FString Value; FText Error; return FSLGMCommandService::Read(Entry, Value, Error); }
+		bool IsActive(int32 OptionValue) const
+		{
+			FString Value; FText Error;
+			if (!FSLGMCommandService::Read(Entry, Value, Error)) return false;
+			int32 Current = 0;
+			return LexTryParseString(Current, *Value) && Current == OptionValue;
+		}
+		void ApplyOption(int32 OptionValue)
+		{
+			FSLGMCommandService::Apply(Entry, FString::FromInt(OptionValue), Status);
+		}
+		FSLGMToolEntry Entry;
+		FText Status;
+	};
+
+	/** Builds the FSLGMToolEntry for the denoiser radio group. Always kept in sync with
+	 *  the ESLDenoiserMethod enum in SLDenoiser.h; no data asset edit required. */
+	FSLGMToolEntry MakeDenoiserEntry()
+	{
+		FSLGMToolEntry E;
+		E.Id = FName("Denoiser.Method");
+		E.Group = FText::FromString(TEXT("1-SPP Denoiser Method"));
+		E.Label = FText::FromString(TEXT("Active method  (auto-exposure is locked while NNE Candy is selected)"));
+		E.ConsoleVariable = TEXT("SL.Denoiser.Method");
+		E.Control = ESLGMControlType::RadioGroup;
+		E.RadioOptions = {
+			{ FText::FromString(TEXT("0 — None (passthrough)")),            0 },
+			{ FText::FromString(TEXT("1 — Gaussian Blur")),                  1 },
+			{ FText::FromString(TEXT("2 — Bilateral Filter")),               2 },
+			{ FText::FromString(TEXT("3 — Neural Placeholder (G-Buffer diagnostic)")), 3 },
+			{ FText::FromString(TEXT("4 — NNE Candy Model (locks auto-exposure)")),   4 },
+		};
+		return E;
+	}
+
 	class SGMPanel : public SCompoundWidget
 	{
 	public:
@@ -150,6 +256,8 @@ namespace
 						if (Entry.Group.ToString() != Group) continue;
 						if (Entry.Control == ESLGMControlType::CommandBatch)
 							Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SGMBatchRow).Entry(Entry).Player(Args._Player)];
+						else if (Entry.Control == ESLGMControlType::RadioGroup)
+							Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SGMRadioGroupRow).Entry(Entry)];
 						else
 							Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SGMRow).Entry(Entry)];
 					}
@@ -157,6 +265,25 @@ namespace
 			}
 			if (!Args._Configuration || Args._Configuration->Entries.IsEmpty())
 				Rows->AddSlot().AutoHeight()[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(FText::FromString(TEXT("Assign a configuration asset with at least one entry in Project Settings > Game > GM Tools."))).AutoWrapText(true)];
+
+			// ---------------------------------------------------------------
+			// Hardcoded denoiser section — always present, driven by
+			// SL.Denoiser.Method.  Mutual exclusivity is enforced by the
+			// RadioGroup widget: clicking any option writes the integer CVar,
+			// which SLPathTracerSubsystem::Tick reacts to immediately
+			// (auto-exposure is locked/unlocked automatically for Method 4).
+			// ---------------------------------------------------------------
+			const FSLGMToolEntry DenoiserEntry = MakeDenoiserEntry();
+			Rows->AddSlot().AutoHeight().Padding(0, 12, 0, 4)
+			[
+				SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body)
+				.Text(DenoiserEntry.Group)
+			];
+			Rows->AddSlot().AutoHeight().Padding(0, 3)
+			[
+				SNew(SGMRadioGroupRow).Entry(DenoiserEntry)
+			];
+
 			ChildSlot.HAlign(HAlign_Right).VAlign(VAlign_Fill).Padding(16)[SNew(SBox).WidthOverride(460)[SNew(SBorder)
 				.BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
 				.BorderBackgroundColor(FGMToolsStyle::Get().PanelBackground).ForegroundColor(FLinearColor::White).Padding(16)[SNew(SVerticalBox)

@@ -14,10 +14,19 @@ namespace
 			Error = FText::FromString(TEXT("Console variable not found or not registered."));
 			return nullptr;
 		}
-		const bool bInteger = Entry.Control != ESLGMControlType::Float;
-		if ((bInteger && !Variable->IsVariableInt()) || (!bInteger && !Variable->IsVariableFloat()))
+		// RadioGroup always writes integers; skip the float/int mismatch check for it.
+		if (Entry.Control != ESLGMControlType::RadioGroup)
 		{
-			Error = FText::FromString(TEXT("Control type does not match the console variable type."));
+			const bool bInteger = Entry.Control != ESLGMControlType::Float;
+			if ((bInteger && !Variable->IsVariableInt()) || (!bInteger && !Variable->IsVariableFloat()))
+			{
+				Error = FText::FromString(TEXT("Control type does not match the console variable type."));
+				return nullptr;
+			}
+		}
+		else if (!Variable->IsVariableInt())
+		{
+			Error = FText::FromString(TEXT("RadioGroup requires an integer console variable."));
 			return nullptr;
 		}
 		return Variable;
@@ -40,7 +49,8 @@ bool FSLGMCommandService::Read(const FSLGMToolEntry& Entry, FString& Value, FTex
 		Error = FText::FromString(TEXT("This console variable is read-only and cannot be changed at runtime."));
 		return false;
 	}
-	if (Entry.bLimitRange && (!FMath::IsFinite(Entry.Minimum) || !FMath::IsFinite(Entry.Maximum) || Entry.Minimum > Entry.Maximum))
+	if (Entry.Control != ESLGMControlType::RadioGroup &&
+		Entry.bLimitRange && (!FMath::IsFinite(Entry.Minimum) || !FMath::IsFinite(Entry.Maximum) || Entry.Minimum > Entry.Maximum))
 	{
 		Error = FText::FromString(TEXT("The configured value range is invalid."));
 		return false;
@@ -50,6 +60,34 @@ bool FSLGMCommandService::Read(const FSLGMToolEntry& Entry, FString& Value, FTex
 
 bool FSLGMCommandService::Apply(const FSLGMToolEntry& Entry, const FString& Input, FText& Result)
 {
+	// RadioGroup: validate the chosen value is in the declared option set, then write it.
+	if (Entry.Control == ESLGMControlType::RadioGroup)
+	{
+		FText ReadError;
+		IConsoleVariable* Variable = Resolve(Entry, ReadError);
+		if (!Variable) { Result = ReadError; return false; }
+		int32 Chosen = 0;
+		if (!LexTryParseString(Chosen, *Input))
+		{
+			Result = FText::FromString(TEXT("Invalid radio option value."));
+			return false;
+		}
+		bool bValidOption = false;
+		for (const FSLGMRadioOption& Opt : Entry.RadioOptions)
+		{
+			if (Opt.Value == Chosen) { bValidOption = true; break; }
+		}
+		if (!bValidOption)
+		{
+			Result = FText::FromString(FString::Printf(TEXT("Value %d is not a valid option for this control."), Chosen));
+			return false;
+		}
+		Variable->Set(Chosen, ECVF_SetByConsole);
+		const bool bMatches = Variable->GetInt() == Chosen;
+		Result = FText::FromString(FString::Printf(TEXT("%s. Current value: %d"), bMatches ? TEXT("Applied") : TEXT("Not applied or overridden"), Variable->GetInt()));
+		return bMatches;
+	}
+
 	FString Previous;
 	if (!Read(Entry, Previous, Result)) return false;
 	const FString Trimmed = Input.TrimStartAndEnd();

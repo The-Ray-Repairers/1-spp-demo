@@ -11,7 +11,21 @@ enum class ESLGMControlType : uint8
 	Toggle,
 	Integer,
 	Float,
-	CommandBatch
+	CommandBatch,
+	/** A set of mutually-exclusive integer options driven by a single CVar. */
+	RadioGroup
+};
+
+/** One labelled option inside a RadioGroup entry. */
+USTRUCT(BlueprintType)
+struct FSLGMRadioOption
+{
+	GENERATED_BODY()
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Option")
+	FText Label;
+	/** The integer value to write to ConsoleVariable when this option is selected. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Option")
+	int32 Value = 0;
 };
 
 /** Describes a console variable; this asset never sets startup values. */
@@ -33,6 +47,9 @@ struct FSLGMToolEntry
 	/** Each array element is one console command, executed in order on click. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Command", meta=(EditCondition="Control == ESLGMControlType::CommandBatch", EditConditionHides))
 	TArray<FString> Commands;
+	/** Options displayed as radio buttons when Control == RadioGroup. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Command", meta=(EditCondition="Control == ESLGMControlType::RadioGroup", EditConditionHides))
+	TArray<FSLGMRadioOption> RadioOptions;
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Command", meta=(MultiLine=true))
 	FText Applicability;
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Command", meta=(EditCondition="Control != ESLGMControlType::CommandBatch", EditConditionHides))
