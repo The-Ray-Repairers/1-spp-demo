@@ -3,7 +3,6 @@
 #include "SLGMCommandService.h"
 #include "SL_Test.h"
 #include "Benchmark/SLComparisonSubsystem.h"
-#include "HAL/PlatformProcess.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/LocalPlayer.h"
 #include "GameFramework/PlayerController.h"
@@ -68,7 +67,7 @@ namespace
 					.OnTextCommitted_Lambda([this](const FText& Text, ETextCommit::Type Type) {
 						if (Type == ETextCommit::OnEnter) Apply(Text.ToString());
 					})];
-				Controls->AddSlot().AutoWidth().Padding(8, 0)[SNew(SButton).Text(FText::FromString(TEXT("Apply")))
+				Controls->AddSlot().AutoWidth().Padding(8, 0)[SNew(SButton).Text(Entry.ApplyLabel)
 					.IsEnabled_Lambda([this] { return CanEdit(); })
 					.OnClicked_Lambda([this] { Apply(Input->GetText().ToString()); return FReply::Handled(); })];
 			}
@@ -79,7 +78,7 @@ namespace
 				+ SVerticalBox::Slot().AutoHeight()[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text_Lambda([this] {
 					FString Value; FText Error;
 					FSLGMCommandService::Read(Entry, Value, Error);
-					return FText::FromString(FString::Printf(TEXT("Current value: %s%s%s"), *Value, Error.IsEmpty() ? TEXT("") : TEXT(" · "), *Error.ToString()));
+					return FText::Format(Entry.ValueFormat, FText::FromString(Value), Error);
 				}).AutoWrapText(true)]
 				+ SVerticalBox::Slot().AutoHeight()[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text_Lambda([this] { return Status; }).AutoWrapText(true)]
 			]];
@@ -111,7 +110,7 @@ namespace
 			ChildSlot[SNew(SBorder).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
 				.BorderBackgroundColor(FGMToolsStyle::Get().RowBackground).Padding(12)[SNew(SVerticalBox)
 				+ SVerticalBox::Slot().AutoHeight()[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(Entry.Label).AutoWrapText(true)]
-				+ SVerticalBox::Slot().AutoHeight().Padding(0, 8)[SNew(SButton).Text(FText::FromString(TEXT("Run")))
+				+ SVerticalBox::Slot().AutoHeight().Padding(0, 8)[SNew(SButton).Text(Entry.ApplyLabel)
 					.OnClicked_Lambda([this]
 					{
 						// Exec commands can remove the viewport UI. Keep the callback's owner alive.
@@ -187,7 +186,7 @@ namespace
 					SNew(SVerticalBox)
 					+ SVerticalBox::Slot().AutoHeight()
 					[
-						SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(Entry.Label)
+						SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(Entry.Label).AutoWrapText(true)
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(0, 6)
 					[
@@ -218,26 +217,6 @@ namespace
 		FText Status;
 	};
 
-	/** Builds the FSLGMToolEntry for the denoiser radio group. Always kept in sync with
-	 *  the ESLDenoiserMethod enum in SLDenoiser.h; no data asset edit required. */
-	FSLGMToolEntry MakeDenoiserEntry()
-	{
-		FSLGMToolEntry E;
-		E.Id = FName("Denoiser.Method");
-		E.Group = FText::FromString(TEXT("1-SPP Denoiser Method"));
-		E.Label = FText::FromString(TEXT("Active method  (auto-exposure is locked while NNE Candy is selected)"));
-		E.ConsoleVariable = TEXT("SL.Denoiser.Method");
-		E.Control = ESLGMControlType::RadioGroup;
-		E.RadioOptions = {
-			{ FText::FromString(TEXT("0 — None (passthrough)")),            0 },
-			{ FText::FromString(TEXT("1 — Gaussian Blur")),                  1 },
-			{ FText::FromString(TEXT("2 — Bilateral Filter")),               2 },
-			{ FText::FromString(TEXT("3 — Neural Placeholder (G-Buffer diagnostic)")), 3 },
-			{ FText::FromString(TEXT("4 — NNE Candy Model (locks auto-exposure)")),   4 },
-		};
-		return E;
-	}
-
 	class SGMPanel : public SCompoundWidget
 	{
 	public:
@@ -248,74 +227,47 @@ namespace
             TWeakObjectPtr<USLComparisonSubsystem> Comparison = Args._Player->GetWorld()->GetSubsystem<USLComparisonSubsystem>();
 
 			TSharedRef<SVerticalBox> Rows = SNew(SVerticalBox);
-			if (Args._Configuration)
-			{
-				TArray<FString> Groups;
-				for (const FSLGMToolEntry& Entry : Args._Configuration->Entries) Groups.AddUnique(Entry.Group.ToString());
-				for (const FString& Group : Groups)
-				{
-					Rows->AddSlot().AutoHeight().Padding(0, 12, 0, 4)[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(FText::FromString(Group))];
-					for (const FSLGMToolEntry& Entry : Args._Configuration->Entries)
-					{
-						if (Entry.Group.ToString() != Group) continue;
-						if (Entry.Control == ESLGMControlType::CommandBatch)
-							Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SBox).IsEnabled_Lambda([Comparison] { return !Comparison.IsValid() || !Comparison->OwnsRenderer(); })[SNew(SGMBatchRow).Entry(Entry).Player(Args._Player)]];
-						else if (Entry.Control == ESLGMControlType::RadioGroup)
-							Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SBox).IsEnabled_Lambda([Comparison] { return !Comparison.IsValid() || !Comparison->OwnsRenderer(); })[SNew(SGMRadioGroupRow).Entry(Entry)]];
-						else
-							Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SBox).IsEnabled_Lambda([Comparison, Entry] { return !Comparison.IsValid() || (!Comparison->IsBusy() && (!Comparison->OwnsRenderer() || Entry.ConsoleVariable == TEXT("SL.PathTracer.TargetSPP"))); })[SNew(SGMRow).Entry(Entry)]];
-					}
-				}
-			}
-			if (!Args._Configuration || Args._Configuration->Entries.IsEmpty())
-				Rows->AddSlot().AutoHeight()[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(FText::FromString(TEXT("Assign a configuration asset with at least one entry in Project Settings > Game > GM Tools."))).AutoWrapText(true)];
-
-			// ---------------------------------------------------------------
-			// Hardcoded denoiser section — always present, driven by
-			// SL.Denoiser.Method.  Mutual exclusivity is enforced by the
-			// RadioGroup widget: clicking any option writes the integer CVar,
-			// which SLPathTracerSubsystem::Tick reacts to immediately
-			// (auto-exposure is locked/unlocked automatically for Method 4).
-			// ---------------------------------------------------------------
-			const FSLGMToolEntry DenoiserEntry = MakeDenoiserEntry();
-			Rows->AddSlot().AutoHeight().Padding(0, 12, 0, 4)
-			[
-				SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body)
-				.Text(DenoiserEntry.Group)
-			];
-			Rows->AddSlot().AutoHeight().Padding(0, 3)
-			[
-				SNew(SBox).IsEnabled_Lambda([Comparison] { return !Comparison.IsValid() || !Comparison->OwnsRenderer(); })[SNew(SGMRadioGroupRow).Entry(DenoiserEntry)]
-			];
-
-            TSharedRef<SVerticalBox> Content = SNew(SVerticalBox);
-            Content->AddSlot().AutoHeight().Padding(0, 8)[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(FText::FromString(TEXT("Denoising Comparison")))];
-            for (const auto& Button : GetDefault<USLComparisonSettings>()->Buttons)
+            TWeakObjectPtr<USLGMToolConfig> Config = Args._Configuration;
+            if (Config.IsValid())
             {
-                const auto Action = Button.Action;
-                Content->AddSlot().AutoHeight().Padding(0, 3)[SNew(SButton)
-                    .IsEnabled_Lambda([Comparison, Action] { FText Reason; return Comparison.IsValid() && Comparison->CanExecute(Action, Reason); })
-                    .ToolTipText_Lambda([Comparison, Action] { FText Reason; if (Comparison.IsValid()) Comparison->CanExecute(Action, Reason); return Reason; })
-                    .OnClicked_Lambda([Comparison, Action] { if (Comparison.IsValid()) Comparison->Execute(Action); return FReply::Handled(); })
-                    [SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text_Lambda([Comparison, Button] { return Comparison.IsValid() ? Comparison->GetButtonLabel(Button) : Button.Label; })]];
+                FString PreviousGroup;
+                for (const FSLGMToolEntry& Entry : Config->Entries)
+                {
+                    const FString Group = Entry.Group.ToString();
+                    if (Group != PreviousGroup && !Group.IsEmpty())
+                        Rows->AddSlot().AutoHeight().Padding(0, 12, 0, 4)[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(Entry.Group)];
+                    PreviousGroup = Group;
+                    if (Entry.Control == ESLGMControlType::RenderingAction)
+                    {
+                        Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SButton)
+                            .IsEnabled_Lambda([Comparison, Entry] { FText Reason; return Comparison.IsValid() && Comparison->CanExecute(Entry.Action, Reason); })
+                            .ToolTipText_Lambda([Comparison, Entry] { FText Reason; if (Comparison.IsValid()) Comparison->CanExecute(Entry.Action, Reason); return Reason.IsEmpty() ? Entry.Applicability : Reason; })
+                            .OnClicked_Lambda([Comparison, Config, Entry] { if (Comparison.IsValid() && Config.IsValid()) Comparison->Execute(Entry, Config.Get()); return FReply::Handled(); })
+                            [SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).AutoWrapText(true)
+                                .Text_Lambda([Comparison, Entry] { return Comparison.IsValid() ? Comparison->GetButtonLabel(Entry) : Entry.Label; })]];
+                    }
+                    else if (Entry.Control == ESLGMControlType::RenderingStatus)
+                        Rows->AddSlot().AutoHeight().Padding(0, 6)[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).AutoWrapText(true)
+                            .Text_Lambda([Comparison, Entry] { const FText Status = Comparison.IsValid() ? Comparison->GetStatus() : FText::GetEmpty(); return Status.IsEmpty() ? Entry.Label : Status; })];
+                    else
+                    {
+                        TSharedPtr<SWidget> Row;
+                        if (Entry.Control == ESLGMControlType::CommandBatch) Row = SNew(SGMBatchRow).Entry(Entry).Player(Args._Player);
+                        else if (Entry.Control == ESLGMControlType::RadioGroup) Row = SNew(SGMRadioGroupRow).Entry(Entry);
+                        else Row = SNew(SGMRow).Entry(Entry);
+                        Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SBox)
+                            .IsEnabled_Lambda([Comparison, Entry] { return !Comparison.IsValid() || (!Comparison->IsBusy() && (!Comparison->OwnsRenderer() || Entry.bEditableDuringPreview)); })[Row.ToSharedRef()]];
+                    }
+                }
             }
-            Content->AddSlot().AutoHeight().Padding(0, 6)[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).AutoWrapText(true)
-                .Text_Lambda([Comparison] { return Comparison.IsValid() ? Comparison->GetStatus() : FText::GetEmpty(); })];
-            Content->AddSlot().AutoHeight().Padding(0, 3)[SNew(SButton).Text(FText::FromString(TEXT("Cancel / Restore Settings")))
-                .IsEnabled_Lambda([Comparison] { return Comparison.IsValid() && Comparison->OwnsRenderer(); })
-                .OnClicked_Lambda([Comparison] { if (Comparison.IsValid()) Comparison->Restore(); return FReply::Handled(); })];
-            Content->AddSlot().AutoHeight().Padding(0, 3)[SNew(SButton).Text(FText::FromString(TEXT("Open Results Folder")))
-                .IsEnabled_Lambda([Comparison] { return Comparison.IsValid() && !Comparison->GetOutputDirectory().IsEmpty(); })
-                .OnClicked_Lambda([Comparison] { if (Comparison.IsValid()) FPlatformProcess::ExploreFolder(*Comparison->GetOutputDirectory()); return FReply::Handled(); })];
-            Content->AddSlot().AutoHeight()[Rows];
 
 			ChildSlot.HAlign(HAlign_Right).VAlign(VAlign_Fill).Padding(16)[SNew(SBox).WidthOverride(460)[SNew(SBorder)
 				.BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
 				.BorderBackgroundColor(FGMToolsStyle::Get().PanelBackground).ForegroundColor(FLinearColor::White).Padding(16)[SNew(SVerticalBox)
 				+ SVerticalBox::Slot().AutoHeight()[SNew(SHorizontalBox)
-					+ SHorizontalBox::Slot().FillWidth(1)[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(FText::FromString(TEXT("GM Tools | Rendering")))]
-					+ SHorizontalBox::Slot().AutoWidth()[SNew(SButton).Text(FText::FromString(TEXT("Minimize"))).OnClicked_Lambda([this] { OnMinimize.ExecuteIfBound(); return FReply::Handled(); })]]
-				+ SVerticalBox::Slot().FillHeight(1)[SNew(SScrollBox) + SScrollBox::Slot()[Content]]
+					+ SHorizontalBox::Slot().FillWidth(1)[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(Config.IsValid() ? Config->PanelTitle : FText::GetEmpty())]
+					+ SHorizontalBox::Slot().AutoWidth()[SNew(SButton).Text(Config.IsValid() ? Config->MinimizeLabel : FText::GetEmpty()).OnClicked_Lambda([this] { OnMinimize.ExecuteIfBound(); return FReply::Handled(); })]]
+				+ SVerticalBox::Slot().FillHeight(1)[SNew(SScrollBox) + SScrollBox::Slot()[Rows]]
 			]]];
 		}
 		virtual bool SupportsKeyboardFocus() const override { return true; }
@@ -382,7 +334,7 @@ void USLGMToolsComponent::MinimizePanel()
 				OpenPanel();
 				return FReply::Handled();
 			}))
-			[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(FText::FromString(TEXT("GM")))]];
+			[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(Configuration ? Configuration->RestorePanelLabel : FText::GetEmpty())]];
 	Player->ViewportClient->AddViewportWidgetForPlayer(Player, MinimizedButton.ToSharedRef(), 100);
 	if (bInputCaptured)
 	{

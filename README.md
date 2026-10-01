@@ -1,11 +1,11 @@
 ## 1-SPP Demo: SL Developer Console Commands
 
-For the project-local official DLSS RR end-to-end benchmark, reproducible run
-profiles, image/timing evaluation and the project-side Falcor SVGF adaptation,
-see [Rendering baselines](Docs/Baselines.md). Normal game startup still uses the
-existing 1-SPP path tracer. Enter `gm` during play for the rendering controls:
+Normal game startup uses the existing 1-SPP path tracer. Enter `gm` during play for the rendering controls:
 Raw 1 SPP, 1 SPP + SVGF, Lumen + DLSS RR (End-to-End), Generate High-SPP Reference.
 Generate a reference directly from the panel and use Open Results Folder to view it.
+Each capture saves `output.png` and `capture.txt` directly under
+`Saved/References/YYYY-MM-DD_HH-MM-SS_<samples>SPP/` (local time).
+Repeated names receive a numeric suffix to avoid overwriting earlier captures.
 Restart the editor after rebuilding to activate the SVGF velocity startup setting.
 
 ### This project adds several custom CVars to control the path tracer and the software noise fallback. You can tweak these at runtime by pressing `~` (tilde) in the editor or packaged game to open the developer console.
@@ -159,3 +159,14 @@ r.PathTracing.TemporalDenoiser.Name NFOR
 Run the game and enter `gm` in the developer console. Click **Minimize** to collapse the panel to a small **GM** button; click it or enter `gm` again to restore the panel. The **1-SPP Denoiser Testing** group contains **Enable spatial denoiser (OIDN)** and **Enable temporal denoiser (NFOR)** buttons. Each runs the corresponding sequence above, including `SL.PathTracer.ResetEveryFrame 0` and the denoiser name selection.
 
 To configure another button, edit `/Game/Debug/GMTools/DA_RenderGMTools`: add an entry, choose **Command Batch** for `Control`, and add one full console command per `Commands` array element. Commands run in array order on click. The panel shows a short execution status; per-command results are written to the Output Log. Execution stops on failure without rolling back earlier commands. Descriptions and command text remain in the configuration asset and are hidden in the runtime UI. Existing numeric controls remain available.
+
+### Edit the GM panel
+
+Open `Content/Debug/GMTools/DA_RenderGMTools` in the Content Browser. Its `Entries`
+array is the single source for button labels, groups, order, radio options and
+rendering settings. `RenderingAction` entries select an operation and contain
+ordered `RenderSettings` name/value pairs. The reference label uses `{0}` for the
+selected SPP. `RenderingStatus` adds the live status row wherever desired.
+Panel title, minimize/restore labels, reference SPP variable and capture timeout
+are also fields on this asset. No JSON profiles or separate comparison INI section
+are used. C++ implements the reusable controls and rendering operations only.

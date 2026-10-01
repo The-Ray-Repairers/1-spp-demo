@@ -13,7 +13,20 @@ enum class ESLGMControlType : uint8
 	Float,
 	CommandBatch,
 	/** A set of mutually-exclusive integer options driven by a single CVar. */
-	RadioGroup
+	RadioGroup,
+	RenderingAction,
+	RenderingStatus
+};
+
+UENUM(BlueprintType)
+enum class ESLComparisonAction : uint8 { Raw, SVGF, RR, Reference, Restore, OpenResults };
+
+USTRUCT(BlueprintType)
+struct FSLGMRenderSetting
+{
+    GENERATED_BODY()
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Rendering") FString Name;
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Rendering") FString Value;
 };
 
 /** One labelled option inside a RadioGroup entry. */
@@ -44,6 +57,16 @@ struct FSLGMToolEntry
 	FString ConsoleVariable;
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Command")
 	ESLGMControlType Control = ESLGMControlType::Float;
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Rendering", meta=(EditCondition="Control == ESLGMControlType::RenderingAction", EditConditionHides))
+    ESLComparisonAction Action = ESLComparisonAction::Raw;
+    /** Applied in array order; values are snapshotted and restored when leaving comparison. */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Rendering", meta=(EditCondition="Control == ESLGMControlType::RenderingAction", EditConditionHides))
+    TArray<FSLGMRenderSetting> RenderSettings;
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Command")
+    bool bEditableDuringPreview = false;
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Command")
+    FText ApplyLabel;
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Command") FText ValueFormat;
 	/** Each array element is one console command, executed in order on click. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Command", meta=(EditCondition="Control == ESLGMControlType::CommandBatch", EditConditionHides))
 	TArray<FString> Commands;
@@ -65,6 +88,11 @@ class SL_TEST_API USLGMToolConfig : public UDataAsset
 {
 	GENERATED_BODY()
 public:
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Panel") FText PanelTitle;
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Panel") FText MinimizeLabel;
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Panel") FText RestorePanelLabel;
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Rendering") FString ReferenceSamplesVariable;
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Rendering", meta=(ClampMin="1")) float CaptureTimeoutSeconds = 600.f;
 	/** Array order defines group order and row order. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="GM Tools")
 	TArray<FSLGMToolEntry> Entries;

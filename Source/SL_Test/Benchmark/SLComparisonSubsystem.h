@@ -1,34 +1,8 @@
 #pragma once
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
-#include "Engine/DeveloperSettings.h"
+#include "Debug/GMTools/SLGMToolConfig.h"
 #include "SLComparisonSubsystem.generated.h"
-
-UENUM()
-enum class ESLComparisonAction : uint8 { Raw, SVGF, RR, Reference };
-
-USTRUCT()
-struct FSLComparisonButton
-{
-    GENERATED_BODY()
-    UPROPERTY(EditAnywhere) ESLComparisonAction Action = ESLComparisonAction::Raw;
-    UPROPERTY(EditAnywhere) FText Label;
-    UPROPERTY(EditAnywhere) FText ResultLabel;
-    UPROPERTY(EditAnywhere) FText Purpose;
-    UPROPERTY(EditAnywhere) bool bEndToEnd = false;
-    /** Rendering profile path relative to the project directory. */
-    UPROPERTY(EditAnywhere) FString Profile;
-};
-
-UCLASS(Config=Game, DefaultConfig, meta=(DisplayName="Rendering Comparison"))
-class USLComparisonSettings : public UDeveloperSettings
-{
-    GENERATED_BODY()
-public:
-    virtual FName GetCategoryName() const override { return TEXT("Game"); }
-    UPROPERTY(Config, EditAnywhere) TArray<FSLComparisonButton> Buttons;
-    UPROPERTY(Config, EditAnywhere, meta=(ClampMin="1")) float TimeoutSeconds = 600.f;
-};
 
 /** Interactive rendering ownership and same-camera capture, used directly by the GM panel. */
 UCLASS()
@@ -41,13 +15,13 @@ public:
     virtual bool IsTickableWhenPaused() const override { return true; }
     virtual TStatId GetStatId() const override { RETURN_QUICK_DECLARE_CYCLE_STAT(USLComparisonSubsystem, STATGROUP_Tickables); }
     virtual void Deinitialize() override;
-    bool Execute(ESLComparisonAction Action);
+    bool Execute(const FSLGMToolEntry& Entry, USLGMToolConfig* Config);
     void Restore();
     bool OwnsRenderer() const { return bOwned; }
     bool IsBusy() const { return bCapturing; }
     bool CanExecute(ESLComparisonAction Action, FText& Reason) const;
     FText GetStatus() const;
-    FText GetButtonLabel(const FSLComparisonButton& Button) const;
+    FText GetButtonLabel(const FSLGMToolEntry& Button) const;
     FString GetOutputDirectory() const { return Output; }
 private:
     bool Apply(ESLComparisonAction Action);
@@ -66,15 +40,16 @@ private:
     TMap<FString, FString> SavedVariables;
     TSharedPtr<class FSLComparisonView, ESPMode::ThreadSafe> View;
     TSharedPtr<class FSLGuideProbe, ESPMode::ThreadSafe> Guide;
-    TSharedPtr<class FJsonObject> Profile;
-    FString Output, StageDirectory, Status;
+    FString Output, Status;
     FIntPoint CaptureSize = FIntPoint::ZeroValue;
     FDelegateHandle ScreenshotHandle;
     int32 ReferenceSamples = 1;
     int32 TargetSamples = 0;
     bool bRequested = false, bImageSaved = false;
     double StageStarted = 0;
-    TSharedPtr<FJsonObject> StageResult;
+    FString CaptureMetadata;
+    FSLGMToolEntry ActiveEntry;
+    UPROPERTY(Transient) TObjectPtr<USLGMToolConfig> Configuration;
     UPROPERTY(Transient) TObjectPtr<class ACameraActor> CaptureCamera;
     UPROPERTY(Transient) TObjectPtr<AActor> PreviousCamera;
 };

@@ -33,7 +33,6 @@ public class SL_Test : ModuleRules
 			"RenderCore",
 			"Renderer",   // FRDGBuilder, FScreenPassTexture, AddDrawScreenPass, FPostProcessingInputs
 			"RHI",        // TStaticSamplerState, FRHICopyTextureInfo
-			"Json",
 			"DLSSBlueprint",
 		});
 
