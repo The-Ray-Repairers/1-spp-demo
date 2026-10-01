@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "SLPathTracerSubsystem.h"
+#include "Benchmark/SLComparisonSubsystem.h"
 #include "SL_Test.h"
 #include "SLDenoiser.h"
 #include "Engine/World.h"
@@ -31,6 +32,12 @@ TAutoConsoleVariable<int32> CVarSLPathTracerTargetSPP(
 	TEXT("Target Samples Per Pixel for the real-time path tracer or its software fallback.\n"),
 	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* Var)
 	{
+		// During comparison this control selects reference quality. The active
+		// method keeps its own sample count (Raw/SVGF stay at 1 SPP).
+		if (GEngine)
+			for (const auto& Context : GEngine->GetWorldContexts())
+				if (auto* World = Context.World())
+					if (auto* Comparison = World->GetSubsystem<USLComparisonSubsystem>(); Comparison && Comparison->OwnsRenderer()) return;
 		if (IConsoleVariable* EngineSPPCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.PathTracing.SamplesPerPixel")))
 		{
 			EngineSPPCVar->Set(Var->GetInt(), ECVF_SetByConsole);
@@ -123,6 +130,7 @@ void USLPathTracerSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 void USLPathTracerSubsystem::Tick(float DeltaTime)
 {
+    if (auto* Comparison = GetWorld()->GetSubsystem<USLComparisonSubsystem>(); Comparison && Comparison->OwnsRenderer()) return;
 	Super::Tick(DeltaTime);
 
 	if (GEngine && GetWorld() && !GetWorld()->IsNetMode(NM_DedicatedServer))

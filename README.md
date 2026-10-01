@@ -1,4 +1,13 @@
 ## 1-SPP Demo: SL Developer Console Commands
+
+For the project-local official DLSS RR end-to-end benchmark, reproducible run
+profiles, image/timing evaluation and the project-side Falcor SVGF adaptation,
+see [Rendering baselines](Docs/Baselines.md). Normal game startup still uses the
+existing 1-SPP path tracer. Enter `gm` during play for the rendering controls:
+Raw 1 SPP, 1 SPP + SVGF, Lumen + DLSS RR (End-to-End), Generate High-SPP Reference.
+Generate a reference directly from the panel and use Open Results Folder to view it.
+Restart the editor after rebuilding to activate the SVGF velocity startup setting.
+
 ### This project adds several custom CVars to control the path tracer and the software noise fallback. You can tweak these at runtime by pressing `~` (tilde) in the editor or packaged game to open the developer console.
 ---
 ### `SL.PathTracer.AutoEnable`

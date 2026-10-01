@@ -2,6 +2,8 @@
 #include "SLGMToolConfig.h"
 #include "SLGMCommandService.h"
 #include "SL_Test.h"
+#include "Benchmark/SLComparisonSubsystem.h"
+#include "HAL/PlatformProcess.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/LocalPlayer.h"
 #include "GameFramework/PlayerController.h"
@@ -243,6 +245,8 @@ namespace
 		void Construct(const FArguments& Args)
 		{
 			OnMinimize = Args._OnMinimize;
+            TWeakObjectPtr<USLComparisonSubsystem> Comparison = Args._Player->GetWorld()->GetSubsystem<USLComparisonSubsystem>();
+
 			TSharedRef<SVerticalBox> Rows = SNew(SVerticalBox);
 			if (Args._Configuration)
 			{
@@ -255,11 +259,11 @@ namespace
 					{
 						if (Entry.Group.ToString() != Group) continue;
 						if (Entry.Control == ESLGMControlType::CommandBatch)
-							Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SGMBatchRow).Entry(Entry).Player(Args._Player)];
+							Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SBox).IsEnabled_Lambda([Comparison] { return !Comparison.IsValid() || !Comparison->OwnsRenderer(); })[SNew(SGMBatchRow).Entry(Entry).Player(Args._Player)]];
 						else if (Entry.Control == ESLGMControlType::RadioGroup)
-							Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SGMRadioGroupRow).Entry(Entry)];
+							Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SBox).IsEnabled_Lambda([Comparison] { return !Comparison.IsValid() || !Comparison->OwnsRenderer(); })[SNew(SGMRadioGroupRow).Entry(Entry)]];
 						else
-							Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SGMRow).Entry(Entry)];
+							Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SBox).IsEnabled_Lambda([Comparison, Entry] { return !Comparison.IsValid() || (!Comparison->IsBusy() && (!Comparison->OwnsRenderer() || Entry.ConsoleVariable == TEXT("SL.PathTracer.TargetSPP"))); })[SNew(SGMRow).Entry(Entry)]];
 					}
 				}
 			}
@@ -281,8 +285,29 @@ namespace
 			];
 			Rows->AddSlot().AutoHeight().Padding(0, 3)
 			[
-				SNew(SGMRadioGroupRow).Entry(DenoiserEntry)
+				SNew(SBox).IsEnabled_Lambda([Comparison] { return !Comparison.IsValid() || !Comparison->OwnsRenderer(); })[SNew(SGMRadioGroupRow).Entry(DenoiserEntry)]
 			];
+
+            TSharedRef<SVerticalBox> Content = SNew(SVerticalBox);
+            Content->AddSlot().AutoHeight().Padding(0, 8)[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(FText::FromString(TEXT("Denoising Comparison")))];
+            for (const auto& Button : GetDefault<USLComparisonSettings>()->Buttons)
+            {
+                const auto Action = Button.Action;
+                Content->AddSlot().AutoHeight().Padding(0, 3)[SNew(SButton)
+                    .IsEnabled_Lambda([Comparison, Action] { FText Reason; return Comparison.IsValid() && Comparison->CanExecute(Action, Reason); })
+                    .ToolTipText_Lambda([Comparison, Action] { FText Reason; if (Comparison.IsValid()) Comparison->CanExecute(Action, Reason); return Reason; })
+                    .OnClicked_Lambda([Comparison, Action] { if (Comparison.IsValid()) Comparison->Execute(Action); return FReply::Handled(); })
+                    [SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text_Lambda([Comparison, Button] { return Comparison.IsValid() ? Comparison->GetButtonLabel(Button) : Button.Label; })]];
+            }
+            Content->AddSlot().AutoHeight().Padding(0, 6)[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).AutoWrapText(true)
+                .Text_Lambda([Comparison] { return Comparison.IsValid() ? Comparison->GetStatus() : FText::GetEmpty(); })];
+            Content->AddSlot().AutoHeight().Padding(0, 3)[SNew(SButton).Text(FText::FromString(TEXT("Cancel / Restore Settings")))
+                .IsEnabled_Lambda([Comparison] { return Comparison.IsValid() && Comparison->OwnsRenderer(); })
+                .OnClicked_Lambda([Comparison] { if (Comparison.IsValid()) Comparison->Restore(); return FReply::Handled(); })];
+            Content->AddSlot().AutoHeight().Padding(0, 3)[SNew(SButton).Text(FText::FromString(TEXT("Open Results Folder")))
+                .IsEnabled_Lambda([Comparison] { return Comparison.IsValid() && !Comparison->GetOutputDirectory().IsEmpty(); })
+                .OnClicked_Lambda([Comparison] { if (Comparison.IsValid()) FPlatformProcess::ExploreFolder(*Comparison->GetOutputDirectory()); return FReply::Handled(); })];
+            Content->AddSlot().AutoHeight()[Rows];
 
 			ChildSlot.HAlign(HAlign_Right).VAlign(VAlign_Fill).Padding(16)[SNew(SBox).WidthOverride(460)[SNew(SBorder)
 				.BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
@@ -290,7 +315,7 @@ namespace
 				+ SVerticalBox::Slot().AutoHeight()[SNew(SHorizontalBox)
 					+ SHorizontalBox::Slot().FillWidth(1)[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(FText::FromString(TEXT("GM Tools | Rendering")))]
 					+ SHorizontalBox::Slot().AutoWidth()[SNew(SButton).Text(FText::FromString(TEXT("Minimize"))).OnClicked_Lambda([this] { OnMinimize.ExecuteIfBound(); return FReply::Handled(); })]]
-				+ SVerticalBox::Slot().FillHeight(1)[SNew(SScrollBox) + SScrollBox::Slot()[Rows]]
+				+ SVerticalBox::Slot().FillHeight(1)[SNew(SScrollBox) + SScrollBox::Slot()[Content]]
 			]]];
 		}
 		virtual bool SupportsKeyboardFocus() const override { return true; }

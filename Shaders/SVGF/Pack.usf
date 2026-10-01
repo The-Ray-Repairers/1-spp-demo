@@ -1,0 +1,8 @@
+#include "/Project/SVGF/Adapter.ush"
+Texture2D<float4> gNormalDepth;
+void MainPS(float4 Position : SV_Position, out float4 Packed : SV_Target0, out float4 Fwidth : SV_Target1)
+{
+    float4 nd = gNormalDepth[int2(Position.xy)];
+    Packed = float4(nd.w, max(abs(ddx(nd.w)), abs(ddy(nd.w))), ndir_to_oct_snorm(nd.xyz));
+    Fwidth = float4(0, length(abs(ddx(nd.xyz))+abs(ddy(nd.xyz))), 0, 0);
+}

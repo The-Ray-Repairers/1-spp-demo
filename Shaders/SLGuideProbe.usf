@@ -1,0 +1,26 @@
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+
+// Public GBuffer interpretation is intentionally limited to legacy-compatible
+// Substrate GBuffer format 0. Full layered Substrate is not certified here.
+void MainPS(float4 Position : SV_Position,
+    out float4 NormalDepth : SV_Target0,
+    out float4 Diffuse : SV_Target1,
+    out float4 Emission : SV_Target2,
+    out float4 Motion : SV_Target3)
+{
+    float2 UV = Position.xy * View.BufferSizeAndInvSize.zw;
+    FGBufferData G = GetGBufferData(UV);
+    float DeviceZ = LookupDeviceZ(UV);
+    float Z = CalcSceneDepth(UV);
+    float2 Screen = UV * float2(2, -2) + float2(-1, 1);
+    float4 Previous = mul(float4(Screen, DeviceZ, 1), View.ClipToPrevClip);
+    float2 CameraMotion = (Previous.xy / Previous.w - Screen) * float2(.5, -.5);
+    float4 Encoded = SceneTexturesStruct.GBufferVelocityTexture.Load(int3(int2(Position.xy), 0));
+    bool HasVelocity = Encoded.x > 0;
+    float2 DeltaUV = HasVelocity ? DecodeVelocityFromTexture(Encoded).xy * float2(-.5, .5) : CameraMotion;
+    NormalDepth = float4(G.WorldNormal, Z);
+    Diffuse = float4(G.DiffuseColor, G.ShadingModelID);
+    Emission = float4(CalcSceneColor(UV) * View.OneOverPreExposure, 0);
+    Motion = float4(DeltaUV, HasVelocity, 0);
+}

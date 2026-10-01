@@ -1,0 +1,12 @@
+{
+  "commit": "759aad033ff610fb0d82c74f7e0a508d0096d5f2",
+  "sources": {
+    "Source\\RenderPasses\\SVGFPass\\SVGFReproject.ps.slang": "1ef134e0bf8872f8fb3ea3be16f52fa256ed39dab10e189eabfac678e0f0acc2",
+    "Source\\RenderPasses\\SVGFPass\\SVGFFilterMoments.ps.slang": "17e957a0173f887f692325a6c9d0556f3bf7ecd09a1d2c2ac7fefcbfdc675e39",
+    "Source\\RenderPasses\\SVGFPass\\SVGFAtrous.ps.slang": "1a194c4137b96cc01e597bc83945bc70f0123c64341262585d1d836fe280583f",
+    "Source\\RenderPasses\\SVGFPass\\SVGFFinalModulate.ps.slang": "9b92688e583419fc4fc888afb693afe2b3e1521429e6e082c1a43a6028586196",
+    "Source\\RenderPasses\\SVGFPass\\SVGFCommon.slang": "7eeb6f56470417b7b12fca4639e05b571707d7e8661760c3bc1e94f342a31aac",
+    "Source\\Falcor\\Utils\\Math\\MathHelpers.slang": "9cfc82dae6745fede32de9bda14394f4279f5bc244e63e8594a4be6a2a207aa4",
+    "Source\\Falcor\\Utils\\Color\\ColorHelpers.slang": "2496aa8d37869eb7437f98a17bebb5c58da858e543fb252029f26ccbbca0b2da"
+  }
+}

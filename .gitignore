@@ -25,6 +25,11 @@ Intermediate/
 Saved/
 Plugins/*/Binaries/
 Plugins/*/Intermediate/
+# NVIDIA bundle is installed from a user-supplied distribution, not vendored.
+Plugins/DLSS/
+Plugins/StreamlineNGXCommon/
+__pycache__/
+*.pyc
 
 # Local / temporary configuration files
 Config/Saved/

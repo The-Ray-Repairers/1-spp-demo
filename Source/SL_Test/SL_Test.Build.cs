@@ -8,6 +8,10 @@ public class SL_Test : ModuleRules
 	public SL_Test(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+        PrivateIncludePaths.AddRange(new string[] {
+            Path.Combine(GetModuleDirectory("Renderer"), "Private"),
+            Path.Combine(GetModuleDirectory("Renderer"), "Internal")
+        });
 
 		PublicDependencyModuleNames.AddRange(new string[] {
 			"Core",
@@ -29,6 +33,8 @@ public class SL_Test : ModuleRules
 			"RenderCore",
 			"Renderer",   // FRDGBuilder, FScreenPassTexture, AddDrawScreenPass, FPostProcessingInputs
 			"RHI",        // TStaticSamplerState, FRHICopyTextureInfo
+			"Json",
+			"DLSSBlueprint",
 		});
 
 		PublicIncludePaths.AddRange(new string[] {
