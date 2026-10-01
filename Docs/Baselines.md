@@ -146,4 +146,3 @@ Parameters are exposed as `SL.SVGF.Iterations`, `FeedbackTap`, `Alpha`,
 `MomentsAlpha`, `PhiColor`, and `PhiNormal`; the baseline JSON records their values.
 Falcor's exported `VarianceEpsilon` setting is not used in its supplied filter
 shader, so this port does not introduce a misleading control for it.
-
