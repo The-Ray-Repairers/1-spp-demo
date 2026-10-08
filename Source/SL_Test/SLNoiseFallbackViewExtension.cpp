@@ -1,6 +1,9 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "SLNoiseFallbackViewExtension.h"
+#include "SL_Test.h"
+
+extern TAutoConsoleVariable<int32> CVarSLDenoiserMethod;
 // PostProcessMaterialInputs.h defines FPostProcessMaterialInputs, EPostProcessMaterialInput,
 // and EPathTracingPostProcessMaterialInput.  It lives in Renderer/Public so no private path
 // hack is required — just the "Renderer" PrivateDependencyModule in Build.cs.
@@ -33,8 +36,8 @@ IMPLEMENT_GLOBAL_SHADER(FSLNoiseFallbackPS, "/Project/SLNoiseFallback.usf", "Mai
 // -----------------------------------------------------------------------
 
 FSLNoiseFallbackViewExtension::FSLNoiseFallbackViewExtension(
-	const FAutoRegister& AutoRegister, UWorld* InWorld)
-	: FWorldSceneViewExtension(AutoRegister, InWorld)
+	const FAutoRegister& AutoRegister, UWorld* InWorld, bool bInInjectNoise)
+	: FWorldSceneViewExtension(AutoRegister, InWorld), bInjectNoise(bInInjectNoise)
 {
 }
 
@@ -47,7 +50,8 @@ void FSLNoiseFallbackViewExtension::SubscribeToPostProcessingPass(
 	// Subscribe after the MotionBlur pass (the last pre-tonemap stage).
 	// The callback fires regardless of whether motion blur itself is enabled,
 	// giving us the scene colour in linear-HDR space before the tonemapper.
-	if (Pass != EPostProcessingPass::MotionBlur)
+	if (Pass != EPostProcessingPass::MotionBlur || View.bIsOfflineRender ||
+        (!bInjectNoise && !View.Family->EngineShowFlags.PathTracing))
 	{
 		return;
 	}
@@ -80,13 +84,16 @@ FScreenPassTexture FSLNoiseFallbackViewExtension::ApplyNoise_RenderThread(
 		Inputs.GetInput(EPostProcessMaterialInput::SceneColor);
 	FScreenPassTexture SceneColor(SceneColorSlice);
 
-	if (!SceneColor.IsValid() || Scale <= 0.0f)
+	if (!SceneColor.IsValid())
 	{
 		return SceneColor;  // pass through unchanged
 	}
 
 	const FIntRect ViewRect = SceneColor.ViewRect;
 
+	FScreenPassTexture NoisyOutput = SceneColor;
+    if (bInjectNoise && Scale > 0.f)
+    {
 	// Allocate an output texture of the same format.
 	FRDGTextureDesc OutputDesc = SceneColor.Texture->Desc;
 	FRDGTextureRef OutputTexture = GraphBuilder.CreateTexture(
@@ -122,7 +129,8 @@ FScreenPassTexture FSLNoiseFallbackViewExtension::ApplyNoise_RenderThread(
 
 	// Return the noisy texture as the new scene colour.
 	// The tonemapper (and all subsequent post-process passes) will receive this.
-	FScreenPassTexture NoisyOutput = FScreenPassTexture(OutputTexture, ViewRect);
+	NoisyOutput = FScreenPassTexture(OutputTexture, ViewRect);
+    }
 
 	// -----------------------------------------------------------------
 	// Denoiser pass  —  selected at runtime by SL.Denoiser.Method.
@@ -137,5 +145,26 @@ FScreenPassTexture FSLNoiseFallbackViewExtension::ApplyNoise_RenderThread(
 	DenoiserContext.SceneColor    = NoisyOutput;
 	DenoiserContext.SceneTextures = Inputs.SceneTextures;
 
-	return GetActiveDenoiser()->Apply(GraphBuilder, View, DenoiserContext);
+    const FScreenPassTexture Filtered = GetActiveDenoiser()->Apply(GraphBuilder, View, DenoiserContext);
+    const int32 Method = CVarSLDenoiserMethod.GetValueOnRenderThread();
+    if (Method != LastExecutedMethod)
+    {
+        UE_LOG(LogSL_Test, Display, TEXT("SL filter: method=%d source=%s filtered_output=%s"), Method,
+            bInjectNoise ? TEXT("software") : TEXT("hardware path tracing"),
+            Filtered.Texture != NoisyOutput.Texture ? TEXT("yes") : TEXT("no"));
+        LastExecutedMethod = Method;
+    }
+    const float Split = ComparisonPosition.Load();
+    if (Split >= 0.f && Filtered.Texture != NoisyOutput.Texture)
+    {
+        // Preserve filter output/history; compose into a separate display texture.
+        auto Composite = GraphBuilder.CreateTexture(Filtered.Texture->Desc, TEXT("SLFilter.Comparison"));
+        AddCopyTexturePass(GraphBuilder, Filtered.Texture, Composite);
+        FRHICopyTextureInfo Copy;
+        Copy.SourcePosition = Copy.DestPosition = FIntVector(ViewRect.Min.X, ViewRect.Min.Y, 0);
+        Copy.Size = FIntVector(FMath::Clamp(FMath::RoundToInt(ViewRect.Width() * Split), 0, ViewRect.Width()), ViewRect.Height(), 1);
+        if (Copy.Size.X > 0) AddCopyTexturePass(GraphBuilder, NoisyOutput.Texture, Composite, Copy);
+        return FScreenPassTexture(Composite, Filtered.ViewRect);
+    }
+	return Filtered;
 }

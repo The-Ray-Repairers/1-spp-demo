@@ -8,6 +8,10 @@ public class SL_Test : ModuleRules
 	public SL_Test(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+        if (Target.bBuildEditor)
+        {
+            PrivateDependencyModuleNames.AddRange(new string[] { "UnrealEd", "UMGEditor", "KismetCompiler", "AssetRegistry" });
+        }
         PrivateIncludePaths.AddRange(new string[] {
             Path.Combine(GetModuleDirectory("Renderer"), "Private"),
             Path.Combine(GetModuleDirectory("Renderer"), "Internal")

@@ -87,7 +87,10 @@ void USLPathTracerSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 	const int32 TargetSPP = CVarSLPathTracerTargetSPP.GetValueOnGameThread();
 
-	if (!IsRayTracingEnabled())
+	const bool bSoftwareFallback = !IsRayTracingEnabled();
+    // Both paths need the selected filter. Only the software path adds synthetic noise.
+    NoiseFallbackViewExtension = FSceneViewExtensions::NewExtension<FSLNoiseFallbackViewExtension>(GetWorld(), bSoftwareFallback);
+	if (bSoftwareFallback)
 	{
 		UE_LOG(LogSL_Test, Warning,
 			TEXT("SL.PathTracer: hardware ray tracing is not available — "
@@ -97,8 +100,6 @@ void USLPathTracerSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		// tonemapper each frame to approximate the visual appearance of a real 1-spp
 		// path-traced output.  The two on-screen messages make it unmistakable to any
 		// developer that this is NOT the physically-based solution.
-		NoiseFallbackViewExtension =
-			FSceneViewExtensions::NewExtension<FSLNoiseFallbackViewExtension>(GetWorld());
 
 		if (GEngine)
 		{
@@ -144,10 +145,6 @@ void USLPathTracerSubsystem::Tick(float DeltaTime)
 			if (IConsoleVariable* AutoExposureCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.DefaultFeature.AutoExposure")))
 			{
 				AutoExposureCVar->Set(MethodInt == 4 ? 0 : 1, ECVF_SetByConsole);
-			}
-			if (IConsoleVariable* ExposureCompCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.EyeAdaptation.ExposureCompensation")))
-			{
-				ExposureCompCVar->Set(MethodInt == 4 ? 1.0f : 0.0f, ECVF_SetByConsole);
 			}
 			LastMethodInt = MethodInt;
 		}

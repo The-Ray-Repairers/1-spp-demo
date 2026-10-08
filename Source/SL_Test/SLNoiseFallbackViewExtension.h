@@ -48,21 +48,16 @@ public:
 };
 
 /**
- * Software 1-spp noise fallback — active only when hardware ray tracing is
- * unavailable (e.g. GTX 1660 / DXR Tier 1.0 GPUs).
- *
- * Subscribes to EPostProcessingPass::MotionBlur (the last pre-tonemap pass),
- * then injects a Poisson shot noise pass so the tonemapper and all later
- * passes receive the noisy linear-HDR colour as their input.
- *
- * This is intentionally a DEVELOPMENT FALLBACK.  USLPathTracerSubsystem
- * displays a persistent red/orange on-screen warning whenever this extension
- * is active so developers cannot mistake it for the physically-based path.
+ * Pre-tonemap filter selection for hardware path tracing and the software fallback.
+ * Only the software path injects synthetic Poisson noise; hardware samples pass
+ * directly to the selected filter. Offline reference views are excluded.
+ * USLPathTracerSubsystem warns on screen only when using the software fallback.
  */
 class FSLNoiseFallbackViewExtension : public FWorldSceneViewExtension
 {
 public:
-	FSLNoiseFallbackViewExtension(const FAutoRegister& AutoRegister, UWorld* InWorld);
+	FSLNoiseFallbackViewExtension(const FAutoRegister& AutoRegister, UWorld* InWorld, bool bInInjectNoise = true);
+    void SetComparisonPosition(float Position) { ComparisonPosition.Store(Position); }
 
 	// FSceneViewExtensionBase overrides
 	virtual void SetupView(FSceneViewFamily& InViewFamily, FSceneView& InView) override {}
@@ -81,6 +76,9 @@ public:
 		bool bIsPassEnabled) override;
 
 private:
+	const bool bInjectNoise;
+	int32 LastExecutedMethod = INDEX_NONE;
+    TAtomic<float> ComparisonPosition{-1.f};
 	/**
 	 * The actual noise pass, executed as a post-process callback.
 	 * Reads the linear-HDR scene colour from Inputs, adds Poisson shot noise,

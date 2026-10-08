@@ -25,6 +25,7 @@ IMPLEMENT_GLOBAL_SHADER(FSLGuidePS, "/Project/SLGuideProbe.usf", "MainPS", SF_Pi
 
 struct FSLGuideFrame
 {
+    TAtomic<float> ComparisonPosition{-1.f};
     FRDGBuilder* Graph = nullptr;
     uint32 Number = 0;
     TArray<FRDGTextureRef> Textures;
@@ -92,7 +93,18 @@ public:
         if (bSameFrame)
             Result = Filter.AddPasses(Graph, View, Inputs.ColorTex, Frame->Textures[0], Frame->Textures[1], Frame->Textures[2], Frame->Textures[3]);
         AddCopyTexturePass(Graph, Result, Inputs.OutputTex);
-
+        // Composite only the display output, AFTER SVGF has queued its own history.
+        // Both sources share the same sample, camera, exposure and tonemapping path.
+        // Copying a subregion avoids a second render and preserves unscaled pixels.
+        const float Position = Frame->ComparisonPosition.Load();
+        if (bSameFrame && Position > 0.f)
+        {
+            FRHICopyTextureInfo Copy;
+            const FIntPoint Size = Inputs.ColorTex->Desc.Extent;
+            Copy.Size = FIntVector(FMath::Clamp(FMath::RoundToInt(Size.X * Position), 0, Size.X), Size.Y, 1);
+            // A zero copy extent means "whole texture" in RHI, not an empty region.
+            if (Copy.Size.X > 0) AddCopyTexturePass(Graph, Inputs.ColorTex, Inputs.OutputTex, Copy);
+        }
     }
 private:
     TSharedPtr<FSLGuideFrame, ESPMode::ThreadSafe> Frame;
@@ -110,6 +122,11 @@ FSLGuideProbe::~FSLGuideProbe()
 {
     UnregisterDenoiser(TEXT("SLGuides"));
     GuideViewState.Destroy();
+}
+
+void FSLGuideProbe::SetComparisonPosition(float Position)
+{
+    Frame->ComparisonPosition.Store(FMath::IsFinite(Position) ? FMath::Clamp(Position, -1.f, 1.f) : -1.f);
 }
 
 

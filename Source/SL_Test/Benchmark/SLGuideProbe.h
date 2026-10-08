@@ -13,6 +13,8 @@ public:
     virtual void SetupViewFamily(FSceneViewFamily&) override {}
     virtual void SetupView(FSceneViewFamily&, FSceneView&) override {}
     virtual void BeginRenderViewFamily(FSceneViewFamily& Family) override;
+    /** Negative disables the wipe; otherwise the raw image occupies [0, Position). */
+    void SetComparisonPosition(float Position);
 private:
     FSceneViewStateReference GuideViewState;
     TSharedPtr<FSLGuideFrame, ESPMode::ThreadSafe> Frame;

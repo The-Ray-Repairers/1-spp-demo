@@ -32,6 +32,8 @@ private:
 	TObjectPtr<USLGMToolConfig> Configuration;
 	TSharedPtr<SWidget> Panel;
 	TSharedPtr<SWidget> MinimizedButton;
+	UPROPERTY(Transient)
+	TObjectPtr<class USLLiveComparisonUserWidget> LiveComparison;
 	bool bPreviousCursor = false;
 	bool bMinimized = false;
 	bool bInputCaptured = false;

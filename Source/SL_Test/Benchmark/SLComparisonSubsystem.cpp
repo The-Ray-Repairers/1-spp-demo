@@ -1,62 +1,84 @@
 #include "SLComparisonSubsystem.h"
+#include "SLComparisonView.h"
 #include "SLGuideProbe.h"
+#include "SL_Test.h"
+#include "Debug/GMTools/SLGMCommandService.h"
 #include "DLSSLibrary.h"
 #include "Camera/CameraActor.h"
 #include "Camera/CameraComponent.h"
-#include "Camera/PlayerCameraManager.h"
-#include "GameFramework/PlayerController.h"
-#include "Engine/GameViewportClient.h"
 #include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
+#include "Engine/GameViewportClient.h"
 #include "Kismet/KismetRenderingLibrary.h"
-#include "SceneViewExtension.h"
-#include "SceneManagement.h"
-#include "ImageUtils.h"
+#include "HAL/PlatformProcess.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
-#include "Misc/EngineVersion.h"
-#include "HAL/PlatformProcess.h"
 #include "RenderingThread.h"
-#include "UnrealClient.h"
-#include "HAL/FileManager.h"
-#include "Engine/LocalPlayer.h"
-#include "Engine/GameInstance.h"
-#include "RHI.h"
 #include "RenderUtils.h"
+#include "UnrealClient.h"
 
-class FSLComparisonView : public FWorldSceneViewExtension
+const FSLGMToolEntry& USLComparisonSubsystem::ResolveEntry(const FSLGMToolEntry& Entry) const
 {
-public:
-    FSLComparisonView(const FAutoRegister& Register, UWorld* World) : FWorldSceneViewExtension(Register, World) {}
-    bool bReference = false;
-    TAtomic<uint32> Samples{0};
-    virtual void SetupViewFamily(FSceneViewFamily&) override {}
-    virtual void SetupView(FSceneViewFamily&, FSceneView& V) override { if (bReference) V.bIsOfflineRender = true; }
-    virtual void BeginRenderViewFamily(FSceneViewFamily&) override {}
-    virtual void PreRenderView_RenderThread(FRDGBuilder&, FSceneView& V) override
-    { if (V.State && V.Family->EngineShowFlags.PathTracing) Samples.Store(V.State->GetPathTracingSampleIndex()); }
-};
+    const auto* Config = Configuration ? Configuration.Get() : GetDefault<USLGMToolSettings>()->Configuration.LoadSynchronous();
+    if (Config && !Entry.Id.IsNone())
+        if (const auto* Current = Config->Entries.FindByPredicate([&](const FSLGMToolEntry& E) { return E.Id == Entry.Id; })) return *Current;
+    return Entry;
+}
+
+int32 USLComparisonSubsystem::ReadSamples(const FSLGMToolEntry& Entry) const
+{
+    if (Entry.Profile.SamplesVariable.IsEmpty()) return Entry.Profile.SamplesPerPixel;
+    const auto* Variable = IConsoleManager::Get().FindConsoleVariable(*Entry.Profile.SamplesVariable);
+    return Variable ? Variable->GetInt() : 0;
+}
 
 bool USLComparisonSubsystem::CanExecute(ESLComparisonAction Action, FText& Reason) const
 {
+    const auto* Config = Configuration ? Configuration.Get() : GetDefault<USLGMToolSettings>()->Configuration.LoadSynchronous();
+    if (Config)
+        if (const auto* Entry = Config->Entries.FindByPredicate([Action](const FSLGMToolEntry& E) { return E.Control == ESLGMControlType::RenderingAction && E.Action == Action; }))
+            return CanExecute(*Entry, Reason);
+    Reason = FText::FromString(TEXT("Rendering profile is missing."));
+    return false;
+}
+
+bool USLComparisonSubsystem::CanExecute(const FSLGMToolEntry& Requested, FText& Reason) const
+{
+    const auto& Entry = ResolveEntry(Requested);
     auto Reject = [&Reason](const TCHAR* Text) { Reason = FText::FromString(Text); return false; };
-    if (Action == ESLComparisonAction::Restore) return OwnsRenderer();
-    if (Action == ESLComparisonAction::OpenResults) return !Output.IsEmpty();
-    if (IsBusy()) return Reject(TEXT("Capture in progress. Wait or cancel."));
+    if (Entry.Action == ESLComparisonAction::Restore) return OwnsRenderer();
+    if (Entry.Action == ESLComparisonAction::OpenResults) return !Output.IsEmpty();
+    if (Entry.Id.IsNone()) return Reject(TEXT("Give each rendering profile a unique Id."));
+    if (Configuration && Configuration->Entries.FilterByPredicate([&](const FSLGMToolEntry& E) { return E.Id == Entry.Id; }).Num() > 1)
+        return Reject(TEXT("Rendering profile Ids must be unique."));
     if (!GetWorld()->GetFirstPlayerController() || !GetWorld()->GetGameViewport()) return Reject(TEXT("Start the game first."));
     if (!GetWorld()->GetGameViewport()->Viewport) return Reject(TEXT("The game viewport is not ready."));
-    if (Action != ESLComparisonAction::RR && !IsRayTracingEnabled()) return Reject(TEXT("Hardware ray tracing is not enabled."));
+    const auto& Profile = Entry.Profile;
+    if ((Profile.Backend != ESLGMRenderBackend::LumenDLSSRR || bLiveComparison) && !IsRayTracingEnabled()) return Reject(TEXT("Hardware ray tracing is not enabled."));
+    if (ReadSamples(Entry) < 1) return Reject(TEXT("The configured sample count must be at least 1; check SamplesVariable or SamplesPerPixel."));
+    if (Profile.Backend != ESLGMRenderBackend::LumenDLSSRR && !Profile.bAccumulate && ReadSamples(Entry) != 1)
+        return Reject(TEXT("Enable Accumulate for multi-sample path tracing."));
+    if (Profile.bSaveImage && !Profile.bAccumulate) return Reject(TEXT("Saving a reference requires Accumulate."));
+    if ((Profile.bAccumulate || Profile.Backend == ESLGMRenderBackend::LumenDLSSRR || ReadSamples(Entry) != 1)
+        && Profile.ComparisonSource != ESLGMComparisonSource::IndependentRaw)
+        return Reject(TEXT("Accumulated, multi-sample and Lumen previews require Independent Raw comparison."));
+    if (Profile.bAccumulate && Profile.Backend != ESLGMRenderBackend::PathTracing)
+        return Reject(TEXT("Accumulation currently requires the Path Tracing backend."));
+    for (const auto& Setting : Entry.RenderSettings)
+        if (!IConsoleManager::Get().FindConsoleVariable(*Setting.Name))
+        { Reason = FText::FromString(TEXT("Unavailable rendering setting: ") + Setting.Name); return false; }
     if (GetWorld()->GetGameInstance()->GetLocalPlayers().Num() != 1) return Reject(TEXT("Comparison requires one local player and one viewport."));
     for (const auto& Context : GEngine->GetWorldContexts())
         if (Context.World() && Context.World() != GetWorld() && Context.World()->IsGameWorld())
             return Reject(TEXT("Close other game instances before comparing."));
-    if (Action == ESLComparisonAction::SVGF)
+    if (Profile.Backend == ESLGMRenderBackend::SVGF)
     {
         if (IConsoleManager::Get().FindConsoleVariable(TEXT("r.VelocityOutputPass"))->GetInt() != 1)
             return Reject(TEXT("Restart the editor to apply the SVGF startup settings."));
         if (IConsoleManager::Get().FindConsoleVariable(TEXT("r.Substrate.ProjectGBufferFormat"))->GetInt() != 0)
             return Reject(TEXT("The current GBuffer format is not supported by this SVGF implementation."));
     }
-    if ((Action == ESLComparisonAction::RR) &&
+    if (Profile.Backend == ESLGMRenderBackend::LumenDLSSRR &&
         (!UDLSSLibrary::IsDLSSSupported() || !UDLSSLibrary::IsDLSSRRSupported()))
         return Reject(TEXT("DLSS RR is unavailable. Use a supported GPU and DX12 Standalone Game."));
     Reason = FText::GetEmpty();
@@ -77,8 +99,19 @@ void USLComparisonSubsystem::ReleaseGuide()
     if (Guide) { FlushRenderingCommands(); Guide.Reset(); FlushRenderingCommands(); }
 }
 
-bool USLComparisonSubsystem::Apply(ESLComparisonAction Action)
+void USLComparisonSubsystem::RestoreVariables()
 {
+    for (const auto& Pair : SavedVariables)
+    {
+        if (auto* Variable = IConsoleManager::Get().FindConsoleVariable(*Pair.Key))
+            Variable->Set(*Pair.Value, ECVF_SetByConsole);
+    }
+}
+
+bool USLComparisonSubsystem::Apply()
+{
+    const int32 RequestedSamples = ReadSamples(ActiveEntry);
+    DisableLiveComparison();
     for (const auto& Setting : ActiveEntry.RenderSettings)
         if (!IConsoleManager::Get().FindConsoleVariable(*Setting.Name)) { Fail(TEXT("Unavailable rendering setting: ") + Setting.Name); return false; }
     if (!bOwned)
@@ -94,24 +127,25 @@ bool USLComparisonSubsystem::Apply(ESLComparisonAction Action)
     UDLSSLibrary::EnableDLSS(false);
     // Reset the union of owned settings before applying a mode, so e.g. offline
     // samples and DLSS AA settings cannot leak into the next renderer.
-    for (const auto& Pair : SavedVariables)
-        if (auto* V = IConsoleManager::Get().FindConsoleVariable(*Pair.Key)) V->Set(*Pair.Value, ECVF_SetByConsole);
+    RestoreVariables();
     // Snapshot all configured values before scalability can change dependent CVars.
     for (const auto& Setting : ActiveEntry.RenderSettings)
         if (!SavedVariables.Contains(Setting.Name)) SavedVariables.Add(Setting.Name, IConsoleManager::Get().FindConsoleVariable(*Setting.Name)->GetString());
     for (const auto& Setting : ActiveEntry.RenderSettings) SetVariable(Setting.Name, Setting.Value);
-    if (Action == ESLComparisonAction::Reference) SetVariable(TEXT("r.PathTracing.SamplesPerPixel"), FString::FromInt(ReferenceSamples));
-    Active = Action;
-    View->bReference = Action == ESLComparisonAction::Reference;
+    const auto& Profile = ActiveEntry.Profile;
+    ReferenceSamples = RequestedSamples;
+    SetVariable(TEXT("r.PathTracing.SamplesPerPixel"), FString::FromInt(ReferenceSamples));
+    View->bReference = Profile.bAccumulate;
+    View->DenoiserOverride = -1;
     View->Samples.Store(0);
-    UKismetRenderingLibrary::EnablePathTracing(Action != ESLComparisonAction::RR);
-    if (Action == ESLComparisonAction::RR)
+    UKismetRenderingLibrary::EnablePathTracing(Profile.Backend != ESLGMRenderBackend::LumenDLSSRR);
+    if (Profile.Backend == ESLGMRenderBackend::LumenDLSSRR)
     {
         UDLSSLibrary::EnableDLSS(true);
         UDLSSLibrary::EnableDLSSRR(true);
         if (!UDLSSLibrary::IsDLSSRREnabled()) { Fail(TEXT("Failed to enable DLSS RR.")); return false; }
     }
-    else if (Action == ESLComparisonAction::SVGF)
+    else if (Profile.Backend == ESLGMRenderBackend::SVGF)
     {
         Guide = FSceneViewExtensions::NewExtension<FSLGuideProbe>(GetWorld());
         SetVariable(TEXT("r.PathTracing.Denoiser"), TEXT("1"));
@@ -123,7 +157,7 @@ bool USLComparisonSubsystem::Apply(ESLComparisonAction Action)
     {
         auto& PP = CaptureCamera->GetCameraComponent()->PostProcessSettings;
         PP.bOverride_PathTracingSamplesPerPixel = true;
-        PP.PathTracingSamplesPerPixel = Action == ESLComparisonAction::Reference ? ReferenceSamples : 1;
+        PP.PathTracingSamplesPerPixel = ReferenceSamples;
         PP.bOverride_PathTracingMaxBounces = true;
         PP.PathTracingMaxBounces = IConsoleManager::Get().FindConsoleVariable(TEXT("r.PathTracing.MaxBounces"))->GetInt();
     }
@@ -131,110 +165,38 @@ bool USLComparisonSubsystem::Apply(ESLComparisonAction Action)
     return true;
 }
 
-bool USLComparisonSubsystem::Execute(const FSLGMToolEntry& Entry, USLGMToolConfig* Config)
+bool USLComparisonSubsystem::Execute(const FSLGMToolEntry& Requested, USLGMToolConfig* Config)
 {
-    const auto Action = Entry.Action;
-    FText Reason;
-    if (!CanExecute(Action, Reason)) { Status = Reason.ToString(); return false; }
-    if (Action == ESLComparisonAction::Restore) { Restore(); return true; }
-    if (Action == ESLComparisonAction::OpenResults) { FPlatformProcess::ExploreFolder(*Output); return true; }
     if (!Config) { Status = TEXT("No GM configuration asset assigned."); return false; }
     Configuration = Config;
-    ActiveEntry = Entry;
-    if (Action == ESLComparisonAction::Reference) return StartCapture();
-    return Apply(Action);
-}
-
-bool USLComparisonSubsystem::StartCapture()
-{
-    if (FScreenshotRequest::IsScreenshotRequested())
-    { Status = TEXT("Another screenshot is active. Try again later."); return false; }
-    const auto* Samples = IConsoleManager::Get().FindConsoleVariable(*Configuration->ReferenceSamplesVariable);
-    if (!Samples || Samples->GetInt() < 1) { Status = TEXT("Set Target Samples Per Pixel to at least 1 and click Apply."); return false; }
-    ReferenceSamples = Samples->GetInt();
-    auto* PC = GetWorld()->GetFirstPlayerController();
-    auto* Viewport = GetWorld()->GetGameViewport();
-    CaptureSize = Viewport->Viewport->GetSizeXY();
-    if (CaptureSize.GetMin() <= 0) { Status = TEXT("The viewport has no valid image size."); return false; }
-    const FString FolderName = FString::Printf(TEXT("%s_%dSPP"), *FDateTime::Now().ToString(TEXT("%Y-%m-%d_%H-%M-%S")), ReferenceSamples);
-    const FString BaseDirectory = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("References"), FolderName));
-    Output = BaseDirectory;
-    for (int32 Suffix = 2; IFileManager::Get().DirectoryExists(*Output) || IFileManager::Get().FileExists(*Output); ++Suffix)
-        Output = FString::Printf(TEXT("%s_%d"), *BaseDirectory, Suffix);
-    if (!IFileManager::Get().MakeDirectory(*Output, true))
-    { Status = TEXT("Unable to create the reference output folder."); return false; }
-    const auto POV = PC->PlayerCameraManager->GetCameraCacheView();
-    PreviousCamera = PC->GetViewTarget();
-    bPausedBefore = PC->IsPaused();
-    CaptureCamera = GetWorld()->SpawnActor<ACameraActor>(POV.Location, POV.Rotation);
-    if (!CaptureCamera) { Status = TEXT("Unable to create the capture camera."); return false; }
-    CaptureCamera->GetCameraComponent()->FieldOfView = POV.FOV;
-    CaptureCamera->GetCameraComponent()->PostProcessSettings = POV.PostProcessSettings;
-    PC->SetViewTarget(CaptureCamera);
-    PC->SetPause(true);
+    const FSLGMToolEntry Entry = ResolveEntry(Requested);
+    FText Reason;
+    if (!CanExecute(Entry, Reason)) { Status = Reason.ToString(); return false; }
+    if (Entry.Action == ESLComparisonAction::Restore) { Restore(); return true; }
+    if (Entry.Action == ESLComparisonAction::OpenResults) { FPlatformProcess::ExploreFolder(*Output); return true; }
+    // A selected preset may replace an in-progress capture; do not lock the GM panel.
+    CancelCapture(TEXT("Capture replaced by another selection."));
     CaptureMetadata.Reset();
-    bCapturing = true;
-    ScreenshotHandle = UGameViewportClient::OnScreenshotCaptured().AddUObject(this, &USLComparisonSubsystem::Screenshot);
-    StartReference();
-    return IsBusy();
-}
-
-void USLComparisonSubsystem::StartReference()
-{
-    const auto Action = ESLComparisonAction::Reference;
-    if (!Apply(Action)) return;
-    bRequested = false; bImageSaved = false;
-    StageStarted = FPlatformTime::Seconds();
-    TargetSamples = Action == ESLComparisonAction::Reference ? CaptureCamera->GetCameraComponent()->PostProcessSettings.PathTracingSamplesPerPixel : 1;
-    CaptureMetadata = FString::Printf(TEXT("Label: %s\nTarget SPP: %d\nCamera: %s\nFOV: %g\nResolution: %d x %d\n"),
-        *ActiveEntry.Label.ToString(), TargetSamples, *CaptureCamera->GetActorTransform().ToString(),
-        CaptureCamera->GetCameraComponent()->FieldOfView, CaptureSize.X, CaptureSize.Y);
-    for (const auto& Pair : SavedVariables)
-        if (const auto* Variable = IConsoleManager::Get().FindConsoleVariable(*Pair.Key)) CaptureMetadata += Pair.Key + TEXT("=") + Variable->GetString() + TEXT("\n");
-    WriteReport();
-}
-
-void USLComparisonSubsystem::Screenshot(int32 Width, int32 Height, const TArray<FColor>& Pixels)
-{
-    if (!bExpectScreenshot) return;
-    bExpectScreenshot = false;
-    if (FIntPoint(Width, Height) != CaptureSize) { Fail(TEXT("The viewport size changed. Start a new capture.")); return; }
-    TArray64<uint8> PNG;
-    FImageUtils::PNGCompressImageArray(Width, Height, Pixels, PNG);
-    if (!FFileHelper::SaveArrayToFile(PNG, *FPaths::Combine(Output, TEXT("output.png")))) { Fail(TEXT("Failed to save the image.")); return; }
-    bImageSaved = true;
-}
-
-void USLComparisonSubsystem::WriteReport()
-{
-    if (CaptureMetadata.IsEmpty()) return;
-    const FString Text = CaptureMetadata + FString::Printf(TEXT("Status: %s\nEngine: %s\nGPU: %s\nMap: %s\nUTC: %s\nElapsed seconds: %.3f\nCompleted SPP: %u\n"),
-        *Status, *FEngineVersion::Current().ToString(), *GRHIAdapterName, *GetWorld()->GetOutermost()->GetName(),
-        *FDateTime::UtcNow().ToIso8601(), FPlatformTime::Seconds() - StageStarted, View ? View->Samples.Load() : 0);
-    FFileHelper::SaveStringToFile(Text, *FPaths::Combine(Output, TEXT("capture.txt")), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
-}
-
-void USLComparisonSubsystem::ReleaseCamera()
-{
-    UGameViewportClient::OnScreenshotCaptured().Remove(ScreenshotHandle);
-    if (CaptureCamera)
-    {
-        if (auto* PC = GetWorld()->GetFirstPlayerController()) { if (PreviousCamera) PC->SetViewTarget(PreviousCamera); PC->SetPause(bPausedBefore); }
-        CaptureCamera->Destroy(); CaptureCamera = nullptr; PreviousCamera = nullptr;
-    }
+    PreviewBeforeCapture = ActiveEntry;
+    bResumeLiveAfterCapture = bLiveComparison && !Entry.Profile.bKeepSelectedAfterCapture;
+    const auto* Method = ActiveEntry.Profile.LabelOptionVariable.IsEmpty() ? nullptr : IConsoleManager::Get().FindConsoleVariable(*ActiveEntry.Profile.LabelOptionVariable);
+    MethodBeforeCapture = Method ? Method->GetInt() : 0;
+    ActiveEntry = Entry;
+    if (Entry.Profile.bAccumulate) return StartCapture();
+    return ApplySelectedProfile();
 }
 
 void USLComparisonSubsystem::Restore()
 {
-    if (IsBusy() && !Output.IsEmpty()) { Status = TEXT("Cancelled. Partial results were retained."); WriteReport(); }
-    if (bExpectScreenshot) FScreenshotRequest::Reset();
-    bCapturing = false; bExpectScreenshot = false;
-    ReleaseCamera(); ReleaseGuide();
+    bResumeLiveAfterCapture = false;
+    DisableLiveComparison();
+    CancelCapture(TEXT("Cancelled. Partial results were retained."));
+    ReleaseGuide();
     if (bOwned)
     {
         FlushRenderingCommands(); View.Reset();
         UDLSSLibrary::EnableDLSSRR(false); UDLSSLibrary::EnableDLSS(false);
-        for (const auto& Pair : SavedVariables) if (auto* V = IConsoleManager::Get().FindConsoleVariable(*Pair.Key)) V->Set(*Pair.Value, ECVF_SetByConsole);
+        RestoreVariables();
         UKismetRenderingLibrary::EnablePathTracing(bSavedPathTracing);
         UDLSSLibrary::EnableDLSS(bSavedDLSS); UDLSSLibrary::EnableDLSSRR(bSavedRR);
     }
@@ -244,46 +206,82 @@ void USLComparisonSubsystem::Restore()
 
 void USLComparisonSubsystem::Fail(const FString& Message)
 {
+    UE_LOG(LogSL_Test, Error, TEXT("Rendering comparison failed: %s"), *Message);
     const FString Error = Message;
     Restore(); Status = Error;
-    if (!Output.IsEmpty()) { WriteReport(); FFileHelper::SaveStringToFile(Error, *FPaths::Combine(Output, TEXT("failed.txt"))); }
+    if (!CaptureMetadata.IsEmpty()) { WriteReport(); FFileHelper::SaveStringToFile(Error, *FPaths::Combine(Output, TEXT("failed.txt"))); }
 }
 
-FText USLComparisonSubsystem::GetButtonLabel(const FSLGMToolEntry& Button) const
+FText USLComparisonSubsystem::GetButtonLabel(const FSLGMToolEntry& Requested) const
 {
-    if (Button.Action != ESLComparisonAction::Reference) return Button.Label;
-    const auto* Config = Configuration ? Configuration.Get() : GetDefault<USLGMToolSettings>()->Configuration.LoadSynchronous();
-    const auto* Samples = Config ? IConsoleManager::Get().FindConsoleVariable(*Config->ReferenceSamplesVariable) : nullptr;
-    const int32 Count = IsBusy() ? ReferenceSamples : (Samples ? Samples->GetInt() : 1);
-    return FText::Format(Button.Label, FText::AsNumber(Count));
+    const auto& Entry = ResolveEntry(Requested);
+    FFormatNamedArguments Args;
+    const auto Count = FText::AsNumber(ReadSamples(Entry));
+    Args.Add(TEXT("0"), Count); Args.Add(TEXT("Samples"), Count);
+    return FText::Format(Entry.Label, Args);
 }
 
-FText USLComparisonSubsystem::GetStatus() const
+bool USLComparisonSubsystem::RefreshSelectedProfile()
 {
-    if (IsBusy() && Active == ESLComparisonAction::Reference && View)
-        return FText::FromString(FString::Printf(TEXT("Generating reference: %u / %d SPP"), View->Samples.Load(), TargetSamples));
-    return FText::FromString(Status);
-}
-
-void USLComparisonSubsystem::Tick(float DeltaTime)
-{
-    if (!IsBusy()) return;
-    if (GetWorld()->GetGameViewport()->Viewport->GetSizeXY() != CaptureSize) { Fail(TEXT("Viewport resized. Capture stopped.")); return; }
-    if (FPlatformTime::Seconds()-StageStarted > Configuration->CaptureTimeoutSeconds) { Fail(TEXT("Capture timed out. Results were retained.")); return; }
-    if (!bRequested && View->Samples.Load() >= uint32(TargetSamples))
+    if (!bOwned || !Configuration) return false;
+    const auto* Current = Configuration->FindProfile(ActiveEntry.Id);
+    if (!Current) return false;
+    // Re-read the asset and bound sample CVar, including edits made after selection.
+    if (!FSLGMToolEntry::StaticStruct()->CompareScriptStruct(Current, &ActiveEntry, 0)
+        || ReadSamples(*Current) != ReferenceSamples)
     {
-        bRequested = true; bExpectScreenshot = true;
-        FScreenshotRequest::RequestScreenshot(false);
+        return Execute(*Current, Configuration);
     }
-    if (bImageSaved)
-    {
-        Status = TEXT("Reference image saved: ") + Output;
-        WriteReport();
-        bCapturing = false;
-        const FString CompletedStatus = Status;
-        Restore();
-        Status = CompletedStatus;
-    }
+    return false;
+}
+
+bool USLComparisonSubsystem::SelectPreviewMethod(const FSLGMToolEntry& Entry, int32 Value, FText& Result)
+{
+    if (!CanSelectPreviewMethod() || !Configuration || Entry.PreviewProfileId.IsNone()) return false;
+    if (!Entry.RadioOptions.ContainsByPredicate([Value](const FSLGMRadioOption& O) { return O.Value == Value; })) return false;
+    const auto* Raw = Configuration->FindProfile(Entry.PreviewProfileId);
+    if (!Raw) { Result = FText::FromString(TEXT("Raw rendering profile is missing.")); return false; }
+    // Switch the renderer, not merely the caption: filters must receive raw input.
+    if (!Execute(*Raw, Configuration)) { Result = GetStatus(); return false; }
+    const bool bApplied = FSLGMCommandService::Apply(Entry, FString::FromInt(Value), Result);
+    Status = Result.ToString();
+    OnLiveComparisonChanged.Broadcast();
+    return bApplied;
 }
 
 void USLComparisonSubsystem::Deinitialize() { Restore(); Super::Deinitialize(); }
+
+void USLComparisonSubsystem::Tick(float DeltaTime)
+{
+    if (RefreshSelectedProfile()) return;
+    if (RefreshPreviewMethod()) return;
+    TickCapture();
+}
+
+bool USLComparisonSubsystem::ApplySelectedProfile()
+{
+    const bool bRestoreComparison = bLiveComparison;
+    if (!Apply()) return false;
+    if (bRestoreComparison && !ActivateLiveComparison())
+    {
+        Fail(Status);
+        return false;
+    }
+    OnLiveComparisonChanged.Broadcast();
+    return true;
+}
+
+bool USLComparisonSubsystem::RefreshPreviewMethod()
+{
+    if (!bLiveComparison || !Guide || !Configuration) return false;
+    for (const auto& Control : Configuration->Entries)
+    {
+        if (Control.PreviewProfileId.IsNone() || Control.PreviewProfileId == ActiveEntry.Id) continue;
+        const auto* Profile = Configuration->FindProfile(Control.PreviewProfileId);
+        const auto* Variable = IConsoleManager::Get().FindConsoleVariable(*Control.ConsoleVariable);
+        if (!Profile || !Variable || Variable->GetInt() == Profile->Profile.PassthroughOptionValue) continue;
+        FText Result;
+        if (SelectPreviewMethod(Control, Variable->GetInt(), Result)) return true;
+    }
+    return false;
+}
