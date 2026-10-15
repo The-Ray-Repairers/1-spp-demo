@@ -47,8 +47,8 @@ enum class ESLFlythroughPhase : uint8
  *  1. Select a method
  *  2. Click "Render Flythrough" — the subsystem drives a fixed camera path
  *     and captures each frame as a PNG
- *  3. Once the 64SPP_GT baseline exists, click "Compute Metrics" to score
- *     all rendered methods
+ *  3. Once a 64SPP_GT or 512SPP_GT baseline exists, click "Compute Metrics"
+ *     to score all rendered methods (512SPP_GT is preferred when complete)
  */
 UCLASS()
 class USLFlythroughSubsystem : public UTickableWorldSubsystem
@@ -90,6 +90,8 @@ public:
 	// ---- Run Detection ----
 	bool HasCompletedRun(const FString& MethodName) const;
 	bool HasGTBaseline() const;
+	/** Reference that Compute Metrics scores against: 512SPP_GT if complete, else 64SPP_GT, else empty. */
+	FString GetReferenceMethodName() const;
 
 	// ---- Summary Data (for UI charts) ----
 	const TArray<FSLMethodSummary>& GetSummaries() const { return CachedSummaries; }

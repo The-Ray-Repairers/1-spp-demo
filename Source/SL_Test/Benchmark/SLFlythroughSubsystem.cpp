@@ -120,6 +120,17 @@ void USLFlythroughSubsystem::RegisterMethods()
 		M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), TEXT("0")});
 		Methods.Add(MoveTemp(M));
 	}
+
+	// 512SPP_GT — high-quality reference; preferred by Compute Metrics when complete
+	{
+		FSLFlythroughMethod M;
+		M.Name = TEXT("512SPP_GT");
+		M.SPP = 512;
+		M.DenoiserMethod = 0; // no denoising on GT
+		M.bAccumulate = true;
+		M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), TEXT("0")});
+		Methods.Add(MoveTemp(M));
+	}
 }
 
 void USLFlythroughSubsystem::SelectMethod(int32 Index)
@@ -153,7 +164,17 @@ bool USLFlythroughSubsystem::HasCompletedRun(const FString& MethodName) const
 
 bool USLFlythroughSubsystem::HasGTBaseline() const
 {
-	return HasCompletedRun(TEXT("64SPP_GT"));
+	return !GetReferenceMethodName().IsEmpty();
+}
+
+FString USLFlythroughSubsystem::GetReferenceMethodName() const
+{
+	// Highest-SPP reference with a completed run wins.
+	for (const TCHAR* Name : { TEXT("512SPP_GT"), TEXT("64SPP_GT") })
+	{
+		if (HasCompletedRun(Name)) return Name;
+	}
+	return FString();
 }
 
 // -----------------------------------------------------------------------
@@ -692,7 +713,7 @@ bool USLFlythroughSubsystem::CanComputeMetrics(FText& Reason) const
 	}
 	if (!HasGTBaseline())
 	{
-		Reason = FText::FromString(TEXT("Render a 64SPP_GT baseline first."));
+		Reason = FText::FromString(TEXT("Render a 64SPP_GT or 512SPP_GT baseline first."));
 		return false;
 	}
 	return true;
@@ -713,7 +734,9 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 	OnStateChanged.Broadcast();
 
 	const FString Root = GetRendersRoot();
-	const FString GTDir = FSLFlythroughMetrics::FindLatestRun(FPaths::Combine(Root, TEXT("64SPP_GT")));
+	const FString ReferenceName = GetReferenceMethodName();
+	const FString GTDir = FSLFlythroughMetrics::FindLatestRun(FPaths::Combine(Root, ReferenceName));
+	UE_LOG(LogSL_Test, Log, TEXT("Flythrough: Scoring against %s (%s)"), *ReferenceName, *GTDir);
 
 	// Load GT frames
 	TArray<FString> GTFrameFiles;
@@ -810,7 +833,7 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 	CachedSummaries = Summaries;
 
 	bComputingMetrics = false;
-	MetricsStatus = FString::Printf(TEXT("Metrics computed for %d methods."), Summaries.Num());
+	MetricsStatus = FString::Printf(TEXT("Metrics computed for %d methods against %s."), Summaries.Num(), *ReferenceName);
 	OnStateChanged.Broadcast();
 
 	UE_LOG(LogSL_Test, Log, TEXT("Flythrough: Metrics computed for %d methods. Summary at %s"),
