@@ -18,6 +18,7 @@
 #include "RenderGraphUtils.h"
 #include "RHIStaticStates.h"      // TStaticSamplerState
 #include "HAL/IConsoleManager.h"
+#include "RenderingThread.h"      // ENQUEUE_RENDER_COMMAND
 #include "SystemTextures.h"       // GSystemTextures — black/white fallback textures
 #include "NNE.h"
 #include "NNERuntimeRDG.h"
@@ -41,14 +42,26 @@ TAutoConsoleVariable<int32> CVarSLDenoiserMethod(
 	TEXT("Changes take effect on the next rendered frame."),
 	ECVF_RenderThreadSafe);
 
-/** NNE model asset loaded by the Ray Repair denoiser (method 5). */
+/**
+ * NNE model asset loaded by the Ray Repair denoiser (method 5).
+ * String CVars cannot be ECVF_RenderThreadSafe, so the render thread reads
+ * a copy that the change callback forwards via a render command.
+ */
+static FString GSLRayRepairModelPath_RenderThread = TEXT("/Game/ML/RayRepair_v1_1920x1080");
 static TAutoConsoleVariable<FString> CVarSLRayRepairModel(
 	TEXT("SL.Denoiser.RayRepair.Model"),
-	TEXT("/Game/ML/RayRepair_v1_1920x1080"),
+	GSLRayRepairModelPath_RenderThread,
 	TEXT("NNE model data asset for SL.Denoiser.Method 5, exported by neural-denoiser's denoiser/export_ue.py.\n")
 	TEXT("The tensor size is read from the model and must equal the view rect (use r.ScreenPercentage 100).\n")
 	TEXT("Changing it reloads the model on the next frame."),
-	ECVF_RenderThreadSafe);
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* Var)
+	{
+		ENQUEUE_RENDER_COMMAND(SLRayRepairSetModel)([Path = Var->GetString()](FRHICommandListImmediate&)
+		{
+			GSLRayRepairModelPath_RenderThread = Path;
+		});
+	}),
+	ECVF_Default);
 
 /** Gaussian kernel standard deviation in pixels. */
 static TAutoConsoleVariable<float> CVarSLGaussianBlurSigma(
@@ -441,7 +454,7 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 	static TSharedPtr<UE::NNE::IModelInstanceRDG> ModelInstance;
 	static FIntPoint TensorSize = FIntPoint::ZeroValue;
 
-	const FString ModelPath = CVarSLRayRepairModel.GetValueOnRenderThread();
+	const FString& ModelPath = GSLRayRepairModelPath_RenderThread;
 	if (ModelPath != LoadedPath)
 	{
 		LoadedPath  = ModelPath;
