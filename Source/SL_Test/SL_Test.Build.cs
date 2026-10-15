@@ -39,6 +39,7 @@ public class SL_Test : ModuleRules
 			"RHI",        // TStaticSamplerState, FRHICopyTextureInfo
 			"DLSSBlueprint",
 			"ImageWrapper", // PNG loading for flythrough metric computation
+			"ImageCore",    // FImage / FImageView for flythrough HDR (EXR) frames
 		});
 
 		PublicIncludePaths.AddRange(new string[] {

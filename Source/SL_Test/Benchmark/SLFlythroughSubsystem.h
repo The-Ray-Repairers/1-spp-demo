@@ -158,6 +158,11 @@ private:
 	TSharedPtr<class FSLComparisonView, ESPMode::ThreadSafe> AccumulationView;
 	int32 TargetSPP = 1;
 
+	// ---- HDR capture (SL.Flythrough.CaptureHDR) ----
+	TSharedPtr<class FSLHDRCaptureView, ESPMode::ThreadSafe> HDRCaptureView;
+	TArray<float> HDRPreExposures;
+	bool SaveHDRFrame();
+
 	// ---- Settings Restore ----
 	TMap<FString, FString> SavedCVars;
 	double SavedFixedDeltaTime = 0.0;

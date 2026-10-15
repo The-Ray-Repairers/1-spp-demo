@@ -106,10 +106,26 @@ renders/
       frames/
         frame_0000.png
         ...
+      frames_hdr/          # SL.Flythrough.CaptureHDR 1 (default)
+        frame_0000.exr
+        ...
+      hdr_frames.csv       # per-frame pre-exposure; marks frames_hdr/ complete
       timings.csv
       metrics.csv          # written by Compute Metrics
+      flip_hdr.csv         # written by Scripts/flythrough_flip.py
   summary_metrics.csv      # latest evaluated complete run per method
+  flip_summary_hdr.csv     # written by Scripts/flythrough_flip.py
 ```
+
+**HDR frames.** With `SL.Flythrough.CaptureHDR 1` (the default), each frame is
+also saved as a half-float EXR of the linear-HDR scene colour **after the SL
+denoiser and before tonemapping**, from the same render as the PNG. Values are
+pre-exposed, exactly what the tonemapper consumes and the same convention as
+Ray Repair's `ue_buffers`. The pre-exposure used for each frame is recorded in
+`hdr_frames.csv`, and a warning is logged if it changes during a run. Expect
+roughly 5–15 MB per 1080p frame, or several GB per 300-frame run. Set
+`SL.Flythrough.CaptureHDR 0` to capture PNGs only; such runs are still scored on
+the PNG metrics.
 
 Run IDs increase independently for each method. Completed runs require a timings
 CSV and the corresponding nonempty frame sequence; cancelled runs are excluded.
@@ -118,9 +134,25 @@ Frame counts/names and decoded image dimensions must match GT for scoring.
 
 ### Reading the measurements
 
-Metrics operate on **tone-mapped 8-bit sRGB PNGs**, not linear HDR radiance.
+MSE, PSNR, SSIM and CNR operate on **tone-mapped 8-bit sRGB PNGs**. Tonemapping
+clips highlights and 8-bit quantisation limits PSNR, and Monte Carlo error is
+concentrated in bright, high-variance regions, so the HDR metrics below are the
+primary numbers for comparing denoisers. They match the definitions used in the
+Monte Carlo denoising literature and in neural-denoiser's `eval_ue`.
 
-| Measurement | Definition / interpretation |
+| HDR measurement (from `frames_hdr/`) | Definition / interpretation |
+| --- | --- |
+| relMSE | Mean over pixels and RGB of `(x - y)^2 / (y^2 + 0.01)`, x = method, y = reference, linear HDR. Relative, so bright highlights do not dominate; lower is better. |
+| SMAPE | Mean over pixels and RGB of `\|x - y\| / (\|x\| + \|y\| + 0.01)`. Bounded and robust to fireflies; lower is better. |
+| Temporal flicker | Mean `\|(x_t - x_{t-1}) - (y_t - y_{t-1})\|` in display space (`max(x,0)`, Reinhard `x/(1+x)`, gamma 1/2.2), averaged over frames 1..N-1: how much the output changes between frames beyond how much the reference does. Same as neural-denoiser `metrics.flicker`. The reference follows the same camera path, so no motion compensation is needed. Lower is steadier. |
+| FLIP (script) | NVIDIA HDR-FLIP perceptual error from `python Scripts/flythrough_flip.py` (`pip install flip-evaluator OpenEXR numpy`); `--mode LDR` scores the PNGs instead. Lower is better. Not computed in the editor. |
+
+HDR metrics need complete `frames_hdr/` in both the method's run and the
+reference run. Otherwise they are left empty (not zero) in the CSVs and that
+method is left out of the HDR charts. Reference noise counts as error for every
+method, so use the highest-SPP reference you can afford.
+
+| PNG measurement | Definition / interpretation |
 | --- | --- |
 | MSE | Mean squared RGB error over channels and pixels using 0–255 inputs (MSE range 0–65025); lower is better. |
 | PSNR | `10 * log10(255^2 / MSE)` in dB; exact matches use a finite 100 dB cap. |
@@ -131,20 +163,23 @@ Metrics operate on **tone-mapped 8-bit sRGB PNGs**, not linear HDR radiance.
 Per-frame CSVs include an `avg` row. Summary metric values are arithmetic means of
 frame metrics, rather than metrics recomputed over a pooled image sequence. The GT
 self-comparison can have a very large CNR because of the residual floor. Charts
-show average runtime, MSE, PSNR, SSIM, and CNR.
+show average runtime, MSE, PSNR, SSIM, and CNR, plus relMSE, SMAPE and temporal
+flicker for methods with HDR data, and the reference run used.
 
 ## Source map and next validation steps
 
 | Location | Responsibility |
 | --- | --- |
 | `Source/SL_Test/Benchmark/SLFlythroughSubsystem.*` | Method registry, camera/state machine, capture, run detection, metrics orchestration. |
-| `Source/SL_Test/Benchmark/SLFlythroughMetrics.*` | PNG decoding, metric calculations, CSV I/O, complete-run selection. |
+| `Source/SL_Test/Benchmark/SLFlythroughMetrics.*` | PNG/EXR decoding, metric calculations (PNG and HDR), CSV I/O, complete-run selection. Tests: `SL.Flythrough.HDRMetrics`. |
+| `Source/SL_Test/Benchmark/SLHDRCaptureView.*` | Pre-tonemap HDR frame capture for the flythrough (after the SL denoiser). |
+| `Scripts/flythrough_flip.py` | NVIDIA FLIP over flythrough runs (HDR or LDR). |
 | `Source/SL_Test/Benchmark/SLFlythroughPanel.*` | Method buttons, GT gating, progress, summary charts. |
 | `Source/SL_Test/Benchmark/SLComparison*` | Interactive renderer ownership, same-camera references, live comparison. |
 | `Source/SL_Test/Debug/GMTools/SLGMToolConfig.*` | Data-asset schema for GM profiles and presentation. |
 | `Source/SL_Test/SLPathTracerSubsystem.*` | Startup path tracing, per-frame reset, software fallback. |
 | `Source/SL_Test/SLDenoiser*`, `Shaders/` | Filter implementations and shader passes. |
-| `Source/SL_Test/SL_Test.Build.cs` | Module dependencies, including Engine's `ImageUtils.h` API and ImageWrapper for decoding. |
+| `Source/SL_Test/SL_Test.Build.cs` | Module dependencies, including Engine's `ImageUtils.h` API, ImageWrapper for decoding and ImageCore for EXR frames. |
 
 Before treating benchmark numbers as validated, render GT plus a noisy and a
 filtered run at the same resolution. Check all 300 PNGs and timing rows, compute

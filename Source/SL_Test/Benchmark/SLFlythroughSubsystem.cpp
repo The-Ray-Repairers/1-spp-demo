@@ -1,5 +1,6 @@
 #include "SLFlythroughSubsystem.h"
 #include "SLComparisonView.h"
+#include "SLHDRCaptureView.h"
 #include "SLComparisonSubsystem.h"
 #include "SL_Test.h"
 #include "DLSSLibrary.h"
@@ -24,6 +25,13 @@
 #include "UnrealClient.h"
 
 DECLARE_CYCLE_STAT(TEXT("SLFlythroughSubsystem"), STAT_SLFlythrough, STATGROUP_Tickables);
+
+static TAutoConsoleVariable<int32> CVarSLFlythroughCaptureHDR(
+	TEXT("SL.Flythrough.CaptureHDR"),
+	1,
+	TEXT("Also save each flythrough frame as a pre-tonemap linear-HDR EXR (frames_hdr/), used for relMSE,\n")
+	TEXT("SMAPE and temporal metrics. Roughly 5-15 MB per 1080p frame. 0 = PNG only."),
+	ECVF_Default);
 
 TStatId USLFlythroughSubsystem::GetStatId() const
 {
@@ -302,10 +310,11 @@ void USLFlythroughSubsystem::ReleaseCamera()
 		PreviousViewTarget = nullptr;
 	}
 
-	if (AccumulationView)
+	if (AccumulationView || HDRCaptureView)
 	{
 		FlushRenderingCommands();
 		AccumulationView.Reset();
+		HDRCaptureView.Reset();
 		FlushRenderingCommands();
 	}
 }
@@ -378,7 +387,9 @@ bool USLFlythroughSubsystem::StartFlythrough()
 	const FString MethodDir = FPaths::Combine(GetRendersRoot(), CurrentMethodName);
 	const FString RunId = FSLFlythroughMetrics::GetNextRunId(MethodDir);
 	CurrentRunDir = FPaths::Combine(MethodDir, RunId);
-	if (!IFileManager::Get().MakeDirectory(*FPaths::Combine(CurrentRunDir, TEXT("frames")), true))
+	const bool bCaptureHDR = CVarSLFlythroughCaptureHDR.GetValueOnGameThread() != 0;
+	if (!IFileManager::Get().MakeDirectory(*FPaths::Combine(CurrentRunDir, TEXT("frames")), true)
+		|| (bCaptureHDR && !IFileManager::Get().MakeDirectory(*FPaths::Combine(CurrentRunDir, TEXT("frames_hdr")), true)))
 	{
 		MetricsStatus = TEXT("Unable to create the flythrough output directory.");
 		return false;
@@ -414,6 +425,13 @@ bool USLFlythroughSubsystem::StartFlythrough()
 		AccumulationView->bReference = true;
 		AccumulationView->DenoiserOverride = -1;
 		AccumulationView->Samples.Store(0);
+	}
+
+	HDRPreExposures.Reset();
+	if (bCaptureHDR)
+	{
+		HDRPreExposures.Reserve(TotalFrames);
+		HDRCaptureView = FSceneViewExtensions::NewExtension<FSLHDRCaptureView>(GetWorld());
 	}
 
 	// Register screenshot delegate
@@ -555,8 +573,10 @@ void USLFlythroughSubsystem::TickAccumulating()
 
 void USLFlythroughSubsystem::CaptureFrame()
 {
-	// Request screenshot
+	// Request screenshot (and the matching pre-tonemap HDR frame, from the same render)
 	Phase = ESLFlythroughPhase::AwaitingScreenshot;
+	if (HDRCaptureView)
+		HDRCaptureView->RequestCapture(CurrentFrame);
 	FScreenshotRequest::RequestScreenshot(false);
 }
 
@@ -592,7 +612,52 @@ void USLFlythroughSubsystem::OnScreenshotCaptured(int32 Width, int32 Height, con
 		return;
 	}
 
+	if (HDRCaptureView && !SaveHDRFrame())
+	{
+		CancelFlythrough();
+		MetricsStatus = TEXT("HDR frame capture failed; see the log. Set SL.Flythrough.CaptureHDR 0 to capture PNG only.");
+		return;
+	}
+
 	AdvanceFrame();
+}
+
+bool USLFlythroughSubsystem::SaveHDRFrame()
+{
+	TArray<FLinearColor> Pixels;
+	FIntPoint Size;
+	float PreExposure = 1.f;
+	if (!HDRCaptureView->ReadCapture(CurrentFrame, Pixels, Size, PreExposure))
+	{
+		UE_LOG(LogSL_Test, Error, TEXT("Flythrough: No HDR capture for frame %d"), CurrentFrame);
+		return false;
+	}
+
+	// Half float halves the file size; clamp to the half range so highlights stay finite.
+	TArray<FFloat16Color> Half;
+	Half.SetNumUninitialized(Pixels.Num());
+	for (int32 i = 0; i < Pixels.Num(); ++i)
+	{
+		const FLinearColor& C = Pixels[i];
+		Half[i] = FFloat16Color(FLinearColor(
+			FMath::Clamp(C.R, -65504.f, 65504.f), FMath::Clamp(C.G, -65504.f, 65504.f),
+			FMath::Clamp(C.B, -65504.f, 65504.f), 1.f));
+	}
+
+	const FString Path = FPaths::Combine(CurrentRunDir, TEXT("frames_hdr"), FString::Printf(TEXT("frame_%04d.exr"), CurrentFrame));
+	if (!FImageUtils::SaveImageByExtension(*Path, FImageView(Half.GetData(), Size.X, Size.Y)))
+	{
+		UE_LOG(LogSL_Test, Error, TEXT("Flythrough: Failed to save %s"), *Path);
+		return false;
+	}
+
+	if (!HDRPreExposures.IsEmpty() && !FMath::IsNearlyEqual(HDRPreExposures.Last(), PreExposure, 1e-4f * HDRPreExposures.Last()))
+	{
+		UE_LOG(LogSL_Test, Warning, TEXT("Flythrough: Pre-exposure changed during the run (%g -> %g); HDR frames are not on one scale."),
+			HDRPreExposures.Last(), PreExposure);
+	}
+	HDRPreExposures.Add(PreExposure);
+	return true;
 }
 
 void USLFlythroughSubsystem::AdvanceFrame()
@@ -633,6 +698,11 @@ void USLFlythroughSubsystem::FinishFlythrough()
 		CancelFlythrough();
 		MetricsStatus = TEXT("Failed to save timings.csv; run is incomplete.");
 		return;
+	}
+	// The HDR manifest marks frames_hdr/ complete; a run without one is scored on PNG metrics only.
+	if (HDRCaptureView && !FSLFlythroughMetrics::WriteHDRManifest(CurrentRunDir, HDRPreExposures))
+	{
+		UE_LOG(LogSL_Test, Warning, TEXT("Flythrough: Failed to save hdr_frames.csv; HDR metrics will be skipped for this run."));
 	}
 
 	// Cleanup
@@ -713,7 +783,9 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 	OnStateChanged.Broadcast();
 
 	const FString Root = GetRendersRoot();
-	const FString GTDir = FSLFlythroughMetrics::FindLatestRun(FPaths::Combine(Root, TEXT("64SPP_GT")));
+	const FString ReferenceName = TEXT("64SPP_GT");
+	const FString GTDir = FSLFlythroughMetrics::FindLatestRun(FPaths::Combine(Root, ReferenceName));
+	const FString ReferenceLabel = ReferenceName / FPaths::GetCleanFilename(GTDir);
 
 	// Load GT frames
 	TArray<FString> GTFrameFiles;
@@ -752,6 +824,16 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 		TArray<FSLFrameMetrics> AllMetrics;
 		AllMetrics.Reserve(FrameCount);
 
+		// HDR metrics need complete frames_hdr/ in both this run and the reference.
+		bool bHDR = FSLFlythroughMetrics::IsHDRRunComplete(LatestRun, FrameCount)
+			&& FSLFlythroughMetrics::IsHDRRunComplete(GTDir, FrameCount);
+		if (!bHDR)
+		{
+			UE_LOG(LogSL_Test, Log, TEXT("Flythrough: %s scored on PNG metrics only (no complete HDR frames in it or in %s)."),
+				*Method.Name, *ReferenceLabel);
+		}
+		TArray<float> TestDisplayPrev, GTDisplayPrev;
+
 		for (int32 i = 0; i < FrameCount; ++i)
 		{
 			TArray<FColor> TestPixels, GTPixels;
@@ -764,7 +846,32 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 			if (!FSLFlythroughMetrics::LoadPNG(GTPath, GTPixels, GW, GH)) continue;
 			if (TW != GW || TH != GH) continue;
 
-			AllMetrics.Add(FSLFlythroughMetrics::ComputeFrameMetrics(i, TestPixels, GTPixels, TW, TH));
+			FSLFrameMetrics& Frame = AllMetrics.Add_GetRef(FSLFlythroughMetrics::ComputeFrameMetrics(i, TestPixels, GTPixels, TW, TH));
+
+			if (!bHDR) continue;
+			const FString ExrName = FString::Printf(TEXT("frame_%04d.exr"), i);
+			TArray<FLinearColor> TestHDR, GTHDR;
+			int32 HTW, HTH, HGW, HGH;
+			if (!FSLFlythroughMetrics::LoadEXR(FPaths::Combine(LatestRun, TEXT("frames_hdr"), ExrName), TestHDR, HTW, HTH)
+				|| !FSLFlythroughMetrics::LoadEXR(FPaths::Combine(GTDir, TEXT("frames_hdr"), ExrName), GTHDR, HGW, HGH)
+				|| HTW != HGW || HTH != HGH)
+			{
+				UE_LOG(LogSL_Test, Warning, TEXT("Flythrough: %s HDR frame %d unreadable or size mismatch; HDR averages skipped."), *Method.Name, i);
+				bHDR = false;
+				continue;
+			}
+
+			const FSLHDRErrors Errors = FSLFlythroughMetrics::ComputeHDRErrors(TestHDR, GTHDR);
+			Frame.RelMSE = Errors.RelMSE;
+			Frame.SMAPE = Errors.SMAPE;
+
+			TArray<float> TestDisplay, GTDisplay;
+			FSLFlythroughMetrics::ToDisplay(TestHDR, TestDisplay);
+			FSLFlythroughMetrics::ToDisplay(GTHDR, GTDisplay);
+			if (i > 0 && TestDisplayPrev.Num() == TestDisplay.Num())
+				Frame.TemporalFlicker = FSLFlythroughMetrics::ComputeTemporalFlicker(TestDisplayPrev, TestDisplay, GTDisplayPrev, GTDisplay);
+			TestDisplayPrev = MoveTemp(TestDisplay);
+			GTDisplayPrev = MoveTemp(GTDisplay);
 		}
 
 		// Write per-run metrics.csv
@@ -795,6 +902,8 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 			Summary.AvgSSIM /= AllMetrics.Num();
 			Summary.AvgCNR /= AllMetrics.Num();
 		}
+		FSLFlythroughMetrics::ComputeSummaryHDR(AllMetrics, Summary);
+		Summary.Reference = ReferenceLabel;
 
 		Summaries.Add(MoveTemp(Summary));
 	}
@@ -810,7 +919,7 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 	CachedSummaries = Summaries;
 
 	bComputingMetrics = false;
-	MetricsStatus = FString::Printf(TEXT("Metrics computed for %d methods."), Summaries.Num());
+	MetricsStatus = FString::Printf(TEXT("Metrics computed for %d methods against %s."), Summaries.Num(), *ReferenceLabel);
 	OnStateChanged.Broadcast();
 
 	UE_LOG(LogSL_Test, Log, TEXT("Flythrough: Metrics computed for %d methods. Summary at %s"),

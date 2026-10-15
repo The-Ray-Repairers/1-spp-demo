@@ -3,9 +3,41 @@
 #include "HAL/FileManager.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
+#include "ImageCore.h"
+#include "ImageUtils.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
+
+namespace
+{
+	/** Empty CSV field for unset optional metrics, so "no HDR data" never reads as a zero error. */
+	FString OptionalField(const TOptional<double>& Value)
+	{
+		return Value.IsSet() ? FString::Printf(TEXT("%.6g"), Value.GetValue()) : FString();
+	}
+
+	TOptional<double> ParseOptionalField(const TArray<FString>& Fields, int32 Index)
+	{
+		if (!Fields.IsValidIndex(Index) || Fields[Index].TrimStartAndEnd().IsEmpty()) return {};
+		return FCString::Atod(*Fields[Index]);
+	}
+
+	/** Mean of the set values; unset if any frame lacks the metric (so partial data never averages in). */
+	TOptional<double> MeanIfAllSet(const TArray<FSLFrameMetrics>& Metrics, TOptional<double> FSLFrameMetrics::* Member, int32 FirstFrame = 0)
+	{
+		double Sum = 0.0;
+		int32 Count = 0;
+		for (int32 i = FirstFrame; i < Metrics.Num(); ++i)
+		{
+			const TOptional<double>& V = Metrics[i].*Member;
+			if (!V.IsSet()) return {};
+			Sum += V.GetValue();
+			++Count;
+		}
+		return Count > 0 ? TOptional<double>(Sum / Count) : TOptional<double>();
+	}
+}
 
 // -----------------------------------------------------------------------
 // PNG Loading
@@ -244,11 +276,12 @@ bool FSLFlythroughMetrics::WriteTimingsCSV(const FString& Path, const TArray<FSL
 
 bool FSLFlythroughMetrics::WriteMetricsCSV(const FString& Path, const TArray<FSLFrameMetrics>& Metrics)
 {
-	FString CSV = TEXT("frame_idx,mse,psnr,ssim,cnr\n");
+	FString CSV = TEXT("frame_idx,mse,psnr,ssim,cnr,relmse,smape,tflicker\n");
 	double TotalMSE = 0, TotalPSNR = 0, TotalSSIM = 0, TotalCNR = 0;
 	for (const auto& M : Metrics)
 	{
-		CSV += FString::Printf(TEXT("%d,%.6f,%.4f,%.6f,%.4f\n"), M.FrameIndex, M.MSE, M.PSNR, M.SSIM, M.CNR);
+		CSV += FString::Printf(TEXT("%d,%.6f,%.4f,%.6f,%.4f,%s,%s,%s\n"), M.FrameIndex, M.MSE, M.PSNR, M.SSIM, M.CNR,
+			*OptionalField(M.RelMSE), *OptionalField(M.SMAPE), *OptionalField(M.TemporalFlicker));
 		TotalMSE += M.MSE;
 		TotalPSNR += M.PSNR;
 		TotalSSIM += M.SSIM;
@@ -256,17 +289,32 @@ bool FSLFlythroughMetrics::WriteMetricsCSV(const FString& Path, const TArray<FSL
 	}
 	const int32 N = Metrics.Num();
 	if (N > 0)
-		CSV += FString::Printf(TEXT("avg,%.6f,%.4f,%.6f,%.4f\n"), TotalMSE / N, TotalPSNR / N, TotalSSIM / N, TotalCNR / N);
+	{
+		// Temporal flicker has no value on frame 0, so its average starts at frame 1.
+		CSV += FString::Printf(TEXT("avg,%.6f,%.4f,%.6f,%.4f,%s,%s,%s\n"), TotalMSE / N, TotalPSNR / N, TotalSSIM / N, TotalCNR / N,
+			*OptionalField(MeanIfAllSet(Metrics, &FSLFrameMetrics::RelMSE)),
+			*OptionalField(MeanIfAllSet(Metrics, &FSLFrameMetrics::SMAPE)),
+			*OptionalField(MeanIfAllSet(Metrics, &FSLFrameMetrics::TemporalFlicker, 1)));
+	}
 	return FFileHelper::SaveStringToFile(CSV, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+}
+
+bool FSLFlythroughMetrics::ComputeSummaryHDR(const TArray<FSLFrameMetrics>& Metrics, FSLMethodSummary& InOutSummary)
+{
+	InOutSummary.AvgRelMSE = MeanIfAllSet(Metrics, &FSLFrameMetrics::RelMSE);
+	InOutSummary.AvgSMAPE = MeanIfAllSet(Metrics, &FSLFrameMetrics::SMAPE);
+	InOutSummary.AvgTemporalFlicker = MeanIfAllSet(Metrics, &FSLFrameMetrics::TemporalFlicker, 1);
+	return InOutSummary.AvgRelMSE.IsSet();
 }
 
 bool FSLFlythroughMetrics::WriteSummaryCSV(const FString& RendersRoot, const TArray<FSLMethodSummary>& Summaries)
 {
-	FString CSV = TEXT("method,run_id,avg_render_ms,avg_mse,avg_psnr,avg_ssim,avg_cnr\n");
+	FString CSV = TEXT("method,run_id,avg_render_ms,avg_mse,avg_psnr,avg_ssim,avg_cnr,avg_relmse,avg_smape,avg_tflicker,reference\n");
 	for (const auto& S : Summaries)
 	{
-		CSV += FString::Printf(TEXT("%s,%s,%.3f,%.6f,%.4f,%.6f,%.4f\n"),
-			*S.Method, *S.RunId, S.AvgRenderMs, S.AvgMSE, S.AvgPSNR, S.AvgSSIM, S.AvgCNR);
+		CSV += FString::Printf(TEXT("%s,%s,%.3f,%.6f,%.4f,%.6f,%.4f,%s,%s,%s,%s\n"),
+			*S.Method, *S.RunId, S.AvgRenderMs, S.AvgMSE, S.AvgPSNR, S.AvgSSIM, S.AvgCNR,
+			*OptionalField(S.AvgRelMSE), *OptionalField(S.AvgSMAPE), *OptionalField(S.AvgTemporalFlicker), *S.Reference);
 	}
 	return FFileHelper::SaveStringToFile(CSV, *FPaths::Combine(RendersRoot, TEXT("summary_metrics.csv")),
 		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
@@ -284,8 +332,9 @@ bool FSLFlythroughMetrics::ReadSummaryCSV(const FString& RendersRoot, TArray<FSL
 	// Skip header line
 	for (int32 i = 1; i < Lines.Num(); ++i)
 	{
+		// Keep empty fields: unset HDR metrics are written as empty columns.
 		TArray<FString> Fields;
-		Lines[i].ParseIntoArray(Fields, TEXT(","));
+		Lines[i].ParseIntoArray(Fields, TEXT(","), false);
 		if (Fields.Num() < 7) continue;
 
 		FSLMethodSummary S;
@@ -296,6 +345,11 @@ bool FSLFlythroughMetrics::ReadSummaryCSV(const FString& RendersRoot, TArray<FSL
 		S.AvgPSNR = FCString::Atod(*Fields[4]);
 		S.AvgSSIM = FCString::Atod(*Fields[5]);
 		S.AvgCNR = FCString::Atod(*Fields[6]);
+		// Columns 7-10 exist only in summaries written with HDR support.
+		S.AvgRelMSE = ParseOptionalField(Fields, 7);
+		S.AvgSMAPE = ParseOptionalField(Fields, 8);
+		S.AvgTemporalFlicker = ParseOptionalField(Fields, 9);
+		if (Fields.IsValidIndex(10)) S.Reference = Fields[10];
 		OutSummaries.Add(MoveTemp(S));
 	}
 	return true;
@@ -382,6 +436,106 @@ bool FSLFlythroughMetrics::IsRunComplete(const FString& RunDir)
 		if (!Lines[Index + 1].StartsWith(FString::Printf(TEXT("%d,"), Index))
 			|| Frames[Index] != FString::Printf(TEXT("frame_%04d.png"), Index)
 			|| IFileManager::Get().FileSize(*FPaths::Combine(RunDir, TEXT("frames"), Frames[Index])) <= 0) return false;
+	}
+	return true;
+}
+
+// -----------------------------------------------------------------------
+// HDR Metrics (frames_hdr/*.exr)
+// -----------------------------------------------------------------------
+
+bool FSLFlythroughMetrics::LoadEXR(const FString& Path, TArray<FLinearColor>& OutPixels, int32& OutWidth, int32& OutHeight)
+{
+	FImage Image;
+	if (!FImageUtils::LoadImage(*Path, Image))
+	{
+		UE_LOG(LogSL_Test, Warning, TEXT("FlythroughMetrics: Failed to load EXR %s"), *Path);
+		return false;
+	}
+	Image.ChangeFormat(ERawImageFormat::RGBA32F, EGammaSpace::Linear);
+
+	const int64 PixelCount = Image.GetNumPixels();
+	if (Image.SizeX <= 0 || Image.SizeY <= 0 || PixelCount > MAX_int32) return false;
+	OutWidth = Image.SizeX;
+	OutHeight = Image.SizeY;
+	const TArrayView64<FLinearColor> Pixels = Image.AsRGBA32F();
+	OutPixels.SetNumUninitialized(int32(PixelCount));
+	FMemory::Memcpy(OutPixels.GetData(), Pixels.GetData(), PixelCount * sizeof(FLinearColor));
+	return true;
+}
+
+FSLHDRErrors FSLFlythroughMetrics::ComputeHDRErrors(const TArray<FLinearColor>& Test, const TArray<FLinearColor>& Reference)
+{
+	FSLHDRErrors Result;
+	const int32 N = Test.Num();
+	if (N == 0 || Reference.Num() != N) return Result;
+
+	double SumRel = 0.0, SumSMAPE = 0.0;
+	for (int32 i = 0; i < N; ++i)
+	{
+		const double X[3] = { Test[i].R, Test[i].G, Test[i].B };
+		const double Y[3] = { Reference[i].R, Reference[i].G, Reference[i].B };
+		for (int32 c = 0; c < 3; ++c)
+		{
+			const double D = X[c] - Y[c];
+			SumRel += D * D / (Y[c] * Y[c] + HDREpsilon);
+			SumSMAPE += FMath::Abs(D) / (FMath::Abs(X[c]) + FMath::Abs(Y[c]) + HDREpsilon);
+		}
+	}
+	Result.RelMSE = SumRel / (3.0 * N);
+	Result.SMAPE = SumSMAPE / (3.0 * N);
+	return Result;
+}
+
+void FSLFlythroughMetrics::ToDisplay(const TArray<FLinearColor>& Linear, TArray<float>& OutRGB, double Exposure)
+{
+	OutRGB.SetNumUninitialized(Linear.Num() * 3);
+	auto Map = [Exposure](float V)
+	{
+		const double X = FMath::Max(0.0, (double)V) * Exposure;
+		return (float)FMath::Pow(FMath::Clamp(X / (1.0 + X), 0.0, 1.0), 1.0 / 2.2);
+	};
+	for (int32 i = 0; i < Linear.Num(); ++i)
+	{
+		OutRGB[3 * i + 0] = Map(Linear[i].R);
+		OutRGB[3 * i + 1] = Map(Linear[i].G);
+		OutRGB[3 * i + 2] = Map(Linear[i].B);
+	}
+}
+
+double FSLFlythroughMetrics::ComputeTemporalFlicker(const TArray<float>& TestPrev, const TArray<float>& TestCur,
+	const TArray<float>& RefPrev, const TArray<float>& RefCur)
+{
+	const int32 N = TestCur.Num();
+	if (N == 0 || TestPrev.Num() != N || RefPrev.Num() != N || RefCur.Num() != N) return 0.0;
+
+	double Sum = 0.0;
+	for (int32 i = 0; i < N; ++i)
+		Sum += FMath::Abs((double)(TestCur[i] - TestPrev[i]) - (double)(RefCur[i] - RefPrev[i]));
+	return Sum / N;
+}
+
+bool FSLFlythroughMetrics::WriteHDRManifest(const FString& RunDir, const TArray<float>& PreExposures)
+{
+	FString CSV = TEXT("frame_idx,pre_exposure\n");
+	for (int32 i = 0; i < PreExposures.Num(); ++i)
+		CSV += FString::Printf(TEXT("%d,%.9g\n"), i, PreExposures[i]);
+	return FFileHelper::SaveStringToFile(CSV, *FPaths::Combine(RunDir, TEXT("hdr_frames.csv")),
+		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+}
+
+bool FSLFlythroughMetrics::IsHDRRunComplete(const FString& RunDir, int32 FrameCount)
+{
+	FString CSV;
+	if (!FFileHelper::LoadFileToString(CSV, *FPaths::Combine(RunDir, TEXT("hdr_frames.csv")))) return false;
+	TArray<FString> Lines;
+	CSV.ParseIntoArrayLines(Lines);
+	if (Lines.Num() != FrameCount + 1 || Lines[0] != TEXT("frame_idx,pre_exposure")) return false;
+
+	for (int32 Index = 0; Index < FrameCount; ++Index)
+	{
+		const FString Path = FPaths::Combine(RunDir, TEXT("frames_hdr"), FString::Printf(TEXT("frame_%04d.exr"), Index));
+		if (IFileManager::Get().FileSize(*Path) <= 0) return false;
 	}
 	return true;
 }

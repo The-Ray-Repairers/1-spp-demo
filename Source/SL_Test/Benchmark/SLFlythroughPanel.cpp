@@ -25,16 +25,19 @@ namespace
 class SMetricBar : public SCompoundWidget
 {
 public:
-	SLATE_BEGIN_ARGS(SMetricBar) {}
+	SLATE_BEGIN_ARGS(SMetricBar) : _Decimals(2) {}
 		SLATE_ARGUMENT(FString, Label)
 		SLATE_ARGUMENT(double, Value)
 		SLATE_ARGUMENT(double, MaxValue)
 		SLATE_ARGUMENT(FLinearColor, BarColor)
+		SLATE_ARGUMENT(int32, Decimals)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& Args)
 	{
 		const float Fraction = Args._MaxValue > 0 ? FMath::Clamp((float)(Args._Value / Args._MaxValue), 0.f, 1.f) : 0.f;
+		FNumberFormattingOptions Format;
+		Format.SetUseGrouping(false).SetMinimumFractionalDigits(Args._Decimals).SetMaximumFractionalDigits(Args._Decimals);
 		ChildSlot
 		[
 			SNew(SHorizontalBox)
@@ -75,7 +78,7 @@ public:
 				[
 					SNew(STextBlock)
 					.TextStyle(&FGMToolsStyle::Get().Body)
-					.Text(FText::FromString(FString::Printf(TEXT("%.2f"), Args._Value)))
+					.Text(FText::AsNumber(Args._Value, &Format))
 				]
 			]
 		];
@@ -262,6 +265,40 @@ public:
 			[
 				SNew(SMetricBar).Label(S.Method).Value(S.AvgCNR).MaxValue(MaxCNR)
 				.BarColor(FLinearColor(0.7f, 0.4f, 0.9f))
+			];
+		}
+
+		// HDR metrics (linear EXRs); methods without HDR frames are left out of these charts.
+		auto AddOptionalSection = [&](const TCHAR* Title, TOptional<double> FSLMethodSummary::* Member, const FLinearColor& Color)
+		{
+			double MaxValue = 0.0;
+			for (const auto& S : Summaries)
+				if ((S.*Member).IsSet()) MaxValue = FMath::Max(MaxValue, (S.*Member).GetValue());
+			if (MaxValue <= 0.0) return;
+
+			AddSection(FText::FromString(Title));
+			for (const auto& S : Summaries)
+			{
+				if (!(S.*Member).IsSet()) continue;
+				ChartsBox->AddSlot().AutoHeight().Padding(0, 1)
+				[
+					SNew(SMetricBar).Label(S.Method).Value((S.*Member).GetValue()).MaxValue(MaxValue)
+					.BarColor(Color).Decimals(4)
+				];
+			}
+		};
+		AddOptionalSection(TEXT("▸ Avg relMSE (HDR) — lower is better"), &FSLMethodSummary::AvgRelMSE, FLinearColor(0.9f, 0.45f, 0.35f));
+		AddOptionalSection(TEXT("▸ Avg SMAPE (HDR) — lower is better"), &FSLMethodSummary::AvgSMAPE, FLinearColor(0.95f, 0.7f, 0.3f));
+		AddOptionalSection(TEXT("▸ Avg temporal flicker — lower is steadier"), &FSLMethodSummary::AvgTemporalFlicker, FLinearColor(0.35f, 0.8f, 0.8f));
+
+		if (!Summaries.IsEmpty() && !Summaries[0].Reference.IsEmpty())
+		{
+			ChartsBox->AddSlot().AutoHeight().Padding(0, 8, 0, 0)
+			[
+				SNew(STextBlock)
+				.TextStyle(&FGMToolsStyle::Get().Body)
+				.Text(FText::FromString(FString::Printf(TEXT("Reference: %s"), *Summaries[0].Reference)))
+				.ColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.6f))
 			];
 		}
 	}

@@ -1,8 +1,13 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Misc/Optional.h"
 
-/** Per-frame image quality metrics (all computed in 8-bit sRGB [0,255] space). */
+/**
+ * Per-frame image quality metrics. MSE/PSNR/SSIM/CNR use the 8-bit sRGB PNGs;
+ * RelMSE/SMAPE use the linear-HDR EXRs; TemporalFlicker uses the EXRs in
+ * display space and needs the previous frame (unset on frame 0).
+ */
 struct FSLFrameMetrics
 {
 	int32 FrameIndex = 0;
@@ -10,6 +15,9 @@ struct FSLFrameMetrics
 	double PSNR = 0.0;
 	double SSIM = 0.0;
 	double CNR = 0.0;
+	TOptional<double> RelMSE;
+	TOptional<double> SMAPE;
+	TOptional<double> TemporalFlicker;
 };
 
 /** Per-frame timing record. */
@@ -29,6 +37,19 @@ struct FSLMethodSummary
 	double AvgPSNR = 0.0;
 	double AvgSSIM = 0.0;
 	double AvgCNR = 0.0;
+	/** Unset when the run or the reference has no complete HDR frames. */
+	TOptional<double> AvgRelMSE;
+	TOptional<double> AvgSMAPE;
+	TOptional<double> AvgTemporalFlicker;
+	/** Reference run these numbers were computed against, e.g. "64SPP_GT/run_002". */
+	FString Reference;
+};
+
+/** Per-pixel HDR error metrics, matching the Monte Carlo denoising literature. */
+struct FSLHDRErrors
+{
+	double RelMSE = 0.0;
+	double SMAPE = 0.0;
 };
 
 /**
@@ -52,6 +73,9 @@ public:
 	/** Write per-frame metrics to a CSV (with an avg summary row appended). */
 	static bool WriteMetricsCSV(const FString& Path, const TArray<FSLFrameMetrics>& Metrics);
 
+	/** Fill a summary's HDR averages from per-frame metrics; returns false if the run had no HDR data. */
+	static bool ComputeSummaryHDR(const TArray<FSLFrameMetrics>& Metrics, FSLMethodSummary& InOutSummary);
+
 	/** Append or update summary_metrics.csv in the renders root. */
 	static bool WriteSummaryCSV(const FString& RendersRoot, const TArray<FSLMethodSummary>& Summaries);
 
@@ -69,6 +93,41 @@ public:
 
 	/** Check whether a run directory has a complete set of frames. */
 	static bool IsRunComplete(const FString& RunDir);
+
+	// ---- HDR (frames_hdr/*.exr) ----
+
+	/** Epsilon in the relMSE and SMAPE denominators (the usual 1e-2). */
+	static constexpr double HDREpsilon = 1e-2;
+
+	/** Load an EXR as linear RGB(A) float. Returns false on failure. */
+	static bool LoadEXR(const FString& Path, TArray<FLinearColor>& OutPixels, int32& OutWidth, int32& OutHeight);
+
+	/**
+	 * relMSE = mean over pixels and RGB of (x - y)^2 / (y^2 + eps)
+	 * SMAPE  = mean over pixels and RGB of |x - y| / (|x| + |y| + eps)
+	 * x = test, y = reference, both linear HDR. Arrays must be the same size.
+	 */
+	static FSLHDRErrors ComputeHDRErrors(const TArray<FLinearColor>& Test, const TArray<FLinearColor>& Reference);
+
+	/**
+	 * Display transform shared with neural-denoiser's eval_ue: max(x,0)*Exposure,
+	 * Reinhard x/(1+x), gamma 1/2.2. Output is interleaved RGB floats.
+	 */
+	static void ToDisplay(const TArray<FLinearColor>& Linear, TArray<float>& OutRGB, double Exposure = 1.0);
+
+	/**
+	 * Temporal flicker: mean |(x_t - x_{t-1}) - (y_t - y_{t-1})| over display-space
+	 * RGB (neural-denoiser metrics.flicker). The reference follows the same camera
+	 * path, so its frame difference already contains the motion; no warping needed.
+	 */
+	static double ComputeTemporalFlicker(const TArray<float>& TestPrev, const TArray<float>& TestCur,
+		const TArray<float>& RefPrev, const TArray<float>& RefCur);
+
+	/** Write hdr_frames.csv (frame_idx,pre_exposure), which marks frames_hdr/ complete. */
+	static bool WriteHDRManifest(const FString& RunDir, const TArray<float>& PreExposures);
+
+	/** True when hdr_frames.csv lists FrameCount frames and every frames_hdr/frame_NNNN.exr exists. */
+	static bool IsHDRRunComplete(const FString& RunDir, int32 FrameCount);
 
 private:
 	/** Compute SSIM for a single-channel luminance pair using 11x11 windows. */
