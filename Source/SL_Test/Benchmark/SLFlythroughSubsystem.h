@@ -47,8 +47,11 @@ enum class ESLFlythroughPhase : uint8
  *  1. Select a method
  *  2. Click "Render Flythrough" — the subsystem drives a fixed camera path
  *     and captures each frame as a PNG
- *  3. Once a 64SPP_GT or 512SPP_GT baseline exists, click "Compute Metrics"
- *     to score all rendered methods (512SPP_GT is preferred when complete)
+ *  3. Once a 1024SPP_GT or 64SPP_GT baseline exists, click "Compute Metrics"
+ *     to score all rendered methods (1024SPP_GT is preferred when complete)
+ *
+ * Starting a test method with no local 1024SPP_GT run prompts the user to
+ * render that reference first (NeedsReferencePrompt / StartReferenceFlythrough).
  */
 UCLASS()
 class USLFlythroughSubsystem : public UTickableWorldSubsystem
@@ -74,6 +77,13 @@ public:
 	bool CanStartFlythrough(FText& Reason) const;
 	bool StartFlythrough();
 	void CancelFlythrough();
+
+	/** Method name of the high-SPP reference that test methods are scored against. */
+	static constexpr const TCHAR* HighQualityReferenceName = TEXT("1024SPP_GT");
+	/** True when the selected method is a test method and renders/ has no complete 1024SPP_GT run. */
+	bool NeedsReferencePrompt() const;
+	/** Select 1024SPP_GT and start rendering it. */
+	bool StartReferenceFlythrough();
 	bool IsBusy() const { return Phase != ESLFlythroughPhase::Idle && Phase != ESLFlythroughPhase::Finished; }
 
 	// ---- Metrics ----
@@ -90,7 +100,7 @@ public:
 	// ---- Run Detection ----
 	bool HasCompletedRun(const FString& MethodName) const;
 	bool HasGTBaseline() const;
-	/** Reference that Compute Metrics scores against: 512SPP_GT if complete, else 64SPP_GT, else empty. */
+	/** Reference that Compute Metrics scores against: 1024SPP_GT if complete, else 64SPP_GT, else empty. */
 	FString GetReferenceMethodName() const;
 
 	// ---- Summary Data (for UI charts) ----

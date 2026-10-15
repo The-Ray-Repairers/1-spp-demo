@@ -72,19 +72,23 @@ $ProjectFile = (Resolve-Path .\SL_Test.uproject).Path
 
 1. Start play, choose the scene/camera position, and enter `gm`. Keep the same scene,
    starting camera, viewport size, and rendering settings across methods.
-2. In **Flythrough Benchmark**, select **64SPP_GT** or **512SPP_GT** and click
-   **Render Flythrough**. The current path is a circular orbit around the starting
-   camera location: 10 seconds sampled at 30 positions/second, producing 300 frames.
-   These parameters are currently C++ defaults in `SLFlythroughSubsystem.h`, not GM
-   asset settings. `512SPP_GT` accumulates 8× the samples of `64SPP_GT` per frame,
-   so expect the run to take roughly 8× as long.
+2. In **Flythrough Benchmark**, select **1024SPP_GT** and click **Render
+   Flythrough**. The current path is a circular orbit around the starting camera
+   location: 10 seconds sampled at 30 positions/second, producing 300 frames. These
+   parameters are currently C++ defaults in `SLFlythroughSubsystem.h`, not GM asset
+   settings. `1024SPP_GT` accumulates 16× the samples of `64SPP_GT` per frame, so
+   expect the run to take roughly 16× as long; `64SPP_GT` remains available as a
+   quick, noisier reference.
 3. Render the desired test methods: `1SPP_Noisy`, `1SPP_Gaussian`,
    `1SPP_Bilateral`, `1SPP_NeuralPlaceholder`, and `1SPP_NNE`. SVGF and Lumen/RR
-   remain separate GM profiles and are not registered flythrough methods.
+   remain separate GM profiles and are not registered flythrough methods. If
+   `renders/` has no complete `1024SPP_GT` run when you start a test method, the
+   panel asks whether to render the reference first, render the method anyway, or
+   cancel.
 4. Click **Compute Metrics** once a complete GT run exists. The operation evaluates
-   each method's latest complete run against the latest complete `512SPP_GT` run,
-   or the latest complete `64SPP_GT` run if no 512 SPP run exists; the status line
-   names the reference used. With a 512 SPP reference, `64SPP_GT` is scored like
+   each method's latest complete run against the latest complete `1024SPP_GT` run,
+   or the latest complete `64SPP_GT` run if no 1024 SPP run exists; the status line
+   names the reference used. With a 1024 SPP reference, `64SPP_GT` is scored like
    any other method, which shows how converged the 64 SPP baseline is.
    It currently runs synchronously and can block the UI while processing images.
 5. Inspect the summary charts or click **Open Results Folder**. Blue marks the
@@ -94,7 +98,7 @@ $ProjectFile = (Resolve-Path .\SL_Test.uproject).Path
 
 During capture, gameplay is paused, the camera follows fixed sample positions,
 path-tracer sampling is locked, and exposure/renderer settings are controlled for
-comparison. GT accumulates 64 or 512 samples at each position. Cancel restores captured
+comparison. GT accumulates 64 or 1024 samples at each position. Cancel restores captured
 settings and leaves partial output on disk. Resizing the viewport or a frame
 exceeding the timeout stops the run. Existing comparison ownership is released
 before capture; conflicting GM controls are disabled while the benchmark runs.

@@ -121,11 +121,11 @@ void USLFlythroughSubsystem::RegisterMethods()
 		Methods.Add(MoveTemp(M));
 	}
 
-	// 512SPP_GT — high-quality reference; preferred by Compute Metrics when complete
+	// 1024SPP_GT — high-quality reference; preferred by Compute Metrics when complete
 	{
 		FSLFlythroughMethod M;
-		M.Name = TEXT("512SPP_GT");
-		M.SPP = 512;
+		M.Name = HighQualityReferenceName;
+		M.SPP = 1024;
 		M.DenoiserMethod = 0; // no denoising on GT
 		M.bAccumulate = true;
 		M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), TEXT("0")});
@@ -170,11 +170,26 @@ bool USLFlythroughSubsystem::HasGTBaseline() const
 FString USLFlythroughSubsystem::GetReferenceMethodName() const
 {
 	// Highest-SPP reference with a completed run wins.
-	for (const TCHAR* Name : { TEXT("512SPP_GT"), TEXT("64SPP_GT") })
+	for (const TCHAR* Name : { HighQualityReferenceName, TEXT("64SPP_GT") })
 	{
 		if (HasCompletedRun(Name)) return Name;
 	}
 	return FString();
+}
+
+bool USLFlythroughSubsystem::NeedsReferencePrompt() const
+{
+	// Reference runs themselves never need one; everything else is scored against it.
+	const FSLFlythroughMethod* Method = GetSelectedMethod();
+	return Method && !Method->bAccumulate && !HasCompletedRun(HighQualityReferenceName);
+}
+
+bool USLFlythroughSubsystem::StartReferenceFlythrough()
+{
+	const int32 Index = Methods.IndexOfByPredicate([](const FSLFlythroughMethod& M) { return M.Name == HighQualityReferenceName; });
+	if (Index == INDEX_NONE || IsBusy()) return false;
+	SelectMethod(Index);
+	return StartFlythrough();
 }
 
 // -----------------------------------------------------------------------
@@ -713,7 +728,7 @@ bool USLFlythroughSubsystem::CanComputeMetrics(FText& Reason) const
 	}
 	if (!HasGTBaseline())
 	{
-		Reason = FText::FromString(TEXT("Render a 64SPP_GT or 512SPP_GT baseline first."));
+		Reason = FText::FromString(TEXT("Render a 1024SPP_GT (or 64SPP_GT) reference first."));
 		return false;
 	}
 	return true;

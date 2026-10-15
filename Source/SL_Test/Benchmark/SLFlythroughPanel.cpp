@@ -351,7 +351,16 @@ public:
 				})
 				.OnClicked_Lambda([this]
 				{
-					if (Subsystem.IsValid()) Subsystem->StartFlythrough();
+					if (!Subsystem.IsValid()) return FReply::Handled();
+					// Re-scan renders/ so a reference rendered in another session counts.
+					Subsystem->RefreshSummaries();
+					if (Subsystem->NeedsReferencePrompt())
+					{
+						PromptedMethod = Subsystem->GetSelectedMethodIndex();
+						return FReply::Handled();
+					}
+					PromptedMethod = INDEX_NONE;
+					Subsystem->StartFlythrough();
 					return FReply::Handled();
 				})
 				.ContentPadding(FMargin(16, 8))
@@ -359,6 +368,90 @@ public:
 					SNew(STextBlock)
 					.TextStyle(&FGMToolsStyle::Get().Body)
 					.Text(FText::FromString(TEXT("▶  Render Flythrough")))
+				]
+			]
+
+			// ---- Missing 1024 SPP reference prompt ----
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+			[
+				SNew(SBorder)
+				.BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+				.BorderBackgroundColor(FLinearColor(0.35f, 0.25f, 0.05f))
+				.Padding(12)
+				.Visibility_Lambda([this]
+				{
+					// Hide once the selection changes, a run starts, or the reference appears.
+					const bool bShow = Subsystem.IsValid() && PromptedMethod != INDEX_NONE && !Subsystem->IsBusy()
+						&& PromptedMethod == Subsystem->GetSelectedMethodIndex() && Subsystem->NeedsReferencePrompt();
+					return bShow ? EVisibility::Visible : EVisibility::Collapsed;
+				})
+				[
+					SNew(SVerticalBox)
+					+ SVerticalBox::Slot().AutoHeight()
+					[
+						SNew(STextBlock)
+						.TextStyle(&FGMToolsStyle::Get().Body)
+						.AutoWrapText(true)
+						.Text(FText::FromString(FString::Printf(
+							TEXT("No local %s reference found in renders/. Metrics score every method against it ")
+							TEXT("(64SPP_GT is only a noisier fallback). Render the reference first? ")
+							TEXT("It accumulates 1024 samples per frame, so it takes much longer than a test run."),
+							USLFlythroughSubsystem::HighQualityReferenceName)))
+					]
+					+ SVerticalBox::Slot().AutoHeight().Padding(0, 8, 0, 0)
+					[
+						SNew(SHorizontalBox)
+						+ SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 6, 0)
+						[
+							SNew(SButton)
+							.ContentPadding(FMargin(12, 6))
+							.ButtonColorAndOpacity(FLinearColor(0.1f, 0.55f, 0.95f))
+							.IsEnabled_Lambda([this] { FText R; return Subsystem.IsValid() && Subsystem->CanStartFlythrough(R); })
+							.OnClicked_Lambda([this]
+							{
+								PromptedMethod = INDEX_NONE;
+								if (Subsystem.IsValid()) Subsystem->StartReferenceFlythrough();
+								return FReply::Handled();
+							})
+							[
+								SNew(STextBlock)
+								.TextStyle(&FGMToolsStyle::Get().Body)
+								.Text(FText::FromString(FString::Printf(TEXT("Render %s"), USLFlythroughSubsystem::HighQualityReferenceName)))
+							]
+						]
+						+ SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 6, 0)
+						[
+							SNew(SButton)
+							.ContentPadding(FMargin(12, 6))
+							.IsEnabled_Lambda([this] { FText R; return Subsystem.IsValid() && Subsystem->CanStartFlythrough(R); })
+							.OnClicked_Lambda([this]
+							{
+								PromptedMethod = INDEX_NONE;
+								if (Subsystem.IsValid()) Subsystem->StartFlythrough();
+								return FReply::Handled();
+							})
+							[
+								SNew(STextBlock)
+								.TextStyle(&FGMToolsStyle::Get().Body)
+								.Text(FText::FromString(TEXT("Render this method anyway")))
+							]
+						]
+						+ SHorizontalBox::Slot().AutoWidth()
+						[
+							SNew(SButton)
+							.ContentPadding(FMargin(12, 6))
+							.OnClicked_Lambda([this]
+							{
+								PromptedMethod = INDEX_NONE;
+								return FReply::Handled();
+							})
+							[
+								SNew(STextBlock)
+								.TextStyle(&FGMToolsStyle::Get().Body)
+								.Text(FText::FromString(TEXT("Cancel")))
+							]
+						]
+					]
 				]
 			]
 
@@ -470,6 +563,8 @@ public:
 
 private:
 	TWeakObjectPtr<USLFlythroughSubsystem> Subsystem;
+	/** Method index the missing-reference prompt was raised for; INDEX_NONE when hidden. */
+	int32 PromptedMethod = INDEX_NONE;
 };
 
 } // anonymous namespace
