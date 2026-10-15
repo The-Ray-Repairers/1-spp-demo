@@ -128,6 +128,17 @@ void USLFlythroughSubsystem::RegisterMethods()
 		M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), TEXT("0")});
 		Methods.Add(MoveTemp(M));
 	}
+
+	// 1024SPP_GT — high-quality reference; preferred by Compute Metrics when complete
+	{
+		FSLFlythroughMethod M;
+		M.Name = HighQualityReferenceName;
+		M.SPP = 1024;
+		M.DenoiserMethod = 0; // no denoising on GT
+		M.bAccumulate = true;
+		M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), TEXT("0")});
+		Methods.Add(MoveTemp(M));
+	}
 }
 
 void USLFlythroughSubsystem::SelectMethod(int32 Index)
@@ -161,7 +172,32 @@ bool USLFlythroughSubsystem::HasCompletedRun(const FString& MethodName) const
 
 bool USLFlythroughSubsystem::HasGTBaseline() const
 {
-	return HasCompletedRun(TEXT("64SPP_GT"));
+	return !GetReferenceMethodName().IsEmpty();
+}
+
+FString USLFlythroughSubsystem::GetReferenceMethodName() const
+{
+	// Highest-SPP reference with a completed run wins.
+	for (const TCHAR* Name : { HighQualityReferenceName, TEXT("64SPP_GT") })
+	{
+		if (HasCompletedRun(Name)) return Name;
+	}
+	return FString();
+}
+
+bool USLFlythroughSubsystem::NeedsReferencePrompt() const
+{
+	// Reference runs themselves never need one; everything else is scored against it.
+	const FSLFlythroughMethod* Method = GetSelectedMethod();
+	return Method && !Method->bAccumulate && !HasCompletedRun(HighQualityReferenceName);
+}
+
+bool USLFlythroughSubsystem::StartReferenceFlythrough()
+{
+	const int32 Index = Methods.IndexOfByPredicate([](const FSLFlythroughMethod& M) { return M.Name == HighQualityReferenceName; });
+	if (Index == INDEX_NONE || IsBusy()) return false;
+	SelectMethod(Index);
+	return StartFlythrough();
 }
 
 // -----------------------------------------------------------------------
@@ -762,7 +798,7 @@ bool USLFlythroughSubsystem::CanComputeMetrics(FText& Reason) const
 	}
 	if (!HasGTBaseline())
 	{
-		Reason = FText::FromString(TEXT("Render a 64SPP_GT baseline first."));
+		Reason = FText::FromString(TEXT("Render a 1024SPP_GT (or 64SPP_GT) reference first."));
 		return false;
 	}
 	return true;
@@ -783,9 +819,10 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 	OnStateChanged.Broadcast();
 
 	const FString Root = GetRendersRoot();
-	const FString ReferenceName = TEXT("64SPP_GT");
+	const FString ReferenceName = GetReferenceMethodName();
 	const FString GTDir = FSLFlythroughMetrics::FindLatestRun(FPaths::Combine(Root, ReferenceName));
 	const FString ReferenceLabel = ReferenceName / FPaths::GetCleanFilename(GTDir);
+	UE_LOG(LogSL_Test, Log, TEXT("Flythrough: Scoring against %s (%s)"), *ReferenceLabel, *GTDir);
 
 	// Load GT frames
 	TArray<FString> GTFrameFiles;

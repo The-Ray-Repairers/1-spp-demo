@@ -28,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-REFERENCE_PREFERENCE = ["512SPP_GT", "64SPP_GT"]
+REFERENCE_PREFERENCE = ["1024SPP_GT", "64SPP_GT"]  # same order as GetReferenceMethodName()
 
 
 def read_lines(path: Path) -> list[str]:
