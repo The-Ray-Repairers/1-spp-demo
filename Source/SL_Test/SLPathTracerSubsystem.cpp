@@ -144,9 +144,11 @@ void USLPathTracerSubsystem::Tick(float DeltaTime)
 		if (MethodInt != LastMethodInt)
 		{
 			// NNE Candy Model requires fixed exposure since it's trained on display-referred sRGB.
+			// RayRepair takes HDR, but its training data was rendered with eye adaptation off,
+			// so pre-exposed SceneColor only matches the training exposure when it is locked too.
 			if (IConsoleVariable* AutoExposureCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.DefaultFeature.AutoExposure")))
 			{
-				AutoExposureCVar->Set(MethodInt == 4 ? 0 : 1, ECVF_SetByConsole);
+				AutoExposureCVar->Set(MethodInt == 4 || MethodInt == 5 ? 0 : 1, ECVF_SetByConsole);
 			}
 			LastMethodInt = MethodInt;
 		}
@@ -169,6 +171,9 @@ void USLPathTracerSubsystem::Tick(float DeltaTime)
 			break;
 		case 4:
 			MethodName = TEXT("NNE Candy Model");
+			break;
+		case 5:
+			MethodName = TEXT("RayRepair Neural Denoiser");
 			break;
 		default:
 			MethodName = FString::Printf(TEXT("Unknown (%d)"), MethodInt);

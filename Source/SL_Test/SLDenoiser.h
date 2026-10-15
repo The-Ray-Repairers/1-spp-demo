@@ -40,6 +40,9 @@ enum class ESLDenoiserMethod : int32
 
 	/** NNE Candy 9 Model — direct C++ inference */
 	NNE = 4,
+
+	/** Ray Repair neural denoiser (format v1 ONNX) via NNERuntimeRDG */
+	RayRepair = 5,
 };
 
 // ---------------------------------------------------------------------------
@@ -315,6 +318,64 @@ class FSLNNEUpsamplePS : public FGlobalShader
 };
 
 class FSLDenoiserNNE final : public ISLDenoiserPass
+{
+public:
+	virtual FScreenPassTexture Apply(
+		FRDGBuilder&          GraphBuilder,
+		const FSceneView&     View,
+		const FSLDenoiserContext& Context) override;
+};
+
+// ---------------------------------------------------------------------------
+// Ray Repair Denoiser (method 5)
+//
+// Runs a format v1 export from neural-denoiser (denoiser/export_ue.py):
+//   input  ue_buffers   [1, 10, H, W]  color(3) base_color(3) normal(3) depth_cm(1)
+//   output denoised_rgb [1,  3, H, W]  linear HDR, same exposure as color
+// All normalisation happens inside the ONNX graph; the shaders only copy
+// and decode buffers. H x W is fixed at export time and must equal the
+// view rect (r.ScreenPercentage 100).
+// ---------------------------------------------------------------------------
+
+class FSLRayRepairPreprocessCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSLRayRepairPreprocessCS);
+	SHADER_USE_PARAMETER_STRUCT(FSLRayRepairPreprocessCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureShaderParameters, SceneTextures)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)
+		SHADER_PARAMETER(FUintVector2, ViewRectMin)
+		SHADER_PARAMETER(FUintVector2, TensorSize)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, OutputTensor)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P)
+	{
+		return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+class FSLRayRepairPostprocessCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSLRayRepairPostprocessCS);
+	SHADER_USE_PARAMETER_STRUCT(FSLRayRepairPostprocessCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, InputTensor)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
+		SHADER_PARAMETER(FUintVector2, ViewRectMin)
+		SHADER_PARAMETER(FUintVector2, TensorSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P)
+	{
+		return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+class FSLDenoiserRayRepair final : public ISLDenoiserPass
 {
 public:
 	virtual FScreenPassTexture Apply(

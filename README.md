@@ -77,7 +77,7 @@ $ProjectFile = (Resolve-Path .\SL_Test.uproject).Path
    seconds sampled at 30 positions/second, producing 300 frames. These parameters
    are currently C++ defaults in `SLFlythroughSubsystem.h`, not GM asset settings.
 3. Render the desired test methods: `1SPP_Noisy`, `1SPP_Gaussian`,
-   `1SPP_Bilateral`, `1SPP_NeuralPlaceholder`, and `1SPP_NNE`. SVGF and Lumen/RR
+   `1SPP_Bilateral`, `1SPP_NeuralPlaceholder`, `1SPP_NNE`, and `1SPP_RayRepair`. SVGF and Lumen/RR
    remain separate GM profiles and are not registered flythrough methods.
 4. Click **Compute Metrics** once a complete GT run exists. The operation evaluates
    each method's latest complete run against the latest complete `64SPP_GT` run.
@@ -213,6 +213,14 @@ Selects the denoising algorithm to apply over the 1-spp frame (after noise injec
 * `2`: Edge-preserving Bilateral Filter.
 * `3`: Neural Denoiser Placeholder — diagnostic pass that reads all G-Buffer auxiliary inputs (Albedo, Normals, Depth, Motion Vectors) and outputs a debug visualisation. See `SL.Denoiser.Neural.DebugMode`.
 * `4`: NNE Candy Model — an ONNX-based neural denoiser integrated directly into the C++ Render Dependency Graph (RDG). Note: because this style transfer network expects display-referred images in [0,255], selecting this method automatically locks auto-exposure (`r.DefaultFeature.AutoExposure 0`) to prevent a blown-out feedback loop.
+* `5`: RayRepair — the team's neural denoiser, exported in Ray Repair format v1 by `denoiser/export_ue.py` in [neural-denoiser](https://github.com/The-Ray-Repairers/neural-denoiser) (`ue-format-v1` / `experiments` branches). It takes linear HDR scene color plus G-Buffer base color, world normal and depth (`ue_buffers`, `[1,10,H,W]`) and returns linear HDR RGB at full resolution, before tonemapping. Auto-exposure is locked as for method 4 because the training data was rendered with eye adaptation off. See `SL.Denoiser.RayRepair.Model`.
+
+---
+
+### `SL.Denoiser.RayRepair.Model`
+**Default:** `/Game/ML/RayRepair_v1_1920x1080`
+
+NNE model data asset loaded by `SL.Denoiser.Method 5`. Import the `.onnx` from `export_ue.py` into `Content/ML/`. The tensor size is read from the model and is static, so the view rect must match it exactly: use `r.ScreenPercentage 100` and a viewport of the export resolution, or re-export at your resolution (`--height/--width`). On a mismatch, or for a history model (extra `motion_px`/`history_rgb` inputs, not wired up yet), the pass logs an error under `LogTemp` and passes the noisy frame through. Changing the value reloads the model on the next frame.
 
 ---
 

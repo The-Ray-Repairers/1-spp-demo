@@ -1,0 +1,54 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// SLRayRepairPreprocess.usf
+//
+// Packs the Ray Repair format v1 input tensor "ue_buffers" [1, 10, H, W],
+// float32, NCHW planar (element (c, y, x) at c*H*W + y*W + x):
+//
+//   ch 0-2  color       linear HDR scene color, 1 spp, pre-exposed (before tonemapping)
+//   ch 3-5  base_color  linear material base color, [0, 1]
+//   ch 6-8  normal      world-space unit normal, decoded to [-1, 1]
+//   ch 9    depth       linear scene depth along the camera forward axis, centimeters
+//
+// Copy and decode only: demodulation, log compression and depth encoding all
+// happen inside the ONNX graph (neural-denoiser denoiser/ue_format.py).
+//
+// G-Buffer decode via GetGBufferData assumes the legacy layout, which this
+// project gets from r.Substrate.ProjectGBufferFormat=0 (blendable GBuffer).
+//
+// Used by:
+//   SL.Denoiser.Method 5
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"   // GetGBufferData, CalcSceneDepth
+
+Texture2D<float4> SceneColorTexture;
+uint2 ViewRectMin;
+uint2 TensorSize;                      // (W, H) of the exported model == view rect size
+RWBuffer<float> OutputTensor;          // 10 * H * W floats
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (any(Id.xy >= TensorSize)) return;
+
+    uint2  Pixel    = ViewRectMin + Id.xy;
+    float2 BufferUV = (float2(Pixel) + 0.5) * View.BufferSizeAndInvSize.zw;
+
+    float3 Color = SceneColorTexture.Load(int3(Pixel, 0)).rgb;
+    FGBufferData GBuffer = GetGBufferData(BufferUV);
+    float DepthCm = CalcSceneDepth(BufferUV);
+
+    uint Plane = TensorSize.x * TensorSize.y;
+    uint I     = Id.y * TensorSize.x + Id.x;
+
+    OutputTensor[0 * Plane + I] = Color.r;
+    OutputTensor[1 * Plane + I] = Color.g;
+    OutputTensor[2 * Plane + I] = Color.b;
+    OutputTensor[3 * Plane + I] = GBuffer.BaseColor.r;
+    OutputTensor[4 * Plane + I] = GBuffer.BaseColor.g;
+    OutputTensor[5 * Plane + I] = GBuffer.BaseColor.b;
+    OutputTensor[6 * Plane + I] = GBuffer.WorldNormal.x;
+    OutputTensor[7 * Plane + I] = GBuffer.WorldNormal.y;
+    OutputTensor[8 * Plane + I] = GBuffer.WorldNormal.z;
+    OutputTensor[9 * Plane + I] = DepthCm;
+}
