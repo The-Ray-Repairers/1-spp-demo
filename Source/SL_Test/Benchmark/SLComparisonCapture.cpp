@@ -5,13 +5,16 @@
 #include "Camera/PlayerCameraManager.h"
 #include "GameFramework/PlayerController.h"
 #include "Engine/GameViewportClient.h"
+#include "Engine/World.h"
 #include "HAL/FileManager.h"
+#include "HAL/IConsoleManager.h"
 #include "ImageUtils.h"
 #include "Misc/EngineVersion.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "RHI.h"
 #include "UnrealClient.h"
+#include "UObject/Package.h"
 
 bool USLComparisonSubsystem::StartCapture()
 {

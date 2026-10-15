@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Modules/ModuleManager.h"
 
 /** Main log category used across the project. */
 DECLARE_LOG_CATEGORY_EXTERN(LogSL_Test, Log, All);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SceneViewExtension.h"
+#include "SceneView.h"
 #include "SceneManagement.h"
 
 /** Main-view accumulation tracking; scene captures keep their own sample state. */

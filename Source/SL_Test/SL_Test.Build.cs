@@ -38,6 +38,7 @@ public class SL_Test : ModuleRules
 			"Renderer",   // FRDGBuilder, FScreenPassTexture, AddDrawScreenPass, FPostProcessingInputs
 			"RHI",        // TStaticSamplerState, FRHICopyTextureInfo
 			"DLSSBlueprint",
+			"ImageWrapper", // PNG loading for flythrough metric computation
 		});
 
 		PublicIncludePaths.AddRange(new string[] {

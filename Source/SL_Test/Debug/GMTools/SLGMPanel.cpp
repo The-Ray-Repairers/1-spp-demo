@@ -4,8 +4,11 @@
 #include "SLGMCommandService.h"
 #include "SL_Test.h"
 #include "Benchmark/SLComparisonSubsystem.h"
+#include "Benchmark/SLFlythroughSubsystem.h"
+#include "Benchmark/SLFlythroughPanel.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/LocalPlayer.h"
+#include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/Layout/SBorder.h"
@@ -219,6 +222,7 @@ namespace
 		{
 			OnMinimize = Args._OnMinimize;
             TWeakObjectPtr<USLComparisonSubsystem> Comparison = Args._Player->GetWorld()->GetSubsystem<USLComparisonSubsystem>();
+            TWeakObjectPtr<USLFlythroughSubsystem> FlythroughSubsystem = Args._Player->GetWorld()->GetSubsystem<USLFlythroughSubsystem>();
 
 			TSharedRef<SVerticalBox> Rows = SNew(SVerticalBox);
             TWeakObjectPtr<USLGMToolConfig> Config = Args._Configuration;
@@ -262,11 +266,22 @@ namespace
 						else if (Entry.Control == ESLGMControlType::RadioGroup) Row = SNew(SGMRadioGroupRow).Entry(Entry).Comparison(Comparison);
                         else Row = SNew(SGMRow).Entry(Entry);
                         Rows->AddSlot().AutoHeight().Padding(0, 3)[SNew(SBox)
-                            .IsEnabled_Lambda([Comparison, Entry] { return !Comparison.IsValid() || Comparison->IsSampleCountControl(Entry) ||
+                            .IsEnabled_Lambda([Comparison, Entry, FlythroughSubsystem] {
+                                if (FlythroughSubsystem.IsValid() && FlythroughSubsystem->IsBusy()) return false;
+                                return !Comparison.IsValid() || Comparison->IsSampleCountControl(Entry) ||
                                 (Entry.Control == ESLGMControlType::RadioGroup && !Entry.PreviewProfileId.IsNone() && Comparison->CanSelectPreviewMethod()) ||
                                 (!Comparison->IsBusy() && (!Comparison->OwnsRenderer() || Entry.bEditableDuringPreview)); })[Row.ToSharedRef()]];
                     }
                 }
+            }
+
+            // ---- Flythrough Benchmark Section ----
+            if (USLFlythroughSubsystem* Flythrough = Args._Player->GetWorld()->GetSubsystem<USLFlythroughSubsystem>())
+            {
+                Rows->AddSlot().AutoHeight().Padding(0, 16, 0, 4)
+                [
+                    CreateFlythroughPanel(Flythrough)
+                ];
             }
 
 			ChildSlot.HAlign(HAlign_Right).VAlign(VAlign_Fill).Padding(16)[SNew(SBox).WidthOverride(460)[SNew(SBorder)

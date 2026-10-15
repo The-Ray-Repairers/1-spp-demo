@@ -1,4 +1,5 @@
 #include "SLComparisonSubsystem.h"
+#include "SLFlythroughSubsystem.h"
 #include "SLComparisonView.h"
 #include "SLGuideProbe.h"
 #include "SL_Test.h"
@@ -9,6 +10,9 @@
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/GameViewportClient.h"
+#include "Engine/World.h"
+#include "GameFramework/PlayerController.h"
+#include "HAL/IConsoleManager.h"
 #include "Kismet/KismetRenderingLibrary.h"
 #include "HAL/PlatformProcess.h"
 #include "Misc/FileHelper.h"
@@ -46,6 +50,8 @@ bool USLComparisonSubsystem::CanExecute(const FSLGMToolEntry& Requested, FText& 
 {
     const auto& Entry = ResolveEntry(Requested);
     auto Reject = [&Reason](const TCHAR* Text) { Reason = FText::FromString(Text); return false; };
+    if (const auto* Flythrough = GetWorld()->GetSubsystem<USLFlythroughSubsystem>(); Flythrough && Flythrough->IsBusy())
+        return Reject(TEXT("Wait for the flythrough benchmark to finish."));
     if (Entry.Action == ESLComparisonAction::Restore) return OwnsRenderer();
     if (Entry.Action == ESLComparisonAction::OpenResults) return !Output.IsEmpty();
     if (Entry.Id.IsNone()) return Reject(TEXT("Give each rendering profile a unique Id."));

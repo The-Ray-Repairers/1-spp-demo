@@ -2,6 +2,7 @@
 
 #include "SLPathTracerSubsystem.h"
 #include "Benchmark/SLComparisonSubsystem.h"
+#include "Benchmark/SLFlythroughSubsystem.h"
 #include "SL_Test.h"
 #include "SLDenoiser.h"
 #include "Engine/World.h"
@@ -131,6 +132,7 @@ void USLPathTracerSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 void USLPathTracerSubsystem::Tick(float DeltaTime)
 {
+    if (auto* Flythrough = GetWorld()->GetSubsystem<USLFlythroughSubsystem>(); Flythrough && Flythrough->IsBusy()) return;
     if (auto* Comparison = GetWorld()->GetSubsystem<USLComparisonSubsystem>(); Comparison && Comparison->OwnsRenderer()) return;
 	Super::Tick(DeltaTime);
 

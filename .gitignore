@@ -45,6 +45,9 @@ DefaultEngine.ini.bak
 *.dmp
 *.crashinfo
 
+# Flythrough benchmark renders (large frame captures)
+/renders/
+
 # System & OS files
 Thumbs.db
 Desktop.ini

@@ -1,4 +1,160 @@
-## 1-SPP Demo: SL Developer Console Commands
+# 1-SPP Denoiser Demo
+
+Unreal Engine 5.8 C++ project for comparing low-sample path tracing, image filters,
+experimental neural passes, and renderer-level denoisers. The default scene is
+`/Game/Levels/LVL_RT_Room`. Normal game startup enables the 1-SPP path tracer;
+enter `gm` in the developer console during play to open the rendering tools.
+
+## Project state
+
+Developer status as of **2026-10-15**:
+
+- The GM panel supports configurable rendering profiles, reference captures, and
+  a live before/after slider. Profiles include raw path tracing, SVGF, and
+  Lumen + DLSS Ray Reconstruction. The Lumen/RR option compares an entire rendering
+  pipeline, so it should not be interpreted as a filter applied to the same input.
+- The flythrough benchmark and full-reference metrics are implemented. It exports
+  PNG sequences, frame timings, per-run metrics, and summary charts. End-to-end
+  GPU capture and visual UI validation remain outstanding.
+- Neural placeholder and NNE Candy are experimental demonstration methods. The
+  placeholder displays diagnostics; Candy is a style-transfer model, not a
+  validated denoising model. Their inclusion does not imply competitive quality.
+- Without hardware ray tracing, normal play can use synthetic noise as a visual
+  fallback. It is not a physical path-tracing reference, and flythrough benchmarks
+  require hardware ray tracing.
+
+### Build and verification status
+
+The current **SL_TestEditor / Win64 / Development** build succeeded with the
+NVIDIA plugins installed (`-NoUnity -NoHotReloadFromIDE`). This was an incremental
+build: existing compile outputs were current and only target metadata was written.
+The previous missing-DLSS build blocker is resolved on this machine; fresh clones
+still need the external plugins. The local log is
+`Saved/Logs/DeveloperReadmeBuild.log`.
+
+The earlier completion pass also passed UnrealHeaderTool, six independent C++
+syntax checks without unity/PCH, and seven isolated numerical fixtures for MSE,
+PSNR, SSIM, and CNR. Those numerical fixtures exercised the math with lightweight
+stand-ins for Unreal containers; they were not engine integration tests. PNG/CSV
+capture, renderer restoration, pause/camera behavior, and graph presentation still
+need an end-to-end editor test. Local scratch verification files live under
+`Saved/FlythroughVerification/` and are not committed.
+
+## Developer setup
+
+1. Install **Unreal Engine 5.8**, Visual Studio 2022 with C++ game-development
+   tools, and a Windows SDK. The targets use `BuildSettingsVersion.V7` and
+   `EngineIncludeOrderVersion.Unreal5_8`. Win64 with DX12/SM6 is the configured
+   development path.
+2. Install an engine-compatible NVIDIA plugin bundle. `SL_Test.uproject` enables
+   `DLSS`, `StreamlineDLSSG`, and `StreamlineReflex`; install their dependencies as
+   well. `DLSSBlueprint` is a required C++ module, so disabling the plugin checkbox
+   alone does not remove the build dependency. The current local engine has these
+   plugins under `Engine/Plugins/Marketplace`; NVIDIA plugin code/binaries are not
+   shipped in this repository.
+3. Keep the project-enabled engine plugins available, including StateTree,
+   GameplayStateTree, NeuralRendering, and NNERuntimeRDG. Generate project files
+   from `SL_Test.uproject`, then build **SL_TestEditor / Development / Win64** with
+   the editor closed.
+4. Open `SL_Test.uproject`, let shaders compile, and play the default map. Use a
+   supported GPU for the rendering mode being tested. Restart the editor after
+   changing startup renderer settings such as the SVGF velocity configuration.
+
+Equivalent PowerShell build command from the repository root (set your engine path):
+
+```powershell
+$EngineRoot = 'A:\Program Files\EpicGames\UE_5.8'
+$ProjectFile = (Resolve-Path .\SL_Test.uproject).Path
+& "$EngineRoot\Engine\Build\BatchFiles\Build.bat" SL_TestEditor Win64 Development "-Project=$ProjectFile" -WaitMutex -NoHotReloadFromIDE -NoUnity
+```
+
+## Flythrough benchmark workflow
+
+1. Start play, choose the scene/camera position, and enter `gm`. Keep the same scene,
+   starting camera, viewport size, and rendering settings across methods.
+2. In **Flythrough Benchmark**, select **64SPP_GT** and click **Render Flythrough**.
+   The current path is a circular orbit around the starting camera location: 10
+   seconds sampled at 30 positions/second, producing 300 frames. These parameters
+   are currently C++ defaults in `SLFlythroughSubsystem.h`, not GM asset settings.
+3. Render the desired test methods: `1SPP_Noisy`, `1SPP_Gaussian`,
+   `1SPP_Bilateral`, `1SPP_NeuralPlaceholder`, and `1SPP_NNE`. SVGF and Lumen/RR
+   remain separate GM profiles and are not registered flythrough methods.
+4. Click **Compute Metrics** once a complete GT run exists. The operation evaluates
+   each method's latest complete run against the latest complete `64SPP_GT` run.
+   It currently runs synchronously and can block the UI while processing images.
+5. Inspect the summary charts or click **Open Results Folder**. Blue marks the
+   selected method, green marks other methods with completed runs, and gray marks
+   methods without completed runs. Incomplete newer runs do not hide older complete
+   runs. Run detection refreshes when the panel is constructed or a run completes.
+
+During capture, gameplay is paused, the camera follows fixed sample positions,
+path-tracer sampling is locked, and exposure/renderer settings are controlled for
+comparison. GT accumulates 64 samples at each position. Cancel restores captured
+settings and leaves partial output on disk. Resizing the viewport or a frame
+exceeding the timeout stops the run. Existing comparison ownership is released
+before capture; conflicting GM controls are disabled while the benchmark runs.
+
+The path is repeatable for the same starting view. Runs do not yet store a scene,
+camera, or settings manifest, so matching filenames/resolutions alone cannot
+establish that captures from different sessions are comparable. Use a fresh
+`renders/` directory when changing the scene or benchmark configuration.
+
+```text
+renders/
+  <method_name>/
+    run_001/
+      frames/
+        frame_0000.png
+        ...
+      timings.csv
+      metrics.csv          # written by Compute Metrics
+  summary_metrics.csv      # latest evaluated complete run per method
+```
+
+Run IDs increase independently for each method. Completed runs require a timings
+CSV and the corresponding nonempty frame sequence; cancelled runs are excluded.
+Frame counts/names and decoded image dimensions must match GT for scoring.
+`renders/` is ignored by Git. Share exported results separately from source changes.
+
+### Reading the measurements
+
+Metrics operate on **tone-mapped 8-bit sRGB PNGs**, not linear HDR radiance.
+
+| Measurement | Definition / interpretation |
+| --- | --- |
+| MSE | Mean squared RGB error over channels and pixels using 0–255 inputs (MSE range 0–65025); lower is better. |
+| PSNR | `10 * log10(255^2 / MSE)` in dB; exact matches use a finite 100 dB cap. |
+| SSIM | Luminance SSIM with an 11×11 Gaussian window, sigma 1.5, sampled at stride 4; small images use a smaller odd window. |
+| CNR | Linear `sigma_G / sigma_R`, where G is GT luminance and R is test-minus-GT luminance. Residual standard deviation is floored at `1e-8`; this is not a dB value. |
+| Render time | Wall-clock milliseconds through frame completion/readback, excluding PNG compression and disk writes; includes capture/accumulation overhead and is not a GPU-only profiler measurement. |
+
+Per-frame CSVs include an `avg` row. Summary metric values are arithmetic means of
+frame metrics, rather than metrics recomputed over a pooled image sequence. The GT
+self-comparison can have a very large CNR because of the residual floor. Charts
+show average runtime, MSE, PSNR, SSIM, and CNR.
+
+## Source map and next validation steps
+
+| Location | Responsibility |
+| --- | --- |
+| `Source/SL_Test/Benchmark/SLFlythroughSubsystem.*` | Method registry, camera/state machine, capture, run detection, metrics orchestration. |
+| `Source/SL_Test/Benchmark/SLFlythroughMetrics.*` | PNG decoding, metric calculations, CSV I/O, complete-run selection. |
+| `Source/SL_Test/Benchmark/SLFlythroughPanel.*` | Method buttons, GT gating, progress, summary charts. |
+| `Source/SL_Test/Benchmark/SLComparison*` | Interactive renderer ownership, same-camera references, live comparison. |
+| `Source/SL_Test/Debug/GMTools/SLGMToolConfig.*` | Data-asset schema for GM profiles and presentation. |
+| `Source/SL_Test/SLPathTracerSubsystem.*` | Startup path tracing, per-frame reset, software fallback. |
+| `Source/SL_Test/SLDenoiser*`, `Shaders/` | Filter implementations and shader passes. |
+| `Source/SL_Test/SL_Test.Build.cs` | Module dependencies, including Engine's `ImageUtils.h` API and ImageWrapper for decoding. |
+
+Before treating benchmark numbers as validated, render GT plus a noisy and a
+filtered run at the same resolution. Check all 300 PNGs and timing rows, compute
+metrics, inspect the CSVs/charts, and compare representative frames visually.
+Exercise cancellation, viewport resize, repeated runs, and restoration of the
+camera/pause/render settings. Also test a partial newer GT run and a missing or
+mismatched frame to verify gating and rejection. Changing shader types/layouts
+requires a normal rebuild and editor restart; see the Live Coding notes below.
+
+## Developer console reference
 
 Normal game startup uses the existing 1-SPP path tracer. Enter `gm` during play for the rendering controls:
 Raw 1 SPP, 1 SPP + SVGF, Lumen + DLSS RR (End-to-End), Generate High-SPP Reference.
@@ -33,7 +189,7 @@ Controls whether path tracer accumulation restarts on every frame. When enabled,
 
 Sets the Target Samples Per Pixel (SPP) for the real-time path tracer or its software fallback.
 * When hardware ray tracing is available, this CVar drives the engine's built-in `r.PathTracing.SamplesPerPixel`.
-* When hardware ray tracing is unavailable, this mathematically scales the variance of the software noise fallback to correctly emulate the specified sample rate (standard deviation is scaled by `1 / sqrt(TargetSPP)`).
+* When hardware ray tracing is unavailable, this mathematically scales the variance of the software noise fallback to approximate the variance at the specified sample rate (standard deviation is scaled by `1 / sqrt(TargetSPP)`).
 
 ---
 
@@ -43,7 +199,7 @@ Sets the Target Samples Per Pixel (SPP) for the real-time path tracer or its sof
 Controls the overall intensity of the software noise fallback. **Note:** This is only active on machines without hardware ray tracing (DXR) support.
 * Scales the standard deviation of the injected Poisson shot noise.
 * `0`: Disables the noise injection completely.
-* `1.0`: Default intensity (mathematically matched to 1-spp Monte Carlo variance).
+* `1.0`: Default synthetic noise intensity; this does not validate physical 1-SPP rendering.
 * Changes to this value apply on the render thread and take effect on the very next frame.
 
 ---
@@ -163,10 +319,11 @@ To configure another button, edit `/Game/Debug/GMTools/DA_RenderGMTools`: add an
 ### Edit the GM panel
 
 Open `Content/Debug/GMTools/DA_RenderGMTools` in the Content Browser. Its `Entries`
-array is the single source for button labels, groups, order, radio options and
+array configures GM profile button labels, groups, order, radio options and
 rendering settings. `RenderingAction` entries select an operation and contain
 ordered `RenderSettings` name/value pairs. The reference label uses `{0}` for the
 selected SPP. `RenderingStatus` adds the live status row wherever desired.
 Panel title, minimize/restore labels, reference SPP variable and capture timeout
 are also fields on this asset. No JSON profiles or separate comparison INI section
-are used. C++ implements the reusable controls and rendering operations only.
+are used. C++ implements the reusable controls and rendering operations. The separate
+flythrough section currently defines its methods and path defaults in C++.

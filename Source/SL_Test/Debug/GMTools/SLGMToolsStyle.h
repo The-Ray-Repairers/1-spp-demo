@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Styling/CoreStyle.h"
+#include "Styling/SlateTypes.h"
 
 /** Shared runtime palette; opaque fill brushes prevent the scene bleeding through. */
 struct FGMToolsStyle
