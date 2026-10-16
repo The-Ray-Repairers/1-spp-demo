@@ -311,7 +311,11 @@ public:
 			[
 				SNew(STextBlock)
 				.TextStyle(&FGMToolsStyle::Get().Body)
-				.Text(FText::FromString(TEXT("Flythrough Benchmark")))
+				.Text_Lambda([this]
+				{
+					return FText::FromString(Subsystem.IsValid() && Subsystem->IsUsingSoftwareFallback()
+						? TEXT("Flythrough Benchmark - SYNTHETIC TEST") : TEXT("Flythrough Benchmark"));
+				})
 				.ColorAndOpacity(FLinearColor(0.6f, 0.8f, 1.0f))
 			]
 

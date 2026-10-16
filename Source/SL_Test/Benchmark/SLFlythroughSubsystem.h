@@ -104,6 +104,8 @@ public:
 
 	// ---- Renders directory ----
 	FString GetRendersRoot() const;
+	/** Opt-in synthetic pipeline testing on machines without hardware ray tracing. */
+	bool IsUsingSoftwareFallback() const;
 
 private:
 	void RegisterMethods();
@@ -135,6 +137,7 @@ private:
 	// ---- Camera ----
 	UPROPERTY(Transient) TObjectPtr<class ACameraActor> FlythroughCamera;
 	UPROPERTY(Transient) TObjectPtr<AActor> PreviousViewTarget;
+	bool bUseRoomCameraPath = false;
 	FVector OrbitCenter = FVector::ZeroVector;
 	float OrbitRadius = 400.0f;
 	float OrbitHeight = 200.0f;
@@ -156,6 +159,9 @@ private:
 
 	// ---- Accumulation (multi-SPP) ----
 	TSharedPtr<class FSLComparisonView, ESPMode::ThreadSafe> AccumulationView;
+	// Only owned here if normal startup did not create the existing fallback view.
+	TSharedPtr<class FSLNoiseFallbackViewExtension, ESPMode::ThreadSafe> SoftwareFallbackView;
+	bool bSoftwareFallbackRun = false;
 	int32 TargetSPP = 1;
 
 	// ---- Settings Restore ----

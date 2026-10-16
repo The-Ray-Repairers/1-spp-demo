@@ -43,6 +43,7 @@ public:
     {
         if (NoiseFallbackViewExtension) NoiseFallbackViewExtension->SetComparisonPosition(Position);
     }
+    bool HasNoiseFallbackView() const { return NoiseFallbackViewExtension.IsValid(); }
 
 private:
 	TSharedPtr<FSLPathTracerResetViewExtension, ESPMode::ThreadSafe> ResetViewExtension;

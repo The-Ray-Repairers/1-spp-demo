@@ -1,6 +1,8 @@
 #include "SLFlythroughSubsystem.h"
+#include "SLFlythroughCameraPath.h"
 #include "SLComparisonView.h"
 #include "SLComparisonSubsystem.h"
+#include "SLPathTracerSubsystem.h"
 #include "SL_Test.h"
 #include "DLSSLibrary.h"
 #include "Camera/CameraActor.h"
@@ -24,6 +26,24 @@
 #include "UnrealClient.h"
 
 DECLARE_CYCLE_STAT(TEXT("SLFlythroughSubsystem"), STAT_SLFlythrough, STATGROUP_Tickables);
+
+static TAutoConsoleVariable<int32> CVarSLFlythroughAllowSoftwareFallback(
+	TEXT("SL.Flythrough.AllowSoftwareFallback"), 0,
+	TEXT("Allow synthetic flythrough pipeline tests when hardware ray tracing is unavailable.\n")
+	TEXT("0: require hardware ray tracing (default). 1: allow the existing noise fallback.\n")
+	TEXT("Synthetic PNGs/metrics go to renders/software_fallback and are not ray-traced benchmarks.\n")
+	TEXT("Changes during capture apply after the current run finishes."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*)
+	{
+		if (!GEngine) return;
+		for (const auto& Context : GEngine->GetWorldContexts())
+			if (UWorld* World = Context.World())
+				if (auto* Flythrough = World->GetSubsystem<USLFlythroughSubsystem>(); Flythrough && !Flythrough->IsBusy())
+				{
+					Flythrough->RefreshSummaries();
+					Flythrough->OnStateChanged.Broadcast();
+				}
+	}), ECVF_Default);
 
 TStatId USLFlythroughSubsystem::GetStatId() const
 {
@@ -139,7 +159,15 @@ const FSLFlythroughMethod* USLFlythroughSubsystem::GetSelectedMethod() const
 
 FString USLFlythroughSubsystem::GetRendersRoot() const
 {
-	return FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectDir(), TEXT("renders")));
+	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectDir(), TEXT("renders")));
+	return IsUsingSoftwareFallback() ? FPaths::Combine(Root, TEXT("software_fallback")) : Root;
+}
+
+bool USLFlythroughSubsystem::IsUsingSoftwareFallback() const
+{
+	// Pin the mode for a running capture even if the console switch changes.
+	return IsBusy() ? bSoftwareFallbackRun
+		: !IsRayTracingEnabled() && CVarSLFlythroughAllowSoftwareFallback.GetValueOnGameThread() != 0;
 }
 
 // -----------------------------------------------------------------------
@@ -173,11 +201,14 @@ void USLFlythroughSubsystem::RefreshSummaries()
 }
 
 // -----------------------------------------------------------------------
-// Camera Path — Circular Orbit
+// Camera Path — Authored Room Loop / Generic Orbit
 // -----------------------------------------------------------------------
 
 FTransform USLFlythroughSubsystem::GetCameraTransformAtTime(double Time) const
 {
+	if (bUseRoomCameraPath)
+		return SLFlythroughCameraPath::EvaluateRoom(Time / FlythroughDuration);
+
 	// Full 360° orbit over FlythroughDuration
 	const double Angle = (Time / FlythroughDuration) * 2.0 * PI;
 	const FVector Position = OrbitCenter + FVector(
@@ -202,7 +233,15 @@ void USLFlythroughSubsystem::ApplyMethodSettings(const FSLFlythroughMethod& Meth
 	bSavedRR = UDLSSLibrary::IsDLSSRREnabled();
 	UDLSSLibrary::EnableDLSSRR(false);
 	UDLSSLibrary::EnableDLSS(false);
-	UKismetRenderingLibrary::EnablePathTracing(true);
+	UKismetRenderingLibrary::EnablePathTracing(!bSoftwareFallbackRun);
+	if (bSoftwareFallbackRun)
+	{
+		const auto* PathTracer = GetWorld()->GetSubsystem<USLPathTracerSubsystem>();
+		// Reuse the normal viewport fallback; do not inject noise twice.
+		// Also support SL.PathTracer.AutoEnable=0, which skips its startup view.
+		if (!PathTracer || !PathTracer->HasNoiseFallbackView())
+			SoftwareFallbackView = FSceneViewExtensions::NewExtension<FSLNoiseFallbackViewExtension>(GetWorld(), true);
+	}
 
 	// Save & set SPP
 	auto SetCVar = [this](const FString& Name, const FString& Value)
@@ -271,6 +310,7 @@ void USLFlythroughSubsystem::SetupCamera()
 	if (!PC || !PC->PlayerCameraManager) return;
 
 	const auto POV = PC->PlayerCameraManager->GetCameraCacheView();
+	bUseRoomCameraPath = SLFlythroughCameraPath::IsRoomMap(GetWorld()->GetMapName());
 	OrbitCenter = POV.Location;
 	PreviousViewTarget = PC->GetViewTarget();
 	bWasPaused = PC->IsPaused();
@@ -278,7 +318,10 @@ void USLFlythroughSubsystem::SetupCamera()
 	FlythroughCamera = GetWorld()->SpawnActor<ACameraActor>(POV.Location, POV.Rotation);
 	if (FlythroughCamera)
 	{
-		FlythroughCamera->GetCameraComponent()->FieldOfView = POV.FOV;
+		FlythroughCamera->GetCameraComponent()->FieldOfView = bUseRoomCameraPath
+			? SLFlythroughCameraPath::RoomFieldOfView : POV.FOV;
+		if (bUseRoomCameraPath)
+			FlythroughCamera->GetCameraComponent()->bConstrainAspectRatio = false;
 		FlythroughCamera->GetCameraComponent()->PostProcessSettings = POV.PostProcessSettings;
 		auto& PP = FlythroughCamera->GetCameraComponent()->PostProcessSettings;
 		PP.bOverride_PathTracingSamplesPerPixel = true;
@@ -308,6 +351,12 @@ void USLFlythroughSubsystem::ReleaseCamera()
 		AccumulationView.Reset();
 		FlushRenderingCommands();
 	}
+	if (SoftwareFallbackView)
+	{
+		FlushRenderingCommands();
+		SoftwareFallbackView.Reset();
+		FlushRenderingCommands();
+	}
 }
 
 // -----------------------------------------------------------------------
@@ -326,9 +375,9 @@ bool USLFlythroughSubsystem::CanStartFlythrough(FText& Reason) const
 		Reason = FText::FromString(TEXT("Wait for the comparison capture to finish."));
 		return false;
 	}
-	if (!IsRayTracingEnabled())
+	if (!IsRayTracingEnabled() && !IsUsingSoftwareFallback())
 	{
-		Reason = FText::FromString(TEXT("Flythrough benchmarks require hardware ray tracing."));
+		Reason = FText::FromString(TEXT("Hardware ray tracing is unavailable. For synthetic pipeline tests, enter SL.Flythrough.AllowSoftwareFallback 1."));
 		return false;
 	}
 	if (FScreenshotRequest::IsScreenshotRequested())
@@ -370,6 +419,7 @@ bool USLFlythroughSubsystem::StartFlythrough()
 
 	const FSLFlythroughMethod& Method = *GetSelectedMethod();
 	CurrentMethodName = Method.Name;
+	bSoftwareFallbackRun = IsUsingSoftwareFallback();
 	// Release comparison overlays, view extensions and renderer overrides first.
 	if (auto* Comparison = GetWorld()->GetSubsystem<USLComparisonSubsystem>(); Comparison && Comparison->OwnsRenderer())
 		Comparison->Restore();
@@ -382,6 +432,21 @@ bool USLFlythroughSubsystem::StartFlythrough()
 	{
 		MetricsStatus = TEXT("Unable to create the flythrough output directory.");
 		return false;
+	}
+
+	if (bSoftwareFallbackRun)
+	{
+		const FString Notice = TEXT("SYNTHETIC SOFTWARE FALLBACK - PIPELINE TEST ONLY\n")
+			TEXT("Viewport raster rendering plus simulated noise; not hardware path tracing.\n")
+			TEXT("64SPP_GT uses 1/sqrt(64) noise scaling, not 64 accumulated rays.\n")
+			TEXT("Quality metrics and timings are not valid ray-traced benchmark results.\n");
+		if (!FFileHelper::SaveStringToFile(Notice, *FPaths::Combine(CurrentRunDir, TEXT("capture_mode.txt")),
+			FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+		{
+			MetricsStatus = TEXT("Unable to write the synthetic capture notice.");
+			return false;
+		}
+		UE_LOG(LogSL_Test, Display, TEXT("Flythrough: SYNTHETIC software fallback test. Output: %s"), *CurrentRunDir);
 	}
 
 	// Setup frames
@@ -408,7 +473,7 @@ bool USLFlythroughSubsystem::StartFlythrough()
 	ApplyMethodSettings(Method);
 
 	// For multi-SPP accumulation, create a view extension to track samples
-	if (Method.bAccumulate)
+	if (Method.bAccumulate && !bSoftwareFallbackRun)
 	{
 		AccumulationView = FSceneViewExtensions::NewExtension<FSLComparisonView>(GetWorld());
 		AccumulationView->bReference = true;
@@ -451,6 +516,7 @@ void USLFlythroughSubsystem::CancelFlythrough()
 
 	Phase = ESLFlythroughPhase::Idle;
 	MetricsStatus = TEXT("Flythrough cancelled.");
+	RefreshSummaries();
 	OnStateChanged.Broadcast();
 
 	UE_LOG(LogSL_Test, Log, TEXT("Flythrough: Cancelled at frame %d/%d"), CurrentFrame, TotalFrames);
@@ -519,7 +585,7 @@ void USLFlythroughSubsystem::TickRendering()
 
 	const FSLFlythroughMethod& Method = *GetSelectedMethod();
 
-	if (Method.bAccumulate)
+	if (Method.bAccumulate && !bSoftwareFallbackRun)
 	{
 		// The warm-up view applies the camera change before we trust sample counts.
 		// PreRenderView can otherwise report the previous camera's completed SPP.
@@ -531,7 +597,7 @@ void USLFlythroughSubsystem::TickRendering()
 	}
 	else
 	{
-		// Single-SPP: capture immediately
+		// Software fallback emulates SPP through noise scaling; it has no PT sample counter.
 		CaptureFrame();
 	}
 }
@@ -616,7 +682,7 @@ void USLFlythroughSubsystem::AdvanceFrame()
 		AccumulationView->Samples.Store(0);
 
 	// Continue rendering
-	Phase = GetSelectedMethod()->bAccumulate
+	Phase = GetSelectedMethod()->bAccumulate && !bSoftwareFallbackRun
 		? ESLFlythroughPhase::WarmUp
 		: ESLFlythroughPhase::Rendering;
 

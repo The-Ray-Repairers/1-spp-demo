@@ -21,7 +21,8 @@ Developer status as of **2026-10-15**:
   validated denoising model. Their inclusion does not imply competitive quality.
 - Without hardware ray tracing, normal play can use synthetic noise as a visual
   fallback. It is not a physical path-tracing reference, and flythrough benchmarks
-  require hardware ray tracing.
+  require hardware ray tracing by default. An explicit software-fallback switch
+  supports local pipeline testing without a ray-tracing GPU (see below).
 
 ### Build and verification status
 
@@ -70,12 +71,44 @@ $ProjectFile = (Resolve-Path .\SL_Test.uproject).Path
 
 ## Flythrough benchmark workflow
 
-1. Start play, choose the scene/camera position, and enter `gm`. Keep the same scene,
-   starting camera, viewport size, and rendering settings across methods.
+### Local pipeline testing without hardware ray tracing
+
+During play, enter this developer console command, then open `gm`:
+
+```text
+SL.Flythrough.AllowSoftwareFallback 1
+```
+
+On a machine without hardware ray tracing, this allows **Render Flythrough** to
+use the existing viewport noise simulation. Render `64SPP_GT`, then a test method
+such as `1SPP_Noisy` or `1SPP_Gaussian`, and click **Compute Metrics** to exercise
+PNG export, timing/metric CSVs, run detection, and charts. The synthetic GT uses
+the fallback's `1/sqrt(64)` noise scaling; it does not wait for hardware sample
+accumulation. `SL.NoiseFallback.Scale` still controls noise intensity.
+
+The panel displays **SYNTHETIC TEST**. All outputs, including the summary CSV,
+go under `renders/software_fallback/`, and each run includes `capture_mode.txt`.
+These captures and metrics test the pipeline only; use the normal hardware path
+for actual quality/performance comparisons. Synthetic GT never unlocks metrics
+for hardware runs. Enabling this switch on a machine already using hardware ray
+tracing leaves the normal hardware path selected.
+
+Use `SL.Flythrough.AllowSoftwareFallback 0` to restore the default requirement.
+Changing it during a capture takes effect after the active run finishes or is
+cancelled. This is a runtime opt-in; the project default remains `0`.
+
+### Capturing and comparing methods
+
+1. Start play and enter `gm`. Keep the same scene, viewport size, and rendering
+   settings across methods.
 2. In **Flythrough Benchmark**, select **64SPP_GT** and click **Render Flythrough**.
-   The current path is a circular orbit around the starting camera location: 10
-   seconds sampled at 30 positions/second, producing 300 frames. These parameters
-   are currently C++ defaults in `SLFlythroughSubsystem.h`, not GM asset settings.
+   In `LVL_RT_Room`, the camera follows a fixed interior loop aimed at the sphere
+   and cylinder, with an 80-degree horizontal field of view. It stays clear of the
+   walls and props regardless of the player's starting position. The route lasts
+   10 seconds at 30 positions/second (300 frames). Its coordinates are authored in
+   `SLFlythroughCameraPath.h`; timing defaults remain in `SLFlythroughSubsystem.h`.
+   Other maps retain the orbit around the starting camera, so choose a clear
+   starting position and use that same position for every method on those maps.
 3. Render the desired test methods: `1SPP_Noisy`, `1SPP_Gaussian`,
    `1SPP_Bilateral`, `1SPP_NeuralPlaceholder`, and `1SPP_NNE`. SVGF and Lumen/RR
    remain separate GM profiles and are not registered flythrough methods.
@@ -94,10 +127,15 @@ settings and leaves partial output on disk. Resizing the viewport or a frame
 exceeding the timeout stops the run. Existing comparison ownership is released
 before capture; conflicting GM controls are disabled while the benchmark runs.
 
-The path is repeatable for the same starting view. Runs do not yet store a scene,
+The default room path is independent of the starting view. Runs do not yet store a scene,
 camera, or settings manifest, so matching filenames/resolutions alone cannot
 establish that captures from different sessions are comparable. Use a fresh
 `renders/` directory when changing the scene or benchmark configuration.
+
+**After updating from the old camera orbit, archive your existing `renders/`
+directory and render a new GT and all test methods.** Old frames use different
+camera positions and must not be scored against the new route. This also applies
+to runs under `renders/software_fallback/`.
 
 ```text
 renders/
