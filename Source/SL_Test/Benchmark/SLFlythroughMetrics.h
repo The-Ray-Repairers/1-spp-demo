@@ -31,6 +31,28 @@ struct FSLMethodSummary
 	double AvgCNR = 0.0;
 };
 
+/** Capture identity. Method-specific values are recorded but excluded from compatibility checks. */
+struct FSLFlythroughRunManifest
+{
+	FString Method;
+	int32 SPP = 0;
+	int32 DenoiserMethod = -1;
+	FString Map;
+	FString CameraPath;
+	FString CameraParameters;
+	FString RenderSettings;
+	int32 Width = 0;
+	int32 Height = 0;
+	int32 FrameCount = 0;
+	int32 TargetFPS = 0;
+	double DurationSeconds = 0.0;
+	bool bSoftwareFallback = false;
+	/** Unique per capture; not part of compatibility. Empty for manifests written before it existed. */
+	FString CaptureId;
+
+	bool IsComparableTo(const FSLFlythroughRunManifest& Other) const;
+};
+
 /**
  * Stateless utility class for image quality metric computation and CSV I/O.
  * All image comparisons operate on tone-mapped 8-bit sRGB PNGs.
@@ -69,6 +91,10 @@ public:
 
 	/** Check whether a run directory has a complete set of frames. */
 	static bool IsRunComplete(const FString& RunDir);
+
+	/** Runs without a valid manifest are deliberately ineligible for scoring. */
+	static bool WriteRunManifest(const FString& RunDir, const FSLFlythroughRunManifest& Manifest);
+	static bool ReadRunManifest(const FString& RunDir, FSLFlythroughRunManifest& OutManifest);
 
 private:
 	/** Compute SSIM for a single-channel luminance pair using 11x11 windows. */

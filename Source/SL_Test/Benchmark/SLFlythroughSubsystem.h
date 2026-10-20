@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
+#include "Engine/Scene.h"
 #include "SLFlythroughMetrics.h"
 #include "SLFlythroughSubsystem.generated.h"
 
@@ -18,6 +19,8 @@ struct FSLFlythroughMethod
 	int32 DenoiserMethod = -1;
 	/** Whether to accumulate samples (offline-style for GT). */
 	bool bAccumulate = false;
+	/** The reference every method is scored against. Its SPP and name follow SL.Flythrough.GTSPP. */
+	bool bIsGT = false;
 	/** Additional console variable overrides applied before rendering. */
 	TArray<TPair<FString, FString>> CVarOverrides;
 };
@@ -45,9 +48,9 @@ enum class ESLFlythroughPhase : uint8
  *
  * Usage (from the GM panel):
  *  1. Select a method
- *  2. Click "Render Flythrough" — the subsystem drives a fixed camera path
+ *  2. Click "Render Flythrough" — the subsystem samples the level's camera sequence
  *     and captures each frame as a PNG
- *  3. Once the 64SPP_GT baseline exists, click "Compute Metrics" to score
+ *  3. Once the GT baseline (64SPP_GT by default) exists, click "Compute Metrics" to score
  *     all rendered methods
  */
 UCLASS()
@@ -60,7 +63,7 @@ public:
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
 	virtual void Tick(float DeltaTime) override;
-	virtual bool IsTickable() const override { return IsBusy(); }
+	virtual bool IsTickable() const override { return IsBusy() || bBatchActive; }
 	virtual bool IsTickableWhenPaused() const override { return true; }
 	virtual TStatId GetStatId() const override;
 
@@ -75,6 +78,8 @@ public:
 	bool StartFlythrough();
 	void CancelFlythrough();
 	bool IsBusy() const { return Phase != ESLFlythroughPhase::Idle && Phase != ESLFlythroughPhase::Finished; }
+	/** Capture GT and every method in order, then compute metrics. Used by SL.Flythrough.RunAll. */
+	bool StartBatch(bool bQuitWhenDone);
 
 	// ---- Metrics ----
 	bool CanComputeMetrics(FText& Reason) const;
@@ -90,10 +95,15 @@ public:
 	// ---- Run Detection ----
 	bool HasCompletedRun(const FString& MethodName) const;
 	bool HasGTBaseline() const;
+	/** e.g. "64SPP_GT"; also the GT results folder name. */
+	FString GetGTMethodName() const;
+	/** Re-read SL.Flythrough.GTSPP into the GT method. Ignored while a capture is running. */
+	void ApplyGTSPP();
 
 	// ---- Summary Data (for UI charts) ----
 	const TArray<FSLMethodSummary>& GetSummaries() const { return CachedSummaries; }
 	void RefreshSummaries();
+	void OnFallbackModeChanged();
 
 	// ---- Telemetry ----
 	double GetLastFrameTimeMs() const { return LastFrameTimeMs; }
@@ -108,10 +118,13 @@ public:
 	bool IsUsingSoftwareFallback() const;
 
 private:
+	void RefreshSummariesForRoot(const FString& RendersRoot);
 	void RegisterMethods();
-	void SetupCamera();
+	bool ResolveScenario(class ASLFlythroughScenario*& OutScenario, FText& Reason) const;
+	bool SetupCamera();
 	void ReleaseCamera();
-	FTransform GetCameraTransformAtTime(double Time) const;
+	bool ValidateSequenceBindings(FText& Reason);
+	bool EvaluateSequenceFrame(int32 FrameIndex);
 	void ApplyMethodSettings(const FSLFlythroughMethod& Method);
 	void RestoreSettings();
 	void CaptureFrame();
@@ -120,6 +133,10 @@ private:
 	void FinishFlythrough();
 	void TickRendering();
 	void TickAccumulating();
+	void RestartCurrentFrame();
+	bool ChooseRunDirectory(const FString& MethodDir, FSLFlythroughRunManifest& Manifest, bool& bOutAlreadyComplete);
+	void TickBatch();
+	void EndBatch(bool bSucceeded, const FString& Message);
 
 	// ---- Method Registry ----
 	TArray<FSLFlythroughMethod> Methods;
@@ -129,23 +146,31 @@ private:
 	ESLFlythroughPhase Phase = ESLFlythroughPhase::Idle;
 	int32 CurrentFrame = 0;
 	int32 TotalFrames = 0;
-	double FlythroughDuration = 10.0; // seconds
+	double FlythroughDuration = 0.0;
 	int32 TargetFPS = 30;
 	double FixedDeltaTime = 1.0 / 30.0;
-	double FlythroughTime = 0.0;
+	int32 SequenceStartFrame = 0;
 
 	// ---- Camera ----
 	UPROPERTY(Transient) TObjectPtr<class ACameraActor> FlythroughCamera;
+	UPROPERTY(Transient) TObjectPtr<class ALevelSequenceActor> SequenceActor;
+	UPROPERTY(Transient) TObjectPtr<class ULevelSequencePlayer> SequencePlayer;
+	UPROPERTY(Transient) TObjectPtr<class ASLFlythroughScenario> ActiveScenario;
 	UPROPERTY(Transient) TObjectPtr<AActor> PreviousViewTarget;
-	bool bUseRoomCameraPath = false;
-	FVector OrbitCenter = FVector::ZeroVector;
-	float OrbitRadius = 400.0f;
-	float OrbitHeight = 200.0f;
-	float OrbitPitch = -15.0f;
+	FString SourcePostProcessSettings;
+	FPostProcessSettings SavedCameraPostProcessSettings;
+	// Fallback for pre-animated state; restored after the sequence player's own restore.
+	FTransform SavedCameraActorTransform;
+	FTransform SavedCameraComponentTransform;
+	float SavedCameraFieldOfView = 90.f;
+	float SavedCameraAspectRatio = 1.f;
+	float SavedCameraOrthoWidth = 512.f;
+	bool bSavedCameraConstrainAspectRatio = false;
 	bool bWasPaused = false;
 
 	// ---- Output ----
 	FString CurrentRunDir;
+	FString CurrentRunRoot;
 	FString CurrentMethodName;
 
 	// ---- Timing ----
@@ -171,6 +196,16 @@ private:
 	bool bSavedPathTracing = false;
 	bool bSavedDLSS = false;
 	bool bSavedRR = false;
+	bool bSavedEditorThrottle = false;
+	/** All windows were minimized mid-frame; nothing renders then, so the frame is redone. */
+	bool bFrameInterrupted = false;
+
+	// ---- Batch capture ----
+	TArray<int32> BatchQueue;
+	bool bBatchActive = false;
+	bool bBatchQuitWhenDone = false;
+	bool bBatchRunInFlight = false;
+	double BatchWaitStart = 0.0;
 
 	// ---- Metrics ----
 	bool bComputingMetrics = false;

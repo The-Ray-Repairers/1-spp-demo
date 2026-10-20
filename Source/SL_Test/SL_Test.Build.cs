@@ -38,6 +38,10 @@ public class SL_Test : ModuleRules
 			"Renderer",   // FRDGBuilder, FScreenPassTexture, AddDrawScreenPass, FPostProcessingInputs
 			"RHI",        // TStaticSamplerState, FRHICopyTextureInfo
 			"DLSSBlueprint",
+			"LevelSequence", // frame-addressed camera evaluation
+			"MovieScene",    // sequence range and binding validation
+			"MovieSceneTracks",
+			"Json",         // flythrough run manifests
 			"ImageWrapper", // PNG loading for flythrough metric computation
 		});
 

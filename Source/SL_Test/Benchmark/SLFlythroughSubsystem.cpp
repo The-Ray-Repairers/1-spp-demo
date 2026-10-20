@@ -1,5 +1,5 @@
 #include "SLFlythroughSubsystem.h"
-#include "SLFlythroughCameraPath.h"
+#include "SLFlythroughScenario.h"
 #include "SLComparisonView.h"
 #include "SLComparisonSubsystem.h"
 #include "SLPathTracerSubsystem.h"
@@ -8,6 +8,18 @@
 #include "Camera/CameraActor.h"
 #include "Camera/CameraComponent.h"
 #include "Camera/PlayerCameraManager.h"
+#include "LevelSequence.h"
+#include "LevelSequenceActor.h"
+#include "LevelSequencePlayer.h"
+#include "MovieScene.h"
+#include "MovieSceneBinding.h"
+#include "MovieSceneObjectBindingID.h"
+#include "MovieSceneSequenceID.h"
+#include "MovieScenePossessable.h"
+#include "MovieSceneSequencePlaybackSettings.h"
+#include "Tracks/MovieScene3DTransformTrack.h"
+#include "Tracks/MovieSceneCameraCutTrack.h"
+#include "Tracks/MovieScenePropertyTrack.h"
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/World.h"
@@ -20,12 +32,48 @@
 #include "Misc/App.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Misc/PackageName.h"
+#include "Misc/Crc.h"
 #include "SceneViewExtension.h"
 #include "RenderingThread.h"
 #include "RenderUtils.h"
 #include "UnrealClient.h"
+#include "UObject/Class.h"
+#include "UObject/Package.h"
+#include "EngineUtils.h"
+#if WITH_EDITOR
+#include "Editor/EditorPerformanceSettings.h"
+#endif
 
 DECLARE_CYCLE_STAT(TEXT("SLFlythroughSubsystem"), STAT_SLFlythrough, STATGROUP_Tickables);
+
+static FString GetBenchmarkMapPackage(const UWorld* World)
+{
+	FString MapPackage = World->GetOutermost()->GetName();
+	FString MapLeaf = FPackageName::GetShortName(MapPackage);
+	if (MapLeaf.StartsWith(TEXT("UEDPIE_")))
+	{
+		int32 Separator = INDEX_NONE;
+		if (MapLeaf.FindChar(TEXT('_'), Separator))
+		{
+			Separator = MapLeaf.Find(TEXT("_"), ESearchCase::CaseSensitive, ESearchDir::FromStart, Separator + 1);
+			if (Separator != INDEX_NONE) MapLeaf = MapLeaf.Mid(Separator + 1);
+		}
+	}
+	return FPaths::Combine(FPaths::GetPath(MapPackage), MapLeaf);
+}
+
+/** Run folder names can be reused after deletion; the capture id ties a summary to one GT capture. */
+static FString GetSummaryGTKey(const FString& GTDir, const FSLFlythroughRunManifest& GTManifest)
+{
+	return FPaths::GetCleanFilename(GTDir) + TEXT("|") + GTManifest.CaptureId;
+}
+
+static FString GetScenarioFolder(const UWorld* World, const ASLFlythroughScenario* Scenario)
+{
+	return FString::Printf(TEXT("%s_%08x"), *Scenario->ScenarioId.ToString(),
+		FCrc::StrCrc32(*GetBenchmarkMapPackage(World)));
+}
 
 static TAutoConsoleVariable<int32> CVarSLFlythroughAllowSoftwareFallback(
 	TEXT("SL.Flythrough.AllowSoftwareFallback"), 0,
@@ -40,10 +88,36 @@ static TAutoConsoleVariable<int32> CVarSLFlythroughAllowSoftwareFallback(
 			if (UWorld* World = Context.World())
 				if (auto* Flythrough = World->GetSubsystem<USLFlythroughSubsystem>(); Flythrough && !Flythrough->IsBusy())
 				{
+					Flythrough->OnFallbackModeChanged();
+				}
+	}), ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarSLFlythroughGTSPP(
+	TEXT("SL.Flythrough.GTSPP"), 64,
+	TEXT("Samples per pixel accumulated for the flythrough ground truth (default 64).\n")
+	TEXT("The GT method and its results folder are named <N>SPP_GT. Changes during capture apply to the next run."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*)
+	{
+		if (!GEngine) return;
+		for (const auto& Context : GEngine->GetWorldContexts())
+			if (UWorld* World = Context.World())
+				if (auto* Flythrough = World->GetSubsystem<USLFlythroughSubsystem>(); Flythrough && !Flythrough->IsBusy())
+				{
+					Flythrough->ApplyGTSPP();
 					Flythrough->RefreshSummaries();
 					Flythrough->OnStateChanged.Broadcast();
 				}
 	}), ECVF_Default);
+
+static FAutoConsoleCommandWithWorldAndArgs CmdSLFlythroughRunAll(
+	TEXT("SL.Flythrough.RunAll"),
+	TEXT("Capture the GT (SL.Flythrough.GTSPP) and every flythrough method for this level's scenario, then compute metrics.\n")
+	TEXT("Pass 'quit' to exit when finished, e.g. -ExecCmds=\"SL.Flythrough.RunAll quit\"."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
+	{
+		if (auto* Flythrough = World ? World->GetSubsystem<USLFlythroughSubsystem>() : nullptr)
+			Flythrough->StartBatch(Args.Contains(TEXT("quit")));
+	}));
 
 TStatId USLFlythroughSubsystem::GetStatId() const
 {
@@ -130,16 +204,35 @@ void USLFlythroughSubsystem::RegisterMethods()
 		Methods.Add(MoveTemp(M));
 	}
 
-	// 64SPP_GT — ground truth baseline
+	// <N>SPP_GT — ground truth baseline; N comes from SL.Flythrough.GTSPP
 	{
 		FSLFlythroughMethod M;
-		M.Name = TEXT("64SPP_GT");
-		M.SPP = 64;
 		M.DenoiserMethod = 0; // no denoising on GT
 		M.bAccumulate = true;
+		M.bIsGT = true;
 		M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), TEXT("0")});
 		Methods.Add(MoveTemp(M));
 	}
+	ApplyGTSPP();
+}
+
+void USLFlythroughSubsystem::ApplyGTSPP()
+{
+	if (IsBusy()) return;
+	const int32 SPP = FMath::Clamp(CVarSLFlythroughGTSPP.GetValueOnGameThread(), 1, 65536);
+	for (FSLFlythroughMethod& Method : Methods)
+		if (Method.bIsGT)
+		{
+			// Each sample count gets its own results folder, so GTs at different SPP never mix.
+			Method.SPP = SPP;
+			Method.Name = FString::Printf(TEXT("%dSPP_GT"), SPP);
+		}
+}
+
+FString USLFlythroughSubsystem::GetGTMethodName() const
+{
+	const FSLFlythroughMethod* GT = Methods.FindByPredicate([](const FSLFlythroughMethod& M) { return M.bIsGT; });
+	return GT ? GT->Name : FString();
 }
 
 void USLFlythroughSubsystem::SelectMethod(int32 Index)
@@ -160,13 +253,17 @@ const FSLFlythroughMethod* USLFlythroughSubsystem::GetSelectedMethod() const
 FString USLFlythroughSubsystem::GetRendersRoot() const
 {
 	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectDir(), TEXT("renders")));
-	return IsUsingSoftwareFallback() ? FPaths::Combine(Root, TEXT("software_fallback")) : Root;
+	if ((IsBusy() || Phase == ESLFlythroughPhase::Finished) && !CurrentRunRoot.IsEmpty()) return CurrentRunRoot;
+	const FString ModeRoot = IsUsingSoftwareFallback() ? FPaths::Combine(Root, TEXT("software_fallback")) : Root;
+	ASLFlythroughScenario* Scenario = nullptr;
+	FText Reason;
+	return ResolveScenario(Scenario, Reason) ? FPaths::Combine(ModeRoot, GetScenarioFolder(GetWorld(), Scenario)) : ModeRoot;
 }
 
 bool USLFlythroughSubsystem::IsUsingSoftwareFallback() const
 {
 	// Pin the mode for a running capture even if the console switch changes.
-	return IsBusy() ? bSoftwareFallbackRun
+	return (IsBusy() || Phase == ESLFlythroughPhase::Finished) && !CurrentRunRoot.IsEmpty() ? bSoftwareFallbackRun
 		: !IsRayTracingEnabled() && CVarSLFlythroughAllowSoftwareFallback.GetValueOnGameThread() != 0;
 }
 
@@ -181,7 +278,7 @@ bool USLFlythroughSubsystem::HasCompletedRun(const FString& MethodName) const
 
 bool USLFlythroughSubsystem::HasGTBaseline() const
 {
-	return HasCompletedRun(TEXT("64SPP_GT"));
+	return HasCompletedRun(GetGTMethodName());
 }
 
 // -----------------------------------------------------------------------
@@ -190,35 +287,209 @@ bool USLFlythroughSubsystem::HasGTBaseline() const
 
 void USLFlythroughSubsystem::RefreshSummaries()
 {
-	FSLFlythroughMetrics::ReadSummaryCSV(GetRendersRoot(), CachedSummaries);
+	ASLFlythroughScenario* Scenario = nullptr;
+	FText Reason;
+	if (!ResolveScenario(Scenario, Reason))
+	{
+		CachedSummaries.Reset();
+		CompletedMethods.Reset();
+		return;
+	}
+	RefreshSummariesForRoot(GetRendersRoot());
+}
+
+void USLFlythroughSubsystem::OnFallbackModeChanged()
+{
+	if (IsBusy()) return;
+	CurrentRunRoot.Reset();
+	RefreshSummaries();
+	OnStateChanged.Broadcast();
+}
+
+void USLFlythroughSubsystem::RefreshSummariesForRoot(const FString& RendersRoot)
+{
+	FSLFlythroughMetrics::ReadSummaryCSV(RendersRoot, CachedSummaries);
+	const FString GTDir = FSLFlythroughMetrics::FindLatestRun(FPaths::Combine(RendersRoot, GetGTMethodName()));
+	FString ScoredGT;
+	FSLFlythroughRunManifest GTManifest;
+	if (GTDir.IsEmpty() || !FSLFlythroughMetrics::ReadRunManifest(GTDir, GTManifest)
+		|| !FFileHelper::LoadFileToString(ScoredGT, *FPaths::Combine(RendersRoot, TEXT("summary_gt_run.txt")))
+		|| ScoredGT.TrimStartAndEnd() != GetSummaryGTKey(GTDir, GTManifest))
+	{
+		CachedSummaries.Reset();
+	}
+	else
+	{
+		CachedSummaries.RemoveAll([&](const FSLMethodSummary& Summary)
+		{
+			const FString LatestRun = FSLFlythroughMetrics::FindLatestRun(FPaths::Combine(RendersRoot, Summary.Method));
+			FSLFlythroughRunManifest RunManifest;
+			return LatestRun.IsEmpty() || FPaths::GetCleanFilename(LatestRun) != Summary.RunId
+				|| !FSLFlythroughMetrics::ReadRunManifest(LatestRun, RunManifest)
+				|| !RunManifest.IsComparableTo(GTManifest);
+		});
+	}
 	// Slate polls run colors every paint; validate frame files only on refresh.
 	CompletedMethods.Reset();
 	for (const FSLFlythroughMethod& Method : Methods)
 	{
-		if (!FSLFlythroughMetrics::FindLatestRun(FPaths::Combine(GetRendersRoot(), Method.Name)).IsEmpty())
+		if (!FSLFlythroughMetrics::FindLatestRun(FPaths::Combine(RendersRoot, Method.Name)).IsEmpty())
 			CompletedMethods.Add(Method.Name);
 	}
 }
 
 // -----------------------------------------------------------------------
-// Camera Path — Authored Room Loop / Generic Orbit
+// Scenario discovery and camera-only sequence validation
 // -----------------------------------------------------------------------
 
-FTransform USLFlythroughSubsystem::GetCameraTransformAtTime(double Time) const
+bool USLFlythroughSubsystem::ResolveScenario(ASLFlythroughScenario*& OutScenario, FText& Reason) const
 {
-	if (bUseRoomCameraPath)
-		return SLFlythroughCameraPath::EvaluateRoom(Time / FlythroughDuration);
+	OutScenario = nullptr;
+	for (TActorIterator<ASLFlythroughScenario> It(GetWorld()); It; ++It)
+	{
+		if (OutScenario)
+		{
+			Reason = FText::FromString(TEXT("Place exactly one Flythrough Scenario actor in this level."));
+			return false;
+		}
+		OutScenario = *It;
+	}
+	if (!OutScenario || !OutScenario->Sequence || !OutScenario->Camera)
+	{
+		Reason = FText::FromString(TEXT("Place a Flythrough Scenario actor and assign its Sequence and Camera."));
+		return false;
+	}
+	const FString Id = OutScenario->ScenarioId.ToString();
+	bool bInvalidId = OutScenario->ScenarioId.IsNone();
+	for (const TCHAR C : Id)
+		bInvalidId |= !FChar::IsAlnum(C) && C != TEXT('_') && C != TEXT('-');
+	if (bInvalidId)
+	{
+		Reason = FText::FromString(TEXT("Scenario Id must use only letters, numbers, '_' or '-'."));
+		return false;
+	}
+	UMovieScene* Scene = OutScenario->Sequence->GetMovieScene();
+	if (!Scene || Scene->GetSpawnableCount() != 0 || Scene->GetPlaybackRange().IsEmpty()
+		|| !Scene->GetPlaybackRange().HasLowerBound() || !Scene->GetPlaybackRange().HasUpperBound()
+		|| Scene->GetDisplayRate().Denominator != 1 || Scene->GetDisplayRate().Numerator <= 0)
+	{
+		Reason = FText::FromString(TEXT("Sequence needs a nonempty range, integer display rate, and no spawnables."));
+		return false;
+	}
+	const FMovieSceneObjectBindingIDs* Tagged = Scene->AllTaggedBindings().Find(OutScenario->CameraBindingTag);
+	if (OutScenario->CameraBindingTag.IsNone() || !Tagged || Tagged->IDs.Num() != 1)
+	{
+		Reason = FText::FromString(TEXT("Tag exactly one camera actor binding with the configured Camera Binding Tag."));
+		return false;
+	}
+	const FGuid CameraGuid = Tagged->IDs[0].GetGuid();
+	if (OutScenario->Camera->GetWorld() != GetWorld())
+	{
+		Reason = FText::FromString(TEXT("The benchmark camera must belong to this level."));
+		return false;
+	}
+	bool bHasCamera = false;
+	for (int32 Index = 0; Index < Scene->GetPossessableCount(); ++Index)
+	{
+		const FMovieScenePossessable& Possessable = Scene->GetPossessable(Index);
+		if (Possessable.GetGuid() == CameraGuid && !Possessable.GetParent().IsValid())
+		{
+#if WITH_EDITORONLY_DATA
+			const UClass* BindingClass = Possessable.GetPossessedObjectClass();
+			if (BindingClass && !BindingClass->IsChildOf(ACameraActor::StaticClass()))
+			{
+				Reason = FText::FromString(TEXT("The tagged binding must be a CameraActor."));
+				return false;
+			}
+#endif
+			bHasCamera = true;
+		}
+		else if (Possessable.GetParent() != CameraGuid)
+		{
+			Reason = FText::FromString(TEXT("Sequence may bind only the benchmark camera and its components."));
+			return false;
+		}
+		else
+		{
+#if WITH_EDITORONLY_DATA
+			const UClass* BindingClass = Possessable.GetPossessedObjectClass();
+			if (BindingClass && !BindingClass->IsChildOf(UCameraComponent::StaticClass()))
+			{
+				Reason = FText::FromString(TEXT("Sequence may bind only the benchmark camera and its camera component."));
+				return false;
+			}
+#endif
+		}
+	}
+	if (!bHasCamera)
+	{
+		Reason = FText::FromString(TEXT("The tagged binding must be the root camera actor."));
+		return false;
+	}
+	for (const UMovieSceneTrack* Track : Scene->GetTracks())
+		if (!Track->IsA<UMovieSceneCameraCutTrack>())
+		{
+			Reason = FText::FromString(TEXT("Sequence cannot contain event, audio, or subsequence tracks."));
+			return false;
+		}
+	for (const FMovieSceneBinding& Binding : static_cast<const UMovieScene*>(Scene)->GetBindings())
+		for (const UMovieSceneTrack* Track : Binding.GetTracks())
+			if (!Track->IsA<UMovieScene3DTransformTrack>() && !Track->IsA<UMovieScenePropertyTrack>())
+			{
+				Reason = FText::FromString(TEXT("Camera bindings may contain only transform and property tracks."));
+				return false;
+			}
+	return true;
+}
 
-	// Full 360° orbit over FlythroughDuration
-	const double Angle = (Time / FlythroughDuration) * 2.0 * PI;
-	const FVector Position = OrbitCenter + FVector(
-		OrbitRadius * FMath::Cos(Angle),
-		OrbitRadius * FMath::Sin(Angle),
-		OrbitHeight);
-	const FVector LookDir = (OrbitCenter - Position).GetSafeNormal();
-	FRotator Rotation = LookDir.Rotation();
-	Rotation.Pitch = OrbitPitch;
-	return FTransform(Rotation, Position);
+bool USLFlythroughSubsystem::ValidateSequenceBindings(FText& Reason)
+{
+	// Possessable classes are editor-only data; check the objects actually bound in every build.
+	UMovieScene* Scene = ActiveScenario->Sequence->GetMovieScene();
+	UCameraComponent* CameraComponent = FlythroughCamera->GetCameraComponent();
+	for (int32 Index = 0; Index < Scene->GetPossessableCount(); ++Index)
+	{
+		const FMovieScenePossessable& Possessable = Scene->GetPossessable(Index);
+		const bool bRoot = !Possessable.GetParent().IsValid();
+		const TArray<UObject*> Bound = SequencePlayer->GetBoundObjects(
+			UE::MovieScene::FFixedObjectBindingID(Possessable.GetGuid(), MovieSceneSequenceID::Root));
+		for (const UObject* Object : Bound)
+		{
+			const bool bAllowed = bRoot ? Object == FlythroughCamera
+				: Cast<UCameraComponent>(Object) && Cast<UCameraComponent>(Object)->GetOwner() == FlythroughCamera;
+			if (!bAllowed)
+			{
+				Reason = FText::FromString(FString::Printf(TEXT("Sequence binding '%s' resolves to %s, not the benchmark camera."),
+					*Possessable.GetName(), *GetNameSafe(Object)));
+				return false;
+			}
+		}
+		if (bRoot && Bound.Num() != 1)
+		{
+			Reason = FText::FromString(TEXT("The tagged camera binding did not resolve to the scenario camera."));
+			return false;
+		}
+	}
+	return CameraComponent != nullptr;
+}
+
+bool USLFlythroughSubsystem::EvaluateSequenceFrame(int32 FrameIndex)
+{
+	const FFrameTime Position(SequenceStartFrame + FrameIndex);
+	// A stopped player's Jump flushes synchronously unless it is queued as a latent action
+	// during another evaluation. Check the cursor so a deferred update cannot be captured.
+	SequencePlayer->SetPlaybackPosition(FMovieSceneSequencePlaybackParams(Position, EUpdatePositionMethod::Jump));
+	if (SequencePlayer->GetCurrentTime().Time != Position)
+	{
+		UE_LOG(LogSL_Test, Error, TEXT("Flythrough: Sequence did not evaluate display frame %d."), Position.FrameNumber.Value);
+		return false;
+	}
+	// Camera property tracks may write post-process settings; keep the method's SPP override pinned.
+	auto& PP = FlythroughCamera->GetCameraComponent()->PostProcessSettings;
+	PP.bOverride_PathTracingSamplesPerPixel = true;
+	PP.PathTracingSamplesPerPixel = TargetSPP;
+	GetWorld()->GetFirstPlayerController()->PlayerCameraManager->UpdateCamera(0.f);
+	return true;
 }
 
 // -----------------------------------------------------------------------
@@ -263,6 +534,15 @@ void USLFlythroughSubsystem::ApplyMethodSettings(const FSLFlythroughMethod& Meth
 	SetCVar(TEXT("r.ScreenshotDelegate"), TEXT("1"));
 	SetCVar(TEXT("r.DefaultFeature.AutoExposure"), TEXT("0"));
 	SetCVar(TEXT("r.EyeAdaptationQuality"), TEXT("0"));
+	// Keep full speed when the window loses focus so long captures can run in the background.
+	SetCVar(TEXT("t.IdleWhenNotForeground"), TEXT("0"));
+#if WITH_EDITOR
+	if (UEditorPerformanceSettings* Performance = GetMutableDefault<UEditorPerformanceSettings>())
+	{
+		bSavedEditorThrottle = Performance->bThrottleCPUWhenNotForeground;
+		Performance->bThrottleCPUWhenNotForeground = false;
+	}
+#endif
 
 	if (Method.DenoiserMethod >= 0)
 		SetCVar(TEXT("SL.Denoiser.Method"), FString::FromInt(Method.DenoiserMethod));
@@ -293,6 +573,10 @@ void USLFlythroughSubsystem::RestoreSettings()
 			Var->Set(*Pair.Value, ECVF_SetByConsole);
 	}
 	SavedCVars.Reset();
+#if WITH_EDITOR
+	if (UEditorPerformanceSettings* Performance = GetMutableDefault<UEditorPerformanceSettings>())
+		Performance->bThrottleCPUWhenNotForeground = bSavedEditorThrottle;
+#endif
 	FApp::SetFixedDeltaTime(SavedFixedDeltaTime);
 	FApp::SetUseFixedTimeStep(bSavedUseFixedDeltaTime);
 	UKismetRenderingLibrary::EnablePathTracing(bSavedPathTracing);
@@ -304,31 +588,61 @@ void USLFlythroughSubsystem::RestoreSettings()
 // Camera Setup / Teardown
 // -----------------------------------------------------------------------
 
-void USLFlythroughSubsystem::SetupCamera()
+bool USLFlythroughSubsystem::SetupCamera()
 {
 	auto* PC = GetWorld()->GetFirstPlayerController();
-	if (!PC || !PC->PlayerCameraManager) return;
+	if (!PC || !PC->PlayerCameraManager || !ActiveScenario) return false;
 
-	const auto POV = PC->PlayerCameraManager->GetCameraCacheView();
-	bUseRoomCameraPath = SLFlythroughCameraPath::IsRoomMap(GetWorld()->GetMapName());
-	OrbitCenter = POV.Location;
+	FlythroughCamera = ActiveScenario->Camera;
+	const UCameraComponent* CameraComponent = FlythroughCamera->GetCameraComponent();
+	SavedCameraPostProcessSettings = CameraComponent->PostProcessSettings;
+	SavedCameraActorTransform = FlythroughCamera->GetActorTransform();
+	SavedCameraComponentTransform = CameraComponent->GetRelativeTransform();
+	SavedCameraFieldOfView = CameraComponent->FieldOfView;
+	SavedCameraAspectRatio = CameraComponent->AspectRatio;
+	SavedCameraOrthoWidth = CameraComponent->OrthoWidth;
+	bSavedCameraConstrainAspectRatio = CameraComponent->bConstrainAspectRatio;
 	PreviousViewTarget = PC->GetViewTarget();
 	bWasPaused = PC->IsPaused();
-
-	FlythroughCamera = GetWorld()->SpawnActor<ACameraActor>(POV.Location, POV.Rotation);
-	if (FlythroughCamera)
+	FMovieSceneSequencePlaybackSettings Settings;
+	Settings.bDisableCameraCuts = true;
+	// Restore KeepState sections too. Play() normally enables this capture, but the benchmark only jumps.
+	Settings.FinishCompletionStateOverride = EMovieSceneCompletionModeOverride::ForceRestoreState;
+	ALevelSequenceActor* CreatedActor = nullptr;
+	SequencePlayer = ULevelSequencePlayer::CreateLevelSequencePlayer(GetWorld(), ActiveScenario->Sequence, Settings, CreatedActor);
+	SequenceActor = CreatedActor;
+	if (!SequencePlayer || !SequenceActor)
 	{
-		FlythroughCamera->GetCameraComponent()->FieldOfView = bUseRoomCameraPath
-			? SLFlythroughCameraPath::RoomFieldOfView : POV.FOV;
-		if (bUseRoomCameraPath)
-			FlythroughCamera->GetCameraComponent()->bConstrainAspectRatio = false;
-		FlythroughCamera->GetCameraComponent()->PostProcessSettings = POV.PostProcessSettings;
-		auto& PP = FlythroughCamera->GetCameraComponent()->PostProcessSettings;
-		PP.bOverride_PathTracingSamplesPerPixel = true;
-		PP.PathTracingSamplesPerPixel = TargetSPP;
-		PC->SetViewTarget(FlythroughCamera);
-		PC->SetPause(true);
+		MetricsStatus = TEXT("Unable to create a player for the scenario Sequence.");
+		return false;
 	}
+	SequencePlayer->GetEvaluationTemplate().EnableGlobalPreAnimatedStateCapture();
+	TArray<AActor*> CameraBinding{FlythroughCamera};
+	SequenceActor->SetBindingByTag(ActiveScenario->CameraBindingTag, CameraBinding, false);
+	PC->SetViewTarget(FlythroughCamera);
+	PC->SetPause(true);
+	FText BindingReason;
+	if (!EvaluateSequenceFrame(0))
+	{
+		MetricsStatus = TEXT("The scenario Sequence did not evaluate its first frame.");
+		return false;
+	}
+	if (!ValidateSequenceBindings(BindingReason))
+	{
+		MetricsStatus = BindingReason.ToString();
+		return false;
+	}
+
+	SourcePostProcessSettings.Reset();
+	FPostProcessSettings ComparablePostProcess = FlythroughCamera->GetCameraComponent()->PostProcessSettings;
+	ComparablePostProcess.bOverride_PathTracingSamplesPerPixel = false;
+	ComparablePostProcess.PathTracingSamplesPerPixel = 0;
+	FPostProcessSettings::StaticStruct()->ExportText(SourcePostProcessSettings,
+		&ComparablePostProcess, nullptr, nullptr, PPF_None, nullptr);
+	auto& PP = FlythroughCamera->GetCameraComponent()->PostProcessSettings;
+	PP.bOverride_PathTracingSamplesPerPixel = true;
+	PP.PathTracingSamplesPerPixel = TargetSPP;
+	return true;
 }
 
 void USLFlythroughSubsystem::ReleaseCamera()
@@ -340,10 +654,22 @@ void USLFlythroughSubsystem::ReleaseCamera()
 			if (PreviousViewTarget) PC->SetViewTarget(PreviousViewTarget);
 			PC->SetPause(bWasPaused);
 		}
-		FlythroughCamera->Destroy();
+		if (SequencePlayer) SequencePlayer->RestoreState();
+		UCameraComponent* CameraComponent = FlythroughCamera->GetCameraComponent();
+		FlythroughCamera->SetActorTransform(SavedCameraActorTransform);
+		CameraComponent->SetRelativeTransform(SavedCameraComponentTransform);
+		CameraComponent->FieldOfView = SavedCameraFieldOfView;
+		CameraComponent->AspectRatio = SavedCameraAspectRatio;
+		CameraComponent->OrthoWidth = SavedCameraOrthoWidth;
+		CameraComponent->bConstrainAspectRatio = bSavedCameraConstrainAspectRatio;
+		CameraComponent->PostProcessSettings = SavedCameraPostProcessSettings;
 		FlythroughCamera = nullptr;
 		PreviousViewTarget = nullptr;
 	}
+	if (SequenceActor) SequenceActor->Destroy();
+	SequenceActor = nullptr;
+	SequencePlayer = nullptr;
+	ActiveScenario = nullptr;
 
 	if (AccumulationView)
 	{
@@ -375,7 +701,7 @@ bool USLFlythroughSubsystem::CanStartFlythrough(FText& Reason) const
 		Reason = FText::FromString(TEXT("Wait for the comparison capture to finish."));
 		return false;
 	}
-	if (!IsRayTracingEnabled() && !IsUsingSoftwareFallback())
+	if (!IsRayTracingEnabled() && CVarSLFlythroughAllowSoftwareFallback.GetValueOnGameThread() == 0)
 	{
 		Reason = FText::FromString(TEXT("Hardware ray tracing is unavailable. For synthetic pipeline tests, enter SL.Flythrough.AllowSoftwareFallback 1."));
 		return false;
@@ -405,40 +731,85 @@ bool USLFlythroughSubsystem::CanStartFlythrough(FText& Reason) const
 		Reason = FText::FromString(TEXT("No method selected."));
 		return false;
 	}
+	ASLFlythroughScenario* Scenario = nullptr;
+	if (!ResolveScenario(Scenario, Reason)) return false;
 	return true;
 }
 
-bool USLFlythroughSubsystem::StartFlythrough()
+static const TCHAR* PartialTimingsFile = TEXT("timings_partial.csv");
+
+/** Same scene, camera, settings and method; only then may frames from two sessions share a run. */
+static bool IsSameCapture(const FSLFlythroughRunManifest& A, const FSLFlythroughRunManifest& B)
 {
-	FText Reason;
-	if (!CanStartFlythrough(Reason))
+	return A.IsComparableTo(B) && A.Method == B.Method && A.SPP == B.SPP && A.DenoiserMethod == B.DenoiserMethod;
+}
+
+bool USLFlythroughSubsystem::ChooseRunDirectory(const FString& MethodDir, FSLFlythroughRunManifest& Manifest, bool& bOutAlreadyComplete)
+{
+	bOutAlreadyComplete = false;
+	TArray<FString> RunNames;
+	IFileManager::Get().FindFiles(RunNames, *FPaths::Combine(MethodDir, TEXT("run_*")), false, true);
+	RunNames.Sort([](const FString& A, const FString& B) { return FCString::Atoi(*A.Mid(4)) > FCString::Atoi(*B.Mid(4)); });
+	const FString NewestRun = RunNames.IsEmpty() ? FString() : FPaths::Combine(MethodDir, RunNames[0]);
+	FSLFlythroughRunManifest Existing;
+	const bool bNewestMatches = !NewestRun.IsEmpty() && FSLFlythroughMetrics::ReadRunManifest(NewestRun, Existing)
+		&& IsSameCapture(Existing, Manifest);
+
+	if (bNewestMatches && FSLFlythroughMetrics::IsRunComplete(NewestRun))
 	{
-		UE_LOG(LogSL_Test, Warning, TEXT("Flythrough: Cannot start — %s"), *Reason.ToString());
-		return false;
+		// A batch re-run keeps finished work; an explicit Render click always captures anew.
+		if (bBatchActive)
+		{
+			CurrentRunDir = NewestRun;
+			bOutAlreadyComplete = true;
+			return true;
+		}
+	}
+	else if (bNewestMatches)
+	{
+		// Resume an interrupted capture: keep every leading frame that has both its PNG and timing.
+		TMap<int32, double> Timings;
+		FString Partial;
+		if (FFileHelper::LoadFileToString(Partial, *FPaths::Combine(NewestRun, PartialTimingsFile)))
+		{
+			TArray<FString> Lines;
+			Partial.ParseIntoArrayLines(Lines);
+			for (const FString& Line : Lines)
+			{
+				FString Index, Ms;
+				if (Line.Split(TEXT(","), &Index, &Ms) && Index.IsNumeric())
+					Timings.Add(FCString::Atoi(*Index), FCString::Atod(*Ms));
+			}
+		}
+		int32 ResumeFrame = 0;
+		while (ResumeFrame < TotalFrames && Timings.Contains(ResumeFrame)
+			&& IFileManager::Get().FileExists(*FPaths::Combine(NewestRun, TEXT("frames"),
+				FString::Printf(TEXT("frame_%04d.png"), ResumeFrame))))
+		{
+			FSLFrameTiming Timing;
+			Timing.FrameIndex = ResumeFrame;
+			Timing.RenderTimeMs = Timings[ResumeFrame];
+			FrameTimings.Add(Timing);
+			++ResumeFrame;
+		}
+		CurrentRunDir = NewestRun;
+		CurrentFrame = ResumeFrame;
+		Manifest.CaptureId = Existing.CaptureId;
+		UE_LOG(LogSL_Test, Display, TEXT("Flythrough: resuming %s at frame %d/%d."), *NewestRun, ResumeFrame, TotalFrames);
+		return true;
 	}
 
-	const FSLFlythroughMethod& Method = *GetSelectedMethod();
-	CurrentMethodName = Method.Name;
-	bSoftwareFallbackRun = IsUsingSoftwareFallback();
-	// Release comparison overlays, view extensions and renderer overrides first.
-	if (auto* Comparison = GetWorld()->GetSubsystem<USLComparisonSubsystem>(); Comparison && Comparison->OwnsRenderer())
-		Comparison->Restore();
-
-	// Setup output directory
-	const FString MethodDir = FPaths::Combine(GetRendersRoot(), CurrentMethodName);
-	const FString RunId = FSLFlythroughMetrics::GetNextRunId(MethodDir);
-	CurrentRunDir = FPaths::Combine(MethodDir, RunId);
+	CurrentRunDir = FPaths::Combine(MethodDir, FSLFlythroughMetrics::GetNextRunId(MethodDir));
 	if (!IFileManager::Get().MakeDirectory(*FPaths::Combine(CurrentRunDir, TEXT("frames")), true))
 	{
 		MetricsStatus = TEXT("Unable to create the flythrough output directory.");
 		return false;
 	}
-
 	if (bSoftwareFallbackRun)
 	{
 		const FString Notice = TEXT("SYNTHETIC SOFTWARE FALLBACK - PIPELINE TEST ONLY\n")
 			TEXT("Viewport raster rendering plus simulated noise; not hardware path tracing.\n")
-			TEXT("64SPP_GT uses 1/sqrt(64) noise scaling, not 64 accumulated rays.\n")
+			TEXT("The GT uses 1/sqrt(SPP) noise scaling, not accumulated rays.\n")
 			TEXT("Quality metrics and timings are not valid ray-traced benchmark results.\n");
 		if (!FFileHelper::SaveStringToFile(Notice, *FPaths::Combine(CurrentRunDir, TEXT("capture_mode.txt")),
 			FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
@@ -448,12 +819,82 @@ bool USLFlythroughSubsystem::StartFlythrough()
 		}
 		UE_LOG(LogSL_Test, Display, TEXT("Flythrough: SYNTHETIC software fallback test. Output: %s"), *CurrentRunDir);
 	}
+	// Persist the capture identity before any frame is written. Incomplete runs are ignored for scoring.
+	Manifest.CaptureId = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower);
+	if (!FSLFlythroughMetrics::WriteRunManifest(CurrentRunDir, Manifest))
+	{
+		MetricsStatus = TEXT("Unable to write run_manifest.json; capture was not started.");
+		return false;
+	}
+	return true;
+}
 
-	// Setup frames
-	TotalFrames = FMath::RoundToInt32(FlythroughDuration * TargetFPS);
+void USLFlythroughSubsystem::RestartCurrentFrame()
+{
+	// Render time includes the whole frame, so a frame that stalled while minimized starts over.
+	bFrameInterrupted = false;
+	if (FScreenshotRequest::IsScreenshotRequested())
+		FScreenshotRequest::Reset();
+	if (!EvaluateSequenceFrame(CurrentFrame))
+	{
+		CancelFlythrough();
+		MetricsStatus = FString::Printf(TEXT("Capture stopped: Sequence frame %d could not be evaluated."), CurrentFrame);
+		return;
+	}
+	if (AccumulationView)
+	{
+		AccumulationView->Samples.Store(0);
+		AccumulationView->bResetAccumulation.Store(true);
+	}
+	Phase = ESLFlythroughPhase::WarmUp;
+	FrameStartTime = FPlatformTime::Seconds();
+	UE_LOG(LogSL_Test, Display, TEXT("Flythrough: window restored; re-rendering frame %d."), CurrentFrame);
+}
+
+bool USLFlythroughSubsystem::StartFlythrough()
+{
+	ApplyGTSPP();
+	FText Reason;
+	if (!CanStartFlythrough(Reason))
+	{
+		UE_LOG(LogSL_Test, Warning, TEXT("Flythrough: Cannot start — %s"), *Reason.ToString());
+		return false;
+	}
+
+	const FSLFlythroughMethod& Method = *GetSelectedMethod();
+	FText ScenarioReason;
+	ASLFlythroughScenario* Scenario = nullptr;
+	if (!ResolveScenario(Scenario, ScenarioReason)) return false;
+	ActiveScenario = Scenario;
+	const UMovieScene* MovieScene = ActiveScenario->Sequence->GetMovieScene();
+	TargetFPS = MovieScene->GetDisplayRate().Numerator;
+	const TRange<FFrameNumber> PlaybackRange = MovieScene->GetPlaybackRange();
+	SequenceStartFrame = FFrameRate::TransformTime(FFrameTime(PlaybackRange.GetLowerBoundValue()),
+		MovieScene->GetTickResolution(), MovieScene->GetDisplayRate()).CeilToFrame().Value;
+	const int32 EndFrame = FFrameRate::TransformTime(FFrameTime(PlaybackRange.GetUpperBoundValue()),
+		MovieScene->GetTickResolution(), MovieScene->GetDisplayRate()).CeilToFrame().Value;
+	TotalFrames = EndFrame - SequenceStartFrame;
+	if (TotalFrames <= 0)
+	{
+		ActiveScenario = nullptr;
+		MetricsStatus = TEXT("Sequence playback range has no display frames.");
+		return false;
+	}
+	FixedDeltaTime = 1.0 / static_cast<double>(TargetFPS);
+	FlythroughDuration = TotalFrames * FixedDeltaTime;
+	CurrentMethodName = Method.Name;
+	MetricsStatus.Reset();
+	bSoftwareFallbackRun = !IsRayTracingEnabled() && CVarSLFlythroughAllowSoftwareFallback.GetValueOnGameThread() != 0;
+	const FString DefaultRoot = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectDir(), TEXT("renders")));
+	const FString ModeRoot = bSoftwareFallbackRun ? FPaths::Combine(DefaultRoot, TEXT("software_fallback")) : DefaultRoot;
+	CurrentRunRoot = FPaths::Combine(ModeRoot, GetScenarioFolder(GetWorld(), ActiveScenario));
+	// Release comparison overlays, view extensions and renderer overrides first.
+	if (auto* Comparison = GetWorld()->GetSubsystem<USLComparisonSubsystem>(); Comparison && Comparison->OwnsRenderer())
+		Comparison->Restore();
+
+	// Setup frames. The output directory is chosen once the capture identity is known.
 	CurrentFrame = 0;
-	FlythroughTime = 0.0;
-	FixedDeltaTime = 1.0 / (double)TargetFPS;
+	bFrameInterrupted = false;
 	FrameTimings.Reset();
 	FrameTimings.Reserve(TotalFrames);
 	TargetSPP = Method.SPP;
@@ -462,15 +903,118 @@ bool USLFlythroughSubsystem::StartFlythrough()
 	CaptureSize = GetWorld()->GetGameViewport()->Viewport->GetSizeXY();
 
 	// Setup camera
-	SetupCamera();
-	if (!FlythroughCamera)
+	if (!SetupCamera())
 	{
-		UE_LOG(LogSL_Test, Error, TEXT("Flythrough: Failed to create camera."));
+		if (MetricsStatus.IsEmpty()) MetricsStatus = TEXT("Unable to set up the scenario camera.");
+		UE_LOG(LogSL_Test, Error, TEXT("Flythrough: %s"), *MetricsStatus);
+		ReleaseCamera();
+		CurrentRunRoot.Reset();
+		Phase = ESLFlythroughPhase::Idle;
+		OnStateChanged.Broadcast();
 		return false;
 	}
 
 	// Apply method settings
 	ApplyMethodSettings(Method);
+
+	// Persist the capture identity before any frame is written. Incomplete runs are ignored.
+	FSLFlythroughRunManifest Manifest;
+	Manifest.Method = Method.Name;
+	Manifest.SPP = Method.SPP;
+	Manifest.DenoiserMethod = Method.DenoiserMethod;
+	Manifest.Map = GetBenchmarkMapPackage(GetWorld());
+	Manifest.CameraPath = ActiveScenario->Sequence->GetPathName();
+	Manifest.CameraParameters = FString::Printf(TEXT("scenario=%s;camera_tag=%s;start_frame=%d"),
+		*ActiveScenario->ScenarioId.ToString(), *ActiveScenario->CameraBindingTag.ToString(), SequenceStartFrame);
+	// Fingerprint every sampled camera state so route and FOV edits invalidate older GT runs.
+	FString CameraSamples;
+	CameraSamples.Reserve(TotalFrames * 160);
+	bool bSampledCamera = true;
+	for (int32 FrameIndex = 0; FrameIndex < TotalFrames && bSampledCamera; ++FrameIndex)
+	{
+		bSampledCamera = EvaluateSequenceFrame(FrameIndex);
+		const UCameraComponent* CameraComponent = FlythroughCamera->GetCameraComponent();
+		FPostProcessSettings ComparablePostProcess = CameraComponent->PostProcessSettings;
+		ComparablePostProcess.bOverride_PathTracingSamplesPerPixel = false;
+		ComparablePostProcess.PathTracingSamplesPerPixel = 0;
+		FString PostProcessText;
+		FPostProcessSettings::StaticStruct()->ExportText(PostProcessText,
+			&ComparablePostProcess, nullptr, nullptr, PPF_None, nullptr);
+		// The component's world transform includes both actor and camera-component transform tracks.
+		CameraSamples += FString::Printf(TEXT("%s;fov=%.9g;aspect=%.9g;constrain=%d;projection=%d;ortho=%.9g;pp=%08x;"),
+			*CameraComponent->GetComponentTransform().ToString(), CameraComponent->FieldOfView,
+			CameraComponent->AspectRatio, CameraComponent->bConstrainAspectRatio ? 1 : 0,
+			static_cast<int32>(CameraComponent->ProjectionMode), CameraComponent->OrthoWidth,
+			FCrc::StrCrc32(*PostProcessText));
+	}
+	Manifest.CameraParameters += FString::Printf(TEXT(";sample_crc=%08x"), FCrc::StrCrc32(*CameraSamples));
+	bSampledCamera = bSampledCamera && EvaluateSequenceFrame(0);
+	Manifest.Width = CaptureSize.X;
+	Manifest.Height = CaptureSize.Y;
+	Manifest.FrameCount = TotalFrames;
+	Manifest.TargetFPS = TargetFPS;
+	Manifest.DurationSeconds = FlythroughDuration;
+	Manifest.bSoftwareFallback = bSoftwareFallbackRun;
+	// Snapshot renderer setting families instead of maintaining a list of individual CVars.
+	// The method-specific sample count and reset mode are intentionally excluded.
+	TArray<FString> SharedSettings;
+	const auto CollectSetting = FConsoleObjectVisitor::CreateLambda([&](const TCHAR* Name, IConsoleObject* Object)
+	{
+		const FString Key(Name);
+		if (Key == TEXT("r.PathTracing.SamplesPerPixel")
+			|| Key == TEXT("SL.PathTracer.TargetSPP")
+			|| Key == TEXT("SL.PathTracer.ResetEveryFrame")) return;
+		if (const IConsoleVariable* Variable = Object->AsVariable())
+			SharedSettings.Add(Key + TEXT("=") + Variable->GetString());
+	});
+	static const TCHAR* SettingFamilies[] = {
+		TEXT("r.PathTracing."), TEXT("r.Tonemapper."), TEXT("r.EyeAdaptation."),
+		TEXT("r.DefaultFeature."), TEXT("r.ScreenPercentage"), TEXT("SL.PathTracer.")
+	};
+	for (const TCHAR* Prefix : SettingFamilies)
+		IConsoleManager::Get().ForEachConsoleObjectThatStartsWith(CollectSetting, Prefix);
+	SharedSettings.Sort();
+	Manifest.RenderSettings = FString::Printf(TEXT("path_tracing=%d;exposure_bias=%.6f"),
+		bSoftwareFallbackRun ? 0 : 1,
+		FlythroughCamera->GetCameraComponent()->PostProcessSettings.AutoExposureBias);
+	Manifest.RenderSettings += FString::Printf(TEXT(";source_postprocess_crc=%08x"),
+		FCrc::StrCrc32(*SourcePostProcessSettings));
+	for (const FString& Setting : SharedSettings)
+		Manifest.RenderSettings += TEXT(";") + Setting;
+	bool bAlreadyComplete = false;
+	if (!bSampledCamera || !ChooseRunDirectory(FPaths::Combine(CurrentRunRoot, CurrentMethodName), Manifest, bAlreadyComplete))
+	{
+		ReleaseCamera();
+		RestoreSettings();
+		if (!bSampledCamera)
+			MetricsStatus = TEXT("The scenario Sequence could not be evaluated at every frame; capture was not started.");
+		CurrentRunRoot.Reset();
+		Phase = ESLFlythroughPhase::Idle;
+		OnStateChanged.Broadcast();
+		return false;
+	}
+	if (bAlreadyComplete)
+	{
+		// Batch re-runs skip methods whose identical capture already finished.
+		ReleaseCamera();
+		RestoreSettings();
+		Phase = ESLFlythroughPhase::Finished;
+		MetricsStatus = FString::Printf(TEXT("%s is already captured in %s; skipped."), *CurrentMethodName, *CurrentRunDir);
+		UE_LOG(LogSL_Test, Display, TEXT("Flythrough: %s"), *MetricsStatus);
+		RefreshSummariesForRoot(CurrentRunRoot);
+		OnStateChanged.Broadcast();
+		return true;
+	}
+	if (CurrentFrame > 0 && !EvaluateSequenceFrame(CurrentFrame))
+	{
+		ReleaseCamera();
+		RestoreSettings();
+		MetricsStatus = TEXT("The scenario Sequence could not be evaluated at the resume frame.");
+		CurrentRunRoot.Reset();
+		Phase = ESLFlythroughPhase::Idle;
+		OnStateChanged.Broadcast();
+		return false;
+	}
 
 	// For multi-SPP accumulation, create a view extension to track samples
 	if (Method.bAccumulate && !bSoftwareFallbackRun)
@@ -479,24 +1023,23 @@ bool USLFlythroughSubsystem::StartFlythrough()
 		AccumulationView->bReference = true;
 		AccumulationView->DenoiserOverride = -1;
 		AccumulationView->Samples.Store(0);
+		AccumulationView->bResetAccumulation.Store(true);
 	}
 
 	// Register screenshot delegate
 	ScreenshotHandle = UGameViewportClient::OnScreenshotCaptured().AddUObject(
 		this, &USLFlythroughSubsystem::OnScreenshotCaptured);
 
-	// Position camera at frame 0
-	FlythroughCamera->SetActorTransform(GetCameraTransformAtTime(0.0));
-	GetWorld()->GetFirstPlayerController()->PlayerCameraManager->UpdateCamera(0.f);
-
+	// The camera is already evaluated at the first frame to capture.
 	// Warm up for one frame to let settings apply
 	Phase = ESLFlythroughPhase::WarmUp;
 	FrameStartTime = FPlatformTime::Seconds();
 	MetricsStatus.Reset();
 	OnStateChanged.Broadcast();
 
-	UE_LOG(LogSL_Test, Log, TEXT("Flythrough: Started %s — %d frames at %d FPS, SPP=%d"),
-		*CurrentMethodName, TotalFrames, TargetFPS, TargetSPP);
+	UE_LOG(LogSL_Test, Display, TEXT("Flythrough: %s %s at frame %d/%d, %d FPS, SPP=%d. Output: %s"),
+		CurrentFrame > 0 ? TEXT("Resumed") : TEXT("Started"), *CurrentMethodName, CurrentFrame, TotalFrames,
+		TargetFPS, TargetSPP, *CurrentRunDir);
 
 	return true;
 }
@@ -516,10 +1059,93 @@ void USLFlythroughSubsystem::CancelFlythrough()
 
 	Phase = ESLFlythroughPhase::Idle;
 	MetricsStatus = TEXT("Flythrough cancelled.");
-	RefreshSummaries();
+	RefreshSummariesForRoot(CurrentRunRoot);
 	OnStateChanged.Broadcast();
 
 	UE_LOG(LogSL_Test, Log, TEXT("Flythrough: Cancelled at frame %d/%d"), CurrentFrame, TotalFrames);
+}
+
+// -----------------------------------------------------------------------
+// Batch capture (console / command line)
+// -----------------------------------------------------------------------
+
+bool USLFlythroughSubsystem::StartBatch(bool bQuitWhenDone)
+{
+	if (IsBusy() || bBatchActive)
+	{
+		UE_LOG(LogSL_Test, Warning, TEXT("Flythrough batch: a capture is already running."));
+		return false;
+	}
+	// GT first so a failed baseline stops the batch before the test methods run.
+	ApplyGTSPP();
+	BatchQueue.Reset();
+	const int32 GTIndex = Methods.IndexOfByPredicate([](const FSLFlythroughMethod& M) { return M.bIsGT; });
+	if (GTIndex != INDEX_NONE) BatchQueue.Add(GTIndex);
+	for (int32 Index = 0; Index < Methods.Num(); ++Index)
+		if (Index != GTIndex) BatchQueue.Add(Index);
+	bBatchActive = true;
+	bBatchQuitWhenDone = bQuitWhenDone;
+	bBatchRunInFlight = false;
+	BatchWaitStart = FPlatformTime::Seconds();
+	UE_LOG(LogSL_Test, Display, TEXT("Flythrough batch: queued %d methods."), BatchQueue.Num());
+	return true;
+}
+
+void USLFlythroughSubsystem::TickBatch()
+{
+	if (bBatchRunInFlight)
+	{
+		bBatchRunInFlight = false;
+		if (Phase != ESLFlythroughPhase::Finished)
+		{
+			EndBatch(false, MetricsStatus.IsEmpty() ? TEXT("Capture was cancelled.") : MetricsStatus);
+			return;
+		}
+		BatchWaitStart = FPlatformTime::Seconds();
+	}
+	if (BatchQueue.IsEmpty())
+	{
+		const bool bScored = ComputeMetrics();
+		EndBatch(bScored, MetricsStatus);
+		return;
+	}
+	SelectMethod(BatchQueue[0]);
+	FText Reason;
+	if (!CanStartFlythrough(Reason))
+	{
+		// The player controller and viewport may not exist yet right after startup.
+		if (FPlatformTime::Seconds() - BatchWaitStart > 30.0)
+			EndBatch(false, Reason.ToString());
+		return;
+	}
+	if (!StartFlythrough())
+	{
+		EndBatch(false, MetricsStatus.IsEmpty() ? TEXT("Unable to start the flythrough.") : MetricsStatus);
+		return;
+	}
+	UE_LOG(LogSL_Test, Display, TEXT("Flythrough batch: capturing %s (%d left after this)."),
+		*CurrentMethodName, BatchQueue.Num() - 1);
+	BatchQueue.RemoveAt(0);
+	bBatchRunInFlight = true;
+}
+
+void USLFlythroughSubsystem::EndBatch(bool bSucceeded, const FString& Message)
+{
+	bBatchActive = false;
+	BatchQueue.Reset();
+	if (bSucceeded)
+	{
+		UE_LOG(LogSL_Test, Display, TEXT("Flythrough batch: done. %s"), *Message);
+		for (const FSLMethodSummary& S : CachedSummaries)
+			UE_LOG(LogSL_Test, Display, TEXT("Flythrough result: %s %s render=%.2fms PSNR=%.3f SSIM=%.4f MSE=%.3f CNR=%.3f"),
+				*S.Method, *S.RunId, S.AvgRenderMs, S.AvgPSNR, S.AvgSSIM, S.AvgMSE, S.AvgCNR);
+	}
+	else
+	{
+		UE_LOG(LogSL_Test, Error, TEXT("Flythrough batch: failed. %s"), *Message);
+	}
+	if (bBatchQuitWhenDone)
+		FPlatformMisc::RequestExitWithStatus(false, bSucceeded ? 0 : 1);
 }
 
 // -----------------------------------------------------------------------
@@ -530,6 +1156,18 @@ void USLFlythroughSubsystem::Tick(float DeltaTime)
 {
 	if (IsBusy())
 	{
+		// A minimized game draws no viewport, so no samples or screenshots arrive. Wait without
+		// counting toward the timeout, then redo the frame so its render time stays valid.
+		if (GEngine && GEngine->AreAllWindowsHidden())
+		{
+			bFrameInterrupted = true;
+			return;
+		}
+		if (bFrameInterrupted)
+		{
+			RestartCurrentFrame();
+			return;
+		}
 		auto* Viewport = GetWorld()->GetGameViewport();
 		if (!Viewport || !Viewport->Viewport || Viewport->Viewport->GetSizeXY() != CaptureSize
 			|| (Phase != ESLFlythroughPhase::WarmUp && FPlatformTime::Seconds() - FrameStartTime > 600.0))
@@ -538,6 +1176,11 @@ void USLFlythroughSubsystem::Tick(float DeltaTime)
 			MetricsStatus = TEXT("Capture stopped: viewport changed or frame timed out.");
 			return;
 		}
+	}
+	else if (bBatchActive)
+	{
+		TickBatch();
+		return;
 	}
 	switch (Phase)
 	{
@@ -628,7 +1271,7 @@ void USLFlythroughSubsystem::CaptureFrame()
 
 void USLFlythroughSubsystem::OnScreenshotCaptured(int32 Width, int32 Height, const TArray<FColor>& Pixels)
 {
-	if (Phase != ESLFlythroughPhase::AwaitingScreenshot) return;
+	if (Phase != ESLFlythroughPhase::AwaitingScreenshot || bFrameInterrupted) return;
 	// Include completion/readback of this frame, but exclude PNG compression and disk I/O.
 	LastFrameTimeMs = (FPlatformTime::Seconds() - FrameStartTime) * 1000.0;
 	FSLFrameTiming Timing;
@@ -657,6 +1300,15 @@ void USLFlythroughSubsystem::OnScreenshotCaptured(int32 Width, int32 Height, con
 		CancelFlythrough();
 		return;
 	}
+	// Written after the PNG so a resumed run never trusts a timing without its frame.
+	if (!FFileHelper::SaveStringToFile(FString::Printf(TEXT("%d,%.3f\n"), CurrentFrame, LastFrameTimeMs),
+		*FPaths::Combine(CurrentRunDir, PartialTimingsFile), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM,
+		&IFileManager::Get(), FILEWRITE_Append))
+	{
+		UE_LOG(LogSL_Test, Error, TEXT("Flythrough: Failed to record the timing for frame %d"), CurrentFrame);
+		CancelFlythrough();
+		return;
+	}
 
 	AdvanceFrame();
 }
@@ -664,7 +1316,6 @@ void USLFlythroughSubsystem::OnScreenshotCaptured(int32 Width, int32 Height, con
 void USLFlythroughSubsystem::AdvanceFrame()
 {
 	++CurrentFrame;
-	FlythroughTime = CurrentFrame * FixedDeltaTime;
 
 	if (CurrentFrame >= TotalFrames)
 	{
@@ -673,18 +1324,23 @@ void USLFlythroughSubsystem::AdvanceFrame()
 	}
 
 	// Move camera to next position
-	FlythroughCamera->SetActorTransform(GetCameraTransformAtTime(FlythroughTime));
-	// World gameplay is paused; explicitly refresh the cached camera for the next render.
-	GetWorld()->GetFirstPlayerController()->PlayerCameraManager->UpdateCamera(0.f);
+	if (!EvaluateSequenceFrame(CurrentFrame))
+	{
+		CancelFlythrough();
+		MetricsStatus = FString::Printf(TEXT("Capture stopped: Sequence frame %d could not be evaluated."), CurrentFrame);
+		return;
+	}
 
-	// Reset accumulation for multi-SPP
+	// Reset accumulation for multi-SPP. The reference view is an offline render, which
+	// ignores camera motion, so the next view must restart accumulation explicitly.
 	if (AccumulationView)
+	{
 		AccumulationView->Samples.Store(0);
+		AccumulationView->bResetAccumulation.Store(true);
+	}
 
 	// Continue rendering
-	Phase = GetSelectedMethod()->bAccumulate && !bSoftwareFallbackRun
-		? ESLFlythroughPhase::WarmUp
-		: ESLFlythroughPhase::Rendering;
+	Phase = ESLFlythroughPhase::WarmUp;
 
 	FrameStartTime = FPlatformTime::Seconds();
 	OnStateChanged.Broadcast();
@@ -700,6 +1356,7 @@ void USLFlythroughSubsystem::FinishFlythrough()
 		MetricsStatus = TEXT("Failed to save timings.csv; run is incomplete.");
 		return;
 	}
+	IFileManager::Get().Delete(*FPaths::Combine(CurrentRunDir, PartialTimingsFile));
 
 	// Cleanup
 	UGameViewportClient::OnScreenshotCaptured().Remove(ScreenshotHandle);
@@ -711,7 +1368,7 @@ void USLFlythroughSubsystem::FinishFlythrough()
 	MetricsStatus = FString::Printf(TEXT("Flythrough complete: %s — %d frames captured."),
 		*CurrentMethodName, TotalFrames);
 
-	RefreshSummaries();
+	RefreshSummariesForRoot(CurrentRunRoot);
 	OnStateChanged.Broadcast();
 
 	UE_LOG(LogSL_Test, Log, TEXT("Flythrough: %s complete. Output: %s"), *CurrentMethodName, *CurrentRunDir);
@@ -756,9 +1413,11 @@ bool USLFlythroughSubsystem::CanComputeMetrics(FText& Reason) const
 		Reason = FText::FromString(TEXT("Metrics are already being computed."));
 		return false;
 	}
+	ASLFlythroughScenario* Scenario = nullptr;
+	if (!ResolveScenario(Scenario, Reason)) return false;
 	if (!HasGTBaseline())
 	{
-		Reason = FText::FromString(TEXT("Render a 64SPP_GT baseline first."));
+		Reason = FText::FromString(FString::Printf(TEXT("Render a %s baseline first."), *GetGTMethodName()));
 		return false;
 	}
 	return true;
@@ -779,7 +1438,15 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 	OnStateChanged.Broadcast();
 
 	const FString Root = GetRendersRoot();
-	const FString GTDir = FSLFlythroughMetrics::FindLatestRun(FPaths::Combine(Root, TEXT("64SPP_GT")));
+	const FString GTDir = FSLFlythroughMetrics::FindLatestRun(FPaths::Combine(Root, GetGTMethodName()));
+	FSLFlythroughRunManifest GTManifest;
+	if (GTDir.IsEmpty() || !FSLFlythroughMetrics::ReadRunManifest(GTDir, GTManifest))
+	{
+		MetricsStatus = FString::Printf(TEXT("The GT run has no valid capture manifest. Render a new %s baseline."), *GetGTMethodName());
+		bComputingMetrics = false;
+		OnStateChanged.Broadcast();
+		return false;
+	}
 
 	// Load GT frames
 	TArray<FString> GTFrameFiles;
@@ -795,6 +1462,7 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 	}
 
 	TArray<FSLMethodSummary> Summaries;
+	TArray<FString> MismatchedMethods;
 
 	for (const FSLFlythroughMethod& Method : Methods)
 	{
@@ -802,6 +1470,15 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 		const FString LatestRun = FSLFlythroughMetrics::FindLatestRun(MethodDir);
 		if (LatestRun.IsEmpty() || !FSLFlythroughMetrics::IsRunComplete(LatestRun))
 			continue;
+		FSLFlythroughRunManifest TestManifest;
+		if (!FSLFlythroughMetrics::ReadRunManifest(LatestRun, TestManifest)
+			|| !TestManifest.IsComparableTo(GTManifest))
+		{
+			UE_LOG(LogSL_Test, Warning, TEXT("Flythrough: %s capture configuration does not match GT; skipping %s."),
+				*Method.Name, *LatestRun);
+			MismatchedMethods.Add(Method.Name);
+			continue;
+		}
 
 		MetricsStatus = FString::Printf(TEXT("Computing metrics for %s..."), *Method.Name);
 
@@ -866,17 +1543,21 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 	}
 
 	// Write summary CSV
-	if (Summaries.IsEmpty() || !FSLFlythroughMetrics::WriteSummaryCSV(Root, Summaries))
+	const FString MismatchNote = MismatchedMethods.IsEmpty() ? FString()
+		: FString::Printf(TEXT(" Skipped (capture differs from GT; re-render): %s."), *FString::Join(MismatchedMethods, TEXT(", ")));
+	if (Summaries.IsEmpty() || !FSLFlythroughMetrics::WriteSummaryCSV(Root, Summaries)
+		|| !FFileHelper::SaveStringToFile(GetSummaryGTKey(GTDir, GTManifest),
+			*FPaths::Combine(Root, TEXT("summary_gt_run.txt")), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
 	{
 		bComputingMetrics = false;
-		MetricsStatus = TEXT("Metrics failed: no matching frames or summary CSV could not be saved.");
+		MetricsStatus = TEXT("Metrics failed: no matching frames or summary CSV could not be saved.") + MismatchNote;
 		OnStateChanged.Broadcast();
 		return false;
 	}
 	CachedSummaries = Summaries;
 
 	bComputingMetrics = false;
-	MetricsStatus = FString::Printf(TEXT("Metrics computed for %d methods."), Summaries.Num());
+	MetricsStatus = FString::Printf(TEXT("Metrics computed for %d methods."), Summaries.Num()) + MismatchNote;
 	OnStateChanged.Broadcast();
 
 	UE_LOG(LogSL_Test, Log, TEXT("Flythrough: Metrics computed for %d methods. Summary at %s"),

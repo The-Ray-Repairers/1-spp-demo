@@ -6,6 +6,19 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
+
+bool FSLFlythroughRunManifest::IsComparableTo(const FSLFlythroughRunManifest& Other) const
+{
+	return Map == Other.Map && CameraPath == Other.CameraPath
+		&& CameraParameters == Other.CameraParameters && RenderSettings == Other.RenderSettings
+		&& Width == Other.Width && Height == Other.Height && FrameCount == Other.FrameCount
+		&& TargetFPS == Other.TargetFPS && FMath::IsNearlyEqual(DurationSeconds, Other.DurationSeconds)
+		&& bSoftwareFallback == Other.bSoftwareFallback;
+}
 
 // -----------------------------------------------------------------------
 // PNG Loading
@@ -336,6 +349,72 @@ double FSLFlythroughMetrics::ReadAvgRenderTime(const FString& TimingsPath)
 // Run Directory Helpers
 // -----------------------------------------------------------------------
 
+bool FSLFlythroughMetrics::WriteRunManifest(const FString& RunDir, const FSLFlythroughRunManifest& Manifest)
+{
+	TSharedPtr<FJsonObject> Json = MakeShared<FJsonObject>();
+	Json->SetNumberField(TEXT("version"), 1);
+	Json->SetStringField(TEXT("method"), Manifest.Method);
+	Json->SetNumberField(TEXT("spp"), Manifest.SPP);
+	Json->SetNumberField(TEXT("denoiser_method"), Manifest.DenoiserMethod);
+	Json->SetStringField(TEXT("map"), Manifest.Map);
+	Json->SetStringField(TEXT("camera_path"), Manifest.CameraPath);
+	Json->SetStringField(TEXT("camera_parameters"), Manifest.CameraParameters);
+	Json->SetStringField(TEXT("render_settings"), Manifest.RenderSettings);
+	Json->SetNumberField(TEXT("width"), Manifest.Width);
+	Json->SetNumberField(TEXT("height"), Manifest.Height);
+	Json->SetNumberField(TEXT("frame_count"), Manifest.FrameCount);
+	Json->SetNumberField(TEXT("target_fps"), Manifest.TargetFPS);
+	Json->SetNumberField(TEXT("duration_seconds"), Manifest.DurationSeconds);
+	Json->SetBoolField(TEXT("software_fallback"), Manifest.bSoftwareFallback);
+	Json->SetStringField(TEXT("capture_id"), Manifest.CaptureId);
+	FString Contents;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Contents);
+	return FJsonSerializer::Serialize(Json, Writer)
+		&& FFileHelper::SaveStringToFile(Contents, *FPaths::Combine(RunDir, TEXT("run_manifest.json")),
+			FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+}
+
+bool FSLFlythroughMetrics::ReadRunManifest(const FString& RunDir, FSLFlythroughRunManifest& OutManifest)
+{
+	FString Contents;
+	if (!FFileHelper::LoadFileToString(Contents, *FPaths::Combine(RunDir, TEXT("run_manifest.json")))) return false;
+	TSharedPtr<FJsonObject> Json;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Contents);
+	if (!FJsonSerializer::Deserialize(Reader, Json) || !Json.IsValid()) return false;
+	double Version = 0, SPP = 0, Denoiser = 0, Width = 0, Height = 0, Frames = 0, FPS = 0;
+	FSLFlythroughRunManifest Manifest;
+	if (!Json->TryGetNumberField(TEXT("version"), Version) || Version != 1
+		|| !Json->TryGetStringField(TEXT("method"), Manifest.Method)
+		|| !Json->TryGetNumberField(TEXT("spp"), SPP)
+		|| !Json->TryGetNumberField(TEXT("denoiser_method"), Denoiser)
+		|| !Json->TryGetStringField(TEXT("map"), Manifest.Map)
+		|| !Json->TryGetStringField(TEXT("camera_path"), Manifest.CameraPath)
+		|| !Json->TryGetStringField(TEXT("camera_parameters"), Manifest.CameraParameters)
+		|| !Json->TryGetStringField(TEXT("render_settings"), Manifest.RenderSettings)
+		|| !Json->TryGetNumberField(TEXT("width"), Width)
+		|| !Json->TryGetNumberField(TEXT("height"), Height)
+		|| !Json->TryGetNumberField(TEXT("frame_count"), Frames)
+		|| !Json->TryGetNumberField(TEXT("target_fps"), FPS)
+		|| !Json->TryGetNumberField(TEXT("duration_seconds"), Manifest.DurationSeconds)
+		|| !Json->TryGetBoolField(TEXT("software_fallback"), Manifest.bSoftwareFallback)) return false;
+	Json->TryGetStringField(TEXT("capture_id"), Manifest.CaptureId);
+	Manifest.SPP = static_cast<int32>(SPP);
+	Manifest.DenoiserMethod = static_cast<int32>(Denoiser);
+	Manifest.Width = static_cast<int32>(Width);
+	Manifest.Height = static_cast<int32>(Height);
+	Manifest.FrameCount = static_cast<int32>(Frames);
+	Manifest.TargetFPS = static_cast<int32>(FPS);
+	if (Manifest.Method.IsEmpty() || Manifest.Map.IsEmpty() || Manifest.CameraPath.IsEmpty()
+		|| Manifest.CameraParameters.IsEmpty() || Manifest.RenderSettings.IsEmpty()
+		|| Manifest.Width <= 0 || Manifest.Height <= 0 || Manifest.FrameCount <= 0
+		|| Manifest.TargetFPS <= 0 || Manifest.DurationSeconds <= 0.0
+		|| SPP != Manifest.SPP || Denoiser != Manifest.DenoiserMethod
+		|| Width != Manifest.Width || Height != Manifest.Height || Frames != Manifest.FrameCount || FPS != Manifest.TargetFPS
+		|| !FMath::IsFinite(Manifest.DurationSeconds)) return false;
+	OutManifest = MoveTemp(Manifest);
+	return true;
+}
+
 FString FSLFlythroughMetrics::FindLatestRun(const FString& MethodDir)
 {
 	TArray<FString> Dirs;
@@ -378,6 +457,9 @@ bool FSLFlythroughMetrics::IsRunComplete(const FString& RunDir)
 {
 	// timings.csv is written only after capture finishes. Verify every recorded frame.
 	if (!IFileManager::Get().DirectoryExists(*RunDir)) return false;
+	FSLFlythroughRunManifest Manifest;
+	if (!ReadRunManifest(RunDir, Manifest)
+		|| Manifest.Method != FPaths::GetCleanFilename(FPaths::GetPath(RunDir))) return false;
 	FString CSV;
 	if (!FFileHelper::LoadFileToString(CSV, *FPaths::Combine(RunDir, TEXT("timings.csv")))) return false;
 	TArray<FString> Lines;
@@ -386,7 +468,7 @@ bool FSLFlythroughMetrics::IsRunComplete(const FString& RunDir)
 
 	TArray<FString> Frames;
 	IFileManager::Get().FindFiles(Frames, *FPaths::Combine(RunDir, TEXT("frames"), TEXT("*.png")), true, false);
-	if (Frames.Num() != Lines.Num() - 2) return false;
+	if (Frames.Num() != Lines.Num() - 2 || Frames.Num() != Manifest.FrameCount) return false;
 	Frames.Sort();
 	for (int32 Index = 0; Index < Frames.Num(); ++Index)
 	{
