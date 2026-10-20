@@ -162,7 +162,7 @@ Metrics operate on **tone-mapped 8-bit sRGB PNGs**, not linear HDR radiance.
 | MSE | Mean squared RGB error over channels and pixels using 0–255 inputs (MSE range 0–65025); lower is better. |
 | PSNR | `10 * log10(255^2 / MSE)` in dB; exact matches use a finite 100 dB cap. |
 | SSIM | Luminance SSIM with an 11×11 Gaussian window, sigma 1.5, sampled at stride 4; small images use a smaller odd window. |
-| CNR | Linear `sigma_G / sigma_R`, where G is GT luminance and R is test-minus-GT luminance. Residual standard deviation is floored at `1e-8`; this is not a dB value. |
+| CNR | Linear `sigma_G / sigma_R`, where G is linear GT luminance and R is linear test-minus-GT luminance after sRGB decoding. Residual standard deviation is floored at `1e-8`; this is not a dB value. Values from older versions are not directly comparable. |
 | Render time | Wall-clock milliseconds through frame completion/readback, excluding PNG compression and disk writes; includes capture/accumulation overhead and is not a GPU-only profiler measurement. |
 
 Per-frame CSVs include an `avg` row. Summary metric values are arithmetic means of

@@ -2,7 +2,7 @@
 
 #include "CoreMinimal.h"
 
-/** Per-frame image quality metrics (all computed in 8-bit sRGB [0,255] space). */
+/** Per-frame image quality metrics. MSE/PSNR/SSIM use 8-bit sRGB; CNR uses linear luminance. */
 struct FSLFrameMetrics
 {
 	int32 FrameIndex = 0;
@@ -74,6 +74,8 @@ private:
 	/** Compute SSIM for a single-channel luminance pair using 11x11 windows. */
 	static double ComputeSSIM(const TArray<double>& TestLum, const TArray<double>& GTLum, int32 Width, int32 Height);
 
-	/** Convert sRGB FColor to relative luminance [0, 255]. */
+	/** Encoded sRGB luma [0, 255], used by SSIM. */
 	static double ToLuminance(const FColor& C);
+	/** Linear relative luminance [0, 1], used by CNR. */
+	static double ToLinearLuminance(const FColor& C);
 };

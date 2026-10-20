@@ -53,8 +53,14 @@ bool FSLFlythroughMetrics::LoadPNG(const FString& Path, TArray<FColor>& OutPixel
 
 double FSLFlythroughMetrics::ToLuminance(const FColor& C)
 {
-	// BT.709 luminance in [0, 255] from sRGB components.
+	// Encoded sRGB luma for the existing 8-bit SSIM definition.
 	return 0.2126 * C.R + 0.7152 * C.G + 0.0722 * C.B;
+}
+
+double FSLFlythroughMetrics::ToLinearLuminance(const FColor& C)
+{
+	const FLinearColor Linear = FLinearColor::FromSRGBColor(C);
+	return 0.2126 * Linear.R + 0.7152 * Linear.G + 0.0722 * Linear.B;
 }
 
 // -----------------------------------------------------------------------
@@ -109,16 +115,21 @@ FSLFrameMetrics FSLFlythroughMetrics::ComputeFrameMetrics(
 	Result.SSIM = ComputeSSIM(TestLum, GTLum, Width, Height);
 
 	// ---- CNR (full-reference, linear ratio) ----
-	// σ_G = spatial std-dev of GT luminance
-	// σ_R = spatial std-dev of residual luminance (Test - GT)
+	// σ_G = spatial std-dev of linear GT luminance
+	// σ_R = spatial std-dev of linear residual luminance (Test - GT)
 	// CNR = σ_G / σ_R; floor a zero residual to keep CSV/chart values finite.
 	{
 		constexpr double Epsilon = 1e-8;
+		TArray<double> TestLinearLum, GTLinearLum;
+		TestLinearLum.SetNumUninitialized(N);
+		GTLinearLum.SetNumUninitialized(N);
 		double MeanGT = 0.0, MeanRes = 0.0;
 		for (int32 i = 0; i < N; ++i)
 		{
-			MeanGT += GTLum[i];
-			MeanRes += (TestLum[i] - GTLum[i]);
+			TestLinearLum[i] = ToLinearLuminance(TestPixels[i]);
+			GTLinearLum[i] = ToLinearLuminance(GTPixels[i]);
+			MeanGT += GTLinearLum[i];
+			MeanRes += (TestLinearLum[i] - GTLinearLum[i]);
 		}
 		MeanGT /= N;
 		MeanRes /= N;
@@ -126,8 +137,8 @@ FSLFrameMetrics FSLFlythroughMetrics::ComputeFrameMetrics(
 		double VarGT = 0.0, VarRes = 0.0;
 		for (int32 i = 0; i < N; ++i)
 		{
-			const double dGT = GTLum[i] - MeanGT;
-			const double dRes = (TestLum[i] - GTLum[i]) - MeanRes;
+			const double dGT = GTLinearLum[i] - MeanGT;
+			const double dRes = (TestLinearLum[i] - GTLinearLum[i]) - MeanRes;
 			VarGT += dGT * dGT;
 			VarRes += dRes * dRes;
 		}
