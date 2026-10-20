@@ -86,28 +86,35 @@ the fallback's `1/sqrt(64)` noise scaling; it does not wait for hardware sample
 accumulation. `SL.NoiseFallback.Scale` still controls noise intensity.
 
 The panel displays **SYNTHETIC TEST**. All outputs, including the summary CSV,
-go under `renders/software_fallback/`, and each run includes `capture_mode.txt`.
+go under `renders/software_fallback/<scenario_id>_<map_hash>/`, and each run includes `capture_mode.txt`.
 These captures and metrics test the pipeline only; use the normal hardware path
 for actual quality/performance comparisons. Synthetic GT never unlocks metrics
 for hardware runs. Enabling this switch on a machine already using hardware ray
 tracing leaves the normal hardware path selected.
 
 Use `SL.Flythrough.AllowSoftwareFallback 0` to restore the default requirement.
-Changing it during a capture takes effect after the active run finishes or is
-cancelled. This is a runtime opt-in; the project default remains `0`.
+Changing it during a capture does not redirect that run's output. The completed
+run remains selected for results; the new switch value applies to the next run.
+This is a runtime opt-in; the project default remains `0`.
 
 ### Capturing and comparing methods
 
-1. Start play and enter `gm`. Keep the same scene, viewport size, and rendering
-   settings across methods.
+1. In each benchmark level, place one `SLFlythroughScenario` actor. Assign a
+   stable `Scenario Id`, a Level Sequence, and a placed CameraActor (a CineCameraActor
+   also works). In Sequencer, bind that camera as a possessable and tag its actor
+   binding `BenchmarkCamera`, or change `Camera Binding Tag` on the scenario actor
+   to match. Animate only that camera and its camera component. Use an integer
+   Sequence display rate; its playback range sets the captured frames. Save the
+   level and Sequence, start play, then enter `gm`.
+   `LVL_RT_Room` already has this setup (`/Game/Benchmark/LS_RT_Room_Flythrough`,
+   scenario `RT_Room`): the former interior loop, 300 frames at 30 FPS with an
+   80-degree FOV. `Scripts/author_room_flythrough.py` regenerates it:
+   `UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScriptPlugin -script=<project>/Scripts/author_room_flythrough.py -unattended -nullrhi`.
 2. In **Flythrough Benchmark**, select **64SPP_GT** and click **Render Flythrough**.
-   In `LVL_RT_Room`, the camera follows a fixed interior loop aimed at the sphere
-   and cylinder, with an 80-degree horizontal field of view. It stays clear of the
-   walls and props regardless of the player's starting position. The route lasts
-   10 seconds at 30 positions/second (300 frames). Its coordinates are authored in
-   `SLFlythroughCameraPath.h`; timing defaults remain in `SLFlythroughSubsystem.h`.
-   Other maps retain the orbit around the starting camera, so choose a clear
-   starting position and use that same position for every method on those maps.
+   The benchmark evaluates the Sequence at each display frame and keeps that
+   position fixed until the screenshot is complete. For a 10-second, 30 FPS run,
+   use a 30 FPS display rate and a 300-frame playback range. The Sequence is
+   not played in real time; GT can accumulate at each fixed camera position.
 3. Render the desired test methods: `1SPP_Noisy`, `1SPP_Gaussian`,
    `1SPP_Bilateral`, `1SPP_NeuralPlaceholder`, and `1SPP_NNE`. SVGF and Lumen/RR
    remain separate GM profiles and are not registered flythrough methods.
@@ -119,38 +126,76 @@ cancelled. This is a runtime opt-in; the project default remains `0`.
    methods without completed runs. Incomplete newer runs do not hide older complete
    runs. Run detection refreshes when the panel is constructed or a run completes.
 
-During capture, gameplay is paused, the camera follows fixed sample positions,
+To capture everything without the panel, run `SL.Flythrough.RunAll` in the console.
+It renders the GT first, then every method, then computes metrics and logs one
+`Flythrough result:` line per method (render time, PSNR, SSIM, MSE, CNR). Add
+`quit` to exit afterwards, for example:
+`UnrealEditor.exe SL_Test.uproject /Game/Levels/LVL_RT_Room -game -windowed -ResX=1280 -ResY=720 -ExecCmds="SL.Flythrough.RunAll quit"`.
+The exit code is nonzero if any capture or the metrics step fails. Methods whose
+capture identity differs from GT are listed in the metrics status.
+
+The GT sample count defaults to 64. Set `SL.Flythrough.GTSPP <N>` before capturing
+to change it; the GT method and its folder become `<N>SPP_GT`, so GTs with different
+sample counts are kept apart, and metrics score against the currently configured one.
+Existing test-method runs stay valid because the method's SPP is not part of the
+capture identity. On the RTX 5070 Ti laptop, a 1280×720 room frame costs about
+11 ms per sample, so 1024 SPP is roughly 11–12 s per frame, about an hour for 300 frames.
+For example:
+`-ExecCmds="SL.Flythrough.GTSPP 1024,SL.Flythrough.RunAll quit"`.
+
+**Resuming.** Each frame's PNG and its timing (`timings_partial.csv`) are written as
+it completes. If a capture stops (crash, cancel, closed window), starting the same
+method again continues the newest run from its first missing frame, provided the
+capture identity, method, SPP and denoiser are unchanged; otherwise a new run starts.
+A re-rendered frame always measures its whole render time. Re-running
+`SL.Flythrough.RunAll` also skips methods whose identical capture already finished,
+so after an interruption the same command picks up where it stopped. A Render click
+in the panel still starts a fresh run when the previous one is complete.
+
+**Running in the background.** During capture `t.IdleWhenNotForeground` is forced to
+0 (and, in the editor, *Use Less CPU when in Background* is turned off), then
+restored afterwards. The window can lose focus or sit behind other windows at full
+speed. Do not minimize it: a minimized game draws nothing, so 1 SPP methods wait and
+redo the current frame on restore, and minimizing during GT accumulation crashed the
+engine's renderer in testing. Resume after such a crash by running the same command.
+
+During capture, gameplay is paused, the camera follows fixed Sequence positions,
 path-tracer sampling is locked, and exposure/renderer settings are controlled for
-comparison. GT accumulates 64 samples at each position. Cancel restores captured
-settings and leaves partial output on disk. Resizing the viewport or a frame
+comparison. GT accumulates `SL.Flythrough.GTSPP` samples (64 by default) at each position. Cancel restores captured
+settings and leaves partial output on disk for resuming. Resizing the viewport or a frame
 exceeding the timeout stops the run. Existing comparison ownership is released
 before capture; conflicting GM controls are disabled while the benchmark runs.
 
-The default room path is independent of the starting view. Runs do not yet store a scene,
-camera, or settings manifest, so matching filenames/resolutions alone cannot
-establish that captures from different sessions are comparable. Use a fresh
-`renders/` directory when changing the scene or benchmark configuration.
+Each run writes `run_manifest.json` with the map, Sequence asset, sampled camera
+transform/FOV/projection/post-process settings, dimensions, frame
+schedule, capture mode, and shared rendering settings. `Compute Metrics` skips a
+method when this identity differs from GT; SPP and denoiser method are recorded
+but intentionally allowed to differ. Changes to scene content within the same
+map package are not detected, so recapture GT after editing the level.
 
-**After updating from the old camera orbit, archive your existing `renders/`
-directory and render a new GT and all test methods.** Old frames use different
-camera positions and must not be scored against the new route. This also applies
-to runs under `renders/software_fallback/`.
+**Runs created before `run_manifest.json` was introduced are ineligible for
+scoring.** Render a new GT and all test methods. This also applies to runs under
+`renders/software_fallback/`.
 
 ```text
 renders/
-  <method_name>/
-    run_001/
-      frames/
-        frame_0000.png
-        ...
-      timings.csv
-      metrics.csv          # written by Compute Metrics
-  summary_metrics.csv      # latest evaluated complete run per method
+  <scenario_id>_<map_hash>/
+    <method_name>/
+      run_001/
+        frames/
+          frame_0000.png
+          ...
+        timings.csv
+        run_manifest.json   # capture identity required for scoring
+        metrics.csv          # written by Compute Metrics
+    summary_metrics.csv      # latest evaluated complete run per method
+    summary_gt_run.txt       # GT run used for the current summary
 ```
 
-Run IDs increase independently for each method. Completed runs require a timings
-CSV and the corresponding nonempty frame sequence; cancelled runs are excluded.
-Frame counts/names and decoded image dimensions must match GT for scoring.
+Run IDs increase independently for each method. Completed runs require a valid
+manifest, timings CSV, and the corresponding nonempty frame sequence; cancelled
+runs are excluded. Capture identity, frame counts/names, and decoded image
+dimensions must match GT for scoring.
 `renders/` is ignored by Git. Share exported results separately from source changes.
 
 ### Reading the measurements
