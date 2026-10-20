@@ -26,12 +26,11 @@ Developer status as of **2026-10-15**:
 
 ### Build and verification status
 
-The current **SL_TestEditor / Win64 / Development** build succeeded with the
-NVIDIA plugins installed (`-NoUnity -NoHotReloadFromIDE`). This was an incremental
-build: existing compile outputs were current and only target metadata was written.
-The previous missing-DLSS build blocker is resolved on this machine; fresh clones
-still need the external plugins. The local log is
-`Saved/Logs/DeveloperReadmeBuild.log`.
+The current **SL_TestEditor / Win64 / DebugGame** build succeeds with the five
+required NVIDIA plugins installed in the project's `Plugins/` directory.
+The earlier missing `StreamlineDLSSGBlueprint` rules error came from incomplete
+project-local plugin copies and an installed engine rules assembly that did not
+include the engine-level copy. Fresh clones still need the external plugin bundle.
 
 The earlier completion pass also passed UnrealHeaderTool, six independent C++
 syntax checks without unity/PCH, and seven isolated numerical fixtures for MSE,
@@ -47,12 +46,12 @@ need an end-to-end editor test. Local scratch verification files live under
    tools, and a Windows SDK. The targets use `BuildSettingsVersion.V7` and
    `EngineIncludeOrderVersion.Unreal5_8`. Win64 with DX12/SM6 is the configured
    development path.
-2. Install an engine-compatible NVIDIA plugin bundle. `SL_Test.uproject` enables
-   `DLSS`, `StreamlineDLSSG`, and `StreamlineReflex`; install their dependencies as
-   well. `DLSSBlueprint` is a required C++ module, so disabling the plugin checkbox
-   alone does not remove the build dependency. The current local engine has these
-   plugins under `Engine/Plugins/Marketplace`; NVIDIA plugin code/binaries are not
-   shipped in this repository.
+2. Install the UE 5.8 NVIDIA 8.8.0 bundle under project `Plugins/`: `DLSS`,
+   `StreamlineNGXCommon`, `StreamlineCore`, `StreamlineDLSSG`, and
+   `StreamlineReflex`. Copy each complete plugin, including its `.uplugin` and
+   `Source/` directory. `SL_Test.uproject` enables DLSS, DLSSG, and Reflex;
+   the other two are their dependencies. NVIDIA plugin files are not shipped in
+   this repository. `DLSSBlueprint` is a required C++ module.
 3. Keep the project-enabled engine plugins available, including StateTree,
    GameplayStateTree, NeuralRendering, and NNERuntimeRDG. Generate project files
    from `SL_Test.uproject`, then build **SL_TestEditor / Development / Win64** with

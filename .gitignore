@@ -28,6 +28,9 @@ Plugins/*/Intermediate/
 # NVIDIA bundle is installed from a user-supplied distribution, not vendored.
 Plugins/DLSS/
 Plugins/StreamlineNGXCommon/
+Plugins/StreamlineCore/
+Plugins/StreamlineDLSSG/
+Plugins/StreamlineReflex/
 __pycache__/
 *.pyc
 
