@@ -34,6 +34,7 @@
 #include "Misc/Paths.h"
 #include "Misc/PackageName.h"
 #include "Misc/Crc.h"
+#include "Async/Async.h"
 #include "SceneViewExtension.h"
 #include "RenderingThread.h"
 #include "RenderUtils.h"
@@ -1160,8 +1161,21 @@ void USLFlythroughSubsystem::EndBatch(bool bSucceeded, const FString& Message)
 	{
 		UE_LOG(LogSL_Test, Error, TEXT("Flythrough batch: failed. %s"), *Message);
 	}
+	// Notify the UI that the batch is no longer active (bBatchActive is now false).
+	OnStateChanged.Broadcast();
 	if (bBatchQuitWhenDone)
-		FPlatformMisc::RequestExitWithStatus(false, bSucceeded ? 0 : 1);
+	{
+		// RequestExitWithStatus sets GIsRequestingExit, which can cause Slate to begin tearing
+		// down objects while we are still inside the current Tick call chain. Any pending Slate
+		// repaint that was invalidated by the OnStateChanged broadcast above may then read a
+		// partially-destroyed object and crash. Defer to a new game-thread task so the request
+		// is processed after the current tick (and all Slate repaints it triggered) fully unwinds.
+		const int32 ExitCode = bSucceeded ? 0 : 1;
+		AsyncTask(ENamedThreads::GameThread, [ExitCode]()
+		{
+			FPlatformMisc::RequestExitWithStatus(false, ExitCode);
+		});
+	}
 }
 
 // -----------------------------------------------------------------------
