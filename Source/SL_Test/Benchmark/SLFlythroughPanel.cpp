@@ -389,11 +389,23 @@ public:
 			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
 			[
 				SNew(SProgressBar)
-				.Percent_Lambda([this] { return Subsystem.IsValid() ? Subsystem->GetProgress() : 0.f; })
-				.FillColorAndOpacity(FLinearColor(0.1f, 0.55f, 0.95f))
+				.Percent_Lambda([this]
+				{
+					if (!Subsystem.IsValid()) return 0.f;
+					if (Subsystem->IsComputingMetrics()) return Subsystem->GetMetricsProgress();
+					return Subsystem->GetProgress();
+				})
+				.FillColorAndOpacity_Lambda([this]
+				{
+					// Blue during capture, amber during metrics scoring
+					if (Subsystem.IsValid() && Subsystem->IsComputingMetrics())
+						return FLinearColor(0.9f, 0.65f, 0.1f);
+					return FLinearColor(0.1f, 0.55f, 0.95f);
+				})
 				.Visibility_Lambda([this]
 				{
-					return (Subsystem.IsValid() && Subsystem->IsBusy()) ? EVisibility::Visible : EVisibility::Collapsed;
+					if (!Subsystem.IsValid()) return EVisibility::Collapsed;
+					return (Subsystem->IsBusy() || Subsystem->IsComputingMetrics()) ? EVisibility::Visible : EVisibility::Collapsed;
 				})
 			]
 

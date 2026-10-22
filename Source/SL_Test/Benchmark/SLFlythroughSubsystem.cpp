@@ -1464,6 +1464,7 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 	}
 
 	bComputingMetrics = true;
+	MetricsProgress = 0.f;
 	MetricsStatus = TEXT("Computing metrics...");
 	OnStateChanged.Broadcast();
 
@@ -1494,8 +1495,16 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 	TArray<FSLMethodSummary> Summaries;
 	TArray<FString> MismatchedMethods;
 
+	const int32 TotalMethodCount = FMath::Max(1, Methods.Num());
+	int32 MethodIndex = 0;
 	for (const FSLFlythroughMethod& Method : Methods)
 	{
+		// Update and broadcast progress at the start of each method slot so the
+		// panel status text and progress bar refresh even though this loop is synchronous.
+		MetricsProgress = (float)MethodIndex / (float)TotalMethodCount;
+		++MethodIndex;
+		OnStateChanged.Broadcast();
+
 		const FString MethodDir = FPaths::Combine(Root, Method.Name);
 		const FString LatestRun = FSLFlythroughMetrics::FindLatestRun(MethodDir);
 		if (LatestRun.IsEmpty() || !FSLFlythroughMetrics::IsRunComplete(LatestRun))
@@ -1587,6 +1596,7 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 	CachedSummaries = Summaries;
 
 	bComputingMetrics = false;
+	MetricsProgress = 1.f;
 	MetricsStatus = FString::Printf(TEXT("Metrics computed for %d methods."), Summaries.Num()) + MismatchNote;
 	OnStateChanged.Broadcast();
 

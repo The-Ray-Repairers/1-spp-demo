@@ -89,6 +89,8 @@ public:
 	// ---- Status ----
 	FText GetStatusText() const;
 	float GetProgress() const;
+	/** 0–1 progress through the current ComputeMetrics pass; 0 when idle. */
+	float GetMetricsProgress() const { return MetricsProgress; }
 	int32 GetCurrentFrame() const { return CurrentFrame; }
 	int32 GetTotalFrames() const { return TotalFrames; }
 
@@ -209,6 +211,7 @@ private:
 
 	// ---- Metrics ----
 	bool bComputingMetrics = false;
+	float MetricsProgress = 0.f;
 	FString MetricsStatus;
 
 	// ---- Summary Cache ----
