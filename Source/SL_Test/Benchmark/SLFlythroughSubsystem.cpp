@@ -1076,6 +1076,22 @@ bool USLFlythroughSubsystem::StartBatch(bool bQuitWhenDone)
 		UE_LOG(LogSL_Test, Warning, TEXT("Flythrough batch: a capture is already running."));
 		return false;
 	}
+	// Reject immediately when hardware ray tracing is unavailable and software fallback is not opted in.
+	// CanStartFlythrough repeats this check per-method during TickBatch, but failing here avoids a
+	// 30-second startup wait and prevents null-pointer crashes that can occur while ticking before
+	// the viewport is fully ready.
+	if (!IsRayTracingEnabled() && CVarSLFlythroughAllowSoftwareFallback.GetValueOnGameThread() == 0)
+	{
+		const FString Msg =
+			TEXT("Flythrough batch: hardware ray tracing was not detected on this machine. ")
+			TEXT("Enable software fallback with \"SL.Flythrough.AllowSoftwareFallback 1\" to run synthetic ")
+			TEXT("pipeline tests, or use a machine with a hardware ray-tracing capable GPU. ")
+			TEXT("Note: software fallback results go to renders/software_fallback/ and are not valid ray-traced benchmarks.");
+		UE_LOG(LogSL_Test, Error, TEXT("%s"), *Msg);
+		if (bQuitWhenDone)
+			FPlatformMisc::RequestExitWithStatus(false, 1);
+		return false;
+	}
 	// GT first so a failed baseline stops the batch before the test methods run.
 	ApplyGTSPP();
 	BatchQueue.Reset();
