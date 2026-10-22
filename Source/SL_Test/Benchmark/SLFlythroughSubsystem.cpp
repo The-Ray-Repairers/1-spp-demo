@@ -1233,9 +1233,13 @@ void USLFlythroughSubsystem::Tick(float DeltaTime)
 	if (bRecording) { TickRecording(); return; }
 	if (bPreviewing)
 	{
-		const auto* Path = GetRecordedPath();
-		const int32 Frame = int32((FPlatformTime::Seconds() - PreviewStartTime) * Path->FPS);
-		if (Frame >= Path->Frames.Num() || !EvaluateSequenceFrame(Frame)) StopPathPreview();
+		if (bPreviewPlaying)
+		{
+			const int32 Frame = PreviewAnchorFrame + int32((FPlatformTime::Seconds() - PreviewStartTime) * GetPathFPS());
+			PreviewFrame = FMath::Min(Frame, TrimEndFrame);
+			if (!EvaluateSequenceFrame(PreviewFrame)) StopPathPreview();
+			else if (Frame >= TrimEndFrame) bPreviewPlaying = false;
+		}
 		return;
 	}
 	if (IsBusy())
@@ -1464,7 +1468,7 @@ void USLFlythroughSubsystem::FinishFlythrough()
 
 FText USLFlythroughSubsystem::GetStatusText() const
 {
-	if (bPreviewing) return FText::FromString(TEXT("Previewing saved camera path."));
+	if (bPreviewing) return FText::FromString(MetricsStatus.IsEmpty() ? TEXT("Scrub to a pose, then set the start and end. Save Trimmed Copy to benchmark that range.") : MetricsStatus);
 	if (bRecording && !MetricsStatus.IsEmpty()) return FText::FromString(MetricsStatus);
 	if (bRecording) return FText::FromString(FString::Printf(TEXT("Recording %s: %.1f s. Close GM to move; reopen to stop and save."),
 		*Recording.Name, Recording.Frames.Num() / 30.0));
@@ -1705,6 +1709,7 @@ void USLFlythroughSubsystem::RefreshPaths()
 {
 	if (!CanChangePath()) return;
 	RecordedPaths.Reset();
+	RecordedPathFiles.Reset();
 	TArray<FString> Files;
 	IFileManager::Get().FindFiles(Files, *FPaths::Combine(RecordedPathsDirectory(), TEXT("*.json")), true, false);
 	Files.Sort();
@@ -1713,9 +1718,13 @@ void USLFlythroughSubsystem::RefreshPaths()
 		FSLRecordedCameraPath Path;
 		if (Path.Load(FPaths::Combine(RecordedPathsDirectory(), File)) && Path.Map == GetBenchmarkMapPackage(GetWorld())
 			&& !RecordedPaths.ContainsByPredicate([&Path](const FSLRecordedCameraPath& P) { return P.Id == Path.Id; }))
+		{
+			RecordedPathFiles.Add(Path.Id, FPaths::ConvertRelativePathToFull(FPaths::Combine(RecordedPathsDirectory(), File)));
 			RecordedPaths.Add(MoveTemp(Path));
+		}
 	}
 	if (!GetRecordedPath()) SelectedPathId.Reset();
+	ResetTrimRange();
 	CurrentRunRoot.Reset();
 	Phase = ESLFlythroughPhase::Idle;
 	RefreshSummaries();
@@ -1727,6 +1736,7 @@ bool USLFlythroughSubsystem::SelectPath(const FString& Id)
 	if (!CanChangePath()) return false;
 	if (!Id.IsEmpty() && !RecordedPaths.ContainsByPredicate([&Id](const FSLRecordedCameraPath& P) { return P.Id == Id; })) return false;
 	SelectedPathId = Id;
+	ResetTrimRange();
 	CurrentRunRoot.Reset();
 	Phase = ESLFlythroughPhase::Idle;
 	MetricsStatus.Reset();
@@ -1839,7 +1849,10 @@ bool USLFlythroughSubsystem::StartPathPreview()
 	if (const auto* Comparison = GetWorld()->GetSubsystem<USLComparisonSubsystem>(); Comparison && Comparison->IsBusy()) return false;
 	if (!SetupCamera()) { ReleaseCamera(); return false; }
 	bPreviewing = true;
-	PreviewStartTime = FPlatformTime::Seconds();
+	MetricsStatus.Reset();
+	PreviewFrame = TrimStartFrame;
+	bPreviewPlaying = false;
+	if (!SeekPreviewFrame(PreviewFrame)) { StopPathPreview(); return false; }
 	OnStateChanged.Broadcast();
 	return true;
 }
@@ -1849,6 +1862,114 @@ void USLFlythroughSubsystem::StopPathPreview()
 	if (!bPreviewing) return;
 	ReleaseCamera();
 	bPreviewing = false;
+	bPreviewPlaying = false;
 	MetricsStatus = TEXT("Camera preview finished.");
 	OnStateChanged.Broadcast();
+}
+
+int32 USLFlythroughSubsystem::GetPathFrameCount() const
+{
+	const auto* Path = GetRecordedPath();
+	return Path ? Path->Frames.Num() : 0;
+}
+
+int32 USLFlythroughSubsystem::GetPathFPS() const
+{
+	const auto* Path = GetRecordedPath();
+	return Path ? Path->FPS : 30;
+}
+
+bool USLFlythroughSubsystem::SeekPreviewFrame(int32 Frame)
+{
+	if (!bPreviewing || Frame < 0 || Frame >= GetPathFrameCount()) return false;
+	bPreviewPlaying = false;
+	PreviewFrame = Frame;
+	return EvaluateSequenceFrame(Frame);
+}
+
+void USLFlythroughSubsystem::TogglePreviewPlayback()
+{
+	if (!bPreviewing) return;
+	if (bPreviewPlaying) { bPreviewPlaying = false; return; }
+	if (PreviewFrame < TrimStartFrame || PreviewFrame >= TrimEndFrame) PreviewFrame = TrimStartFrame;
+	if (!EvaluateSequenceFrame(PreviewFrame)) { StopPathPreview(); return; }
+	PreviewAnchorFrame = PreviewFrame;
+	PreviewStartTime = FPlatformTime::Seconds();
+	bPreviewPlaying = true;
+}
+
+bool USLFlythroughSubsystem::SetTrimStartAtPreview()
+{
+	if (!bPreviewing || PreviewFrame >= TrimEndFrame) return false;
+	bPreviewPlaying = false;
+	TrimStartFrame = PreviewFrame;
+	return true;
+}
+
+bool USLFlythroughSubsystem::SetTrimEndAtPreview()
+{
+	if (!bPreviewing || PreviewFrame <= TrimStartFrame) return false;
+	bPreviewPlaying = false;
+	TrimEndFrame = PreviewFrame;
+	return true;
+}
+
+void USLFlythroughSubsystem::ResetTrimRange()
+{
+	if (!CanChangePath() && !bPreviewing) return;
+	bPreviewPlaying = false;
+	TrimStartFrame = 0;
+	TrimEndFrame = FMath::Max(0, GetPathFrameCount() - 1);
+	if (!bPreviewing) PreviewFrame = 0;
+}
+
+bool USLFlythroughSubsystem::SaveTrimmedPath()
+{
+	if (!bPreviewing) return false;
+	bPreviewPlaying = false;
+	const auto* Path = GetRecordedPath();
+	FSLRecordedCameraPath Trimmed;
+	if (!Path || !Path->MakeTrimmedCopy(TrimStartFrame, TrimEndFrame, Trimmed)) return false;
+	IFileManager::Get().MakeDirectory(*RecordedPathsDirectory(), true);
+	if (!Trimmed.Save(FPaths::Combine(RecordedPathsDirectory(), Trimmed.Id + TEXT(".json"))))
+	{
+		MetricsStatus = TEXT("Could not save trimmed path. Check Saved/BenchmarkPaths is writable and retry.");
+		return false;
+	}
+	StopPathPreview();
+	RefreshPaths();
+	SelectPath(Trimmed.Id);
+	MetricsStatus = TEXT("Trimmed copy saved and selected. Render GT and methods for this path.");
+	OnStateChanged.Broadcast();
+	return true;
+}
+
+bool USLFlythroughSubsystem::DeleteSelectedPath()
+{
+	if (!CanChangePath() || !GetRecordedPath()) return false;
+	const FString* Source = RecordedPathFiles.Find(SelectedPathId);
+	const FString Directory = FPaths::ConvertRelativePathToFull(RecordedPathsDirectory());
+	FSLRecordedCameraPath OnDisk;
+	// Only act on the discovered file, and reject files replaced since the last refresh.
+	if (!Source || !FPaths::IsUnderDirectory(*Source, Directory)
+		|| !OnDisk.Load(*Source) || OnDisk.Id != SelectedPathId || OnDisk.Map != GetBenchmarkMapPackage(GetWorld()))
+	{
+		MetricsStatus = TEXT("The recording file is missing or changed. Refresh Camera Paths before deleting.");
+		return false;
+	}
+	const FString DeletedDirectory = FPaths::Combine(Directory, TEXT("Deleted"));
+	const FString Destination = FPaths::Combine(DeletedDirectory,
+		FPaths::GetBaseFilename(*Source) + TEXT("_") + FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT(".json"));
+	if (!IFileManager::Get().MakeDirectory(*DeletedDirectory, true)
+		|| !IFileManager::Get().Move(*Destination, **Source, false, false))
+	{
+		MetricsStatus = TEXT("Could not delete the recording. Check folder permissions and retry.");
+		return false;
+	}
+	const FString Name = GetSelectedPathName();
+	SelectedPathId.Reset();
+	RefreshPaths();
+	MetricsStatus = FString::Printf(TEXT("Deleted '%s'. Recording moved to Saved/BenchmarkPaths/Deleted; rendered results retained."), *Name);
+	OnStateChanged.Broadcast();
+	return true;
 }

@@ -121,7 +121,9 @@ bool FSLRecordedPathViewTest::RunTest(const FString& Parameters)
 	PC->PlayerCameraManager->UpdateCamera(0.f);
 	const FVector OriginalView = PC->PlayerCameraManager->GetCameraCacheView().Location;
 	FSLRecordedCameraPath Path;
-	Path.Id = TEXT("view-test");
+	Path.Id = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	Path.Name = TEXT("Preview trim fixture");
+	Path.Map = World->GetOutermost()->GetName();
 	Path.Frames.SetNum(2);
 	Path.Frames[0].Position = FVector(100, 200, 300);
 	Path.Frames[0].Rotation = FRotator(15, 35, 0).Quaternion();
@@ -147,6 +149,157 @@ bool FSLRecordedPathViewTest::RunTest(const FString& Parameters)
 		TestTrue(TEXT("Player viewport uses recorded pose"), PlayerLocation.Equals(Expected.Position, 0.001));
 		TestFalse(TEXT("View no longer stuck at original pose"), PlayerLocation.Equals(OriginalView));
 	}
+	// Editing can scrub outside the selected range, but playback honors the range.
+	Subsystem->RecordedPaths[0].Frames.Add(Path.Frames[0]);
+	Subsystem->ResetTrimRange();
+	Subsystem->bPreviewing = true;
+	TestTrue(TEXT("Scrub updates preview"), Subsystem->SeekPreviewFrame(1));
+	TestTrue(TEXT("Mark start"), Subsystem->SetTrimStartAtPreview());
+	TestTrue(TEXT("Scrub endpoint"), Subsystem->SeekPreviewFrame(2));
+	TestTrue(TEXT("Mark end"), Subsystem->SetTrimEndAtPreview());
+	TestTrue(TEXT("Scrub full source outside selected range"), Subsystem->SeekPreviewFrame(0));
+	TestFalse(TEXT("Reject inverted range"), Subsystem->SetTrimEndAtPreview());
+	TestEqual(TEXT("Rejected mark preserves end"), Subsystem->GetTrimEndFrame(), 2);
+	TestFalse(TEXT("Reject out of bounds seek"), Subsystem->SeekPreviewFrame(3));
+	Subsystem->TogglePreviewPlayback();
+	TestEqual(TEXT("Playback starts inside selected range"), Subsystem->GetPreviewFrame(), 1);
+	Subsystem->PreviewStartTime -= 1.0;
+	Subsystem->Tick(0.f);
+	TestTrue(TEXT("Preview stays open at end for editing"), Subsystem->IsPreviewing());
+	TestFalse(TEXT("Playback pauses at end"), Subsystem->IsPreviewPlaying());
+	TestEqual(TEXT("Playback holds selected endpoint"), Subsystem->GetPreviewFrame(), 2);
+	TestTrue(TEXT("Held pose reaches camera cache"), PC->PlayerCameraManager->GetCameraCacheView().Location.Equals(Path.Frames[0].Position));
+	Subsystem->ResetTrimRange();
+	TestEqual(TEXT("Reset restores original start"), Subsystem->GetTrimStartFrame(), 0);
+	Subsystem->SeekPreviewFrame(1);
+	Subsystem->SetTrimStartAtPreview();
+	const FString OriginalRoot = Subsystem->GetRendersRoot();
+	const bool bSaved = Subsystem->SaveTrimmedPath();
+	TestTrue(TEXT("Save trimmed preview through subsystem"), bSaved);
+	if (bSaved)
+	{
+		TestFalse(TEXT("Saving closes preview"), Subsystem->IsPreviewing());
+		TestEqual(TEXT("Saved copy is selected with retained frames"), Subsystem->GetPathFrameCount(), 2);
+		TestTrue(TEXT("Saved copy has its own results root"), OriginalRoot != Subsystem->GetRendersRoot());
+		TestFalse(TEXT("Saved copy requires a new GT"), Subsystem->HasGTBaseline());
+		if (const auto* Saved = Subsystem->GetRecordedPath())
+			IFileManager::Get().Delete(*FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("BenchmarkPaths"), Saved->Id + TEXT(".json")));
+	}
+	Subsystem->bPreviewing = false;
+	World->DestroyWorld(false);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSLRecordedPathTrimTest, "SL.Flythrough.RecordedPathTrim",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FSLRecordedPathTrimTest::RunTest(const FString& Parameters)
+{
+	FSLRecordedCameraPath Source;
+	Source.Id = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	Source.Name = TEXT("Trim fixture");
+	Source.Map = TEXT("/Game/TestScene");
+	Source.FPS = 24;
+	Source.Frames.SetNum(6);
+	for (int32 I = 0; I < 6; ++I)
+	{
+		Source.Frames[I].Position = FVector(I * 10, I, 50);
+		Source.Frames[I].FOV = 60 + I;
+	}
+	FSLRecordedCameraPath Trimmed;
+	TestTrue(TEXT("Trim inclusive range"), Source.MakeTrimmedCopy(2, 4, Trimmed));
+	TestEqual(TEXT("Both endpoints included"), Trimmed.Frames.Num(), 3);
+	TestEqual(TEXT("Source samples preserved"), Source.Frames.Num(), 6);
+	TestTrue(TEXT("Independent path identity"), Trimmed.Id != Source.Id);
+	TestEqual(TEXT("FPS preserved"), Trimmed.FPS, 24);
+	TestEqual(TEXT("Map preserved"), Trimmed.Map, Source.Map);
+	if (Trimmed.Frames.Num() == 3)
+	{
+		TestTrue(TEXT("Exact start pose"), Trimmed.Frames[0].Position == Source.Frames[2].Position);
+		TestTrue(TEXT("Exact end pose"), Trimmed.Frames[2].Position == Source.Frames[4].Position);
+		TestEqual(TEXT("Exact lens"), Trimmed.Frames[2].FOV, Source.Frames[4].FOV);
+	}
+	const FString Id = Trimmed.Id;
+	TestFalse(TEXT("Negative start rejected"), Source.MakeTrimmedCopy(-1, 4, Trimmed));
+	TestFalse(TEXT("Out of range end rejected"), Source.MakeTrimmedCopy(2, 6, Trimmed));
+	TestFalse(TEXT("Single frame rejected"), Source.MakeTrimmedCopy(2, 2, Trimmed));
+	TestFalse(TEXT("Reversed range rejected"), Source.MakeTrimmedCopy(4, 2, Trimmed));
+	TestEqual(TEXT("Rejected edit leaves output untouched"), Trimmed.Id, Id);
+	const FString File = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("TrimTest_") + Id + TEXT(".json"));
+	TestTrue(TEXT("Save trimmed recording"), Trimmed.Save(File));
+	FSLRecordedCameraPath Loaded;
+	TestTrue(TEXT("Load trimmed recording"), Loaded.Load(File));
+	TestEqual(TEXT("Saved trimmed frame count"), Loaded.Frames.Num(), 3);
+	IFileManager::Get().Delete(*File);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSLRecordedPathDeleteTest, "SL.Flythrough.RecordedPathDelete",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FSLRecordedPathDeleteTest::RunTest(const FString& Parameters)
+{
+	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false);
+	if (!TestNotNull(TEXT("World"), World)) return false;
+	auto* Subsystem = NewObject<USLFlythroughSubsystem>(World);
+	FSLRecordedCameraPath A;
+	A.Id = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	A.Name = TEXT("Delete fixture");
+	A.Map = World->GetOutermost()->GetName();
+	A.Frames.SetNum(2);
+	FSLRecordedCameraPath B = A;
+	B.Id = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("BenchmarkPaths"));
+	const FString ImportedName = TEXT("DeleteTest_") + A.Id;
+	const FString FileA = FPaths::Combine(Directory, ImportedName + TEXT(".json"));
+	const FString FileB = FPaths::Combine(Directory, B.Id + TEXT(".json"));
+	IFileManager::Get().MakeDirectory(*Directory, true);
+	TestTrue(TEXT("Save import with filename different from ID"), A.Save(FileA));
+	TestTrue(TEXT("Save unrelated recording"), B.Save(FileB));
+	Subsystem->RefreshPaths();
+	TestFalse(TEXT("Cannot delete Level Sequence selection"), Subsystem->DeleteSelectedPath());
+	TestTrue(TEXT("Select imported recording"), Subsystem->SelectPath(A.Id));
+	for (bool* BusyFlag : {&Subsystem->bRecording, &Subsystem->bPreviewing, &Subsystem->bBatchActive, &Subsystem->bComputingMetrics})
+	{
+		*BusyFlag = true;
+		TestFalse(TEXT("Deletion blocked during active operation"), Subsystem->DeleteSelectedPath());
+		*BusyFlag = false;
+	}
+	Subsystem->Phase = ESLFlythroughPhase::Rendering;
+	TestFalse(TEXT("Deletion blocked during capture"), Subsystem->DeleteSelectedPath());
+	Subsystem->Phase = ESLFlythroughPhase::Idle;
+	const FString Root = Subsystem->GetRendersRoot();
+	const FString Sentinel = FPaths::Combine(Root, TEXT("delete_test_sentinel.txt"));
+	IFileManager::Get().MakeDirectory(*Root, true);
+	TestTrue(TEXT("Create result sentinel"), FFileHelper::SaveStringToFile(TEXT("keep"), *Sentinel));
+	TestTrue(TEXT("Delete selected import"), Subsystem->DeleteSelectedPath());
+	TestFalse(TEXT("Original file removed"), IFileManager::Get().FileExists(*FileA));
+	TestTrue(TEXT("Other recording retained"), IFileManager::Get().FileExists(*FileB));
+	TestTrue(TEXT("Results retained"), IFileManager::Get().FileExists(*Sentinel));
+	TestFalse(TEXT("Selection reset"), Subsystem->HasRecordedPath());
+	TestFalse(TEXT("Deleted path unavailable"), Subsystem->SelectPath(A.Id));
+	TArray<FString> Archived;
+	const FString DeletedDirectory = FPaths::Combine(Directory, TEXT("Deleted"));
+	IFileManager::Get().FindFiles(Archived, *FPaths::Combine(DeletedDirectory, ImportedName + TEXT("_*.json")), true, false);
+	TestEqual(TEXT("One recoverable recording"), Archived.Num(), 1);
+	if (Archived.Num() == 1)
+	{
+		const FString Archive = FPaths::Combine(DeletedDirectory, Archived[0]);
+		FSLRecordedCameraPath Recovered;
+		TestTrue(TEXT("Archive retains valid recording"), Recovered.Load(Archive));
+		TestEqual(TEXT("Archive retains ID"), Recovered.Id, A.Id);
+		TestTrue(TEXT("Restore recording"), IFileManager::Get().Move(*FileA, *Archive, false, false));
+		Subsystem->RefreshPaths();
+		TestTrue(TEXT("Restored recording selectable"), Subsystem->SelectPath(A.Id));
+		TestEqual(TEXT("Restored recording reuses results root"), Subsystem->GetRendersRoot(), Root);
+	}
+	Subsystem->SelectPath(B.Id);
+	IFileManager::Get().Delete(*FileB);
+	TestFalse(TEXT("Missing file deletion fails safely"), Subsystem->DeleteSelectedPath());
+	TestTrue(TEXT("Failed deletion preserves selection"), Subsystem->HasRecordedPath());
+	IFileManager::Get().Delete(*FileA);
+	IFileManager::Get().Delete(*Sentinel);
+	IFileManager::Get().DeleteDirectory(*Root, false, false);
 	World->DestroyWorld(false);
 	return true;
 }

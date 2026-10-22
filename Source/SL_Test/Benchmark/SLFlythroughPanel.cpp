@@ -8,6 +8,7 @@
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SSlider.h"
 #include "Widgets/Input/SComboButton.h"
 #include "Widgets/Input/SEditableTextBox.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
@@ -350,6 +351,13 @@ public:
 			]
 			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
 			[
+				SNew(SButton).Text(FText::FromString(TEXT("Delete Selected Path")))
+				.IsEnabled_Lambda([this] { return Subsystem.IsValid() && Subsystem->CanChangePath() && Subsystem->HasRecordedPath(); })
+				.ToolTipText(FText::FromString(TEXT("Remove this recording from the list. Its file is kept in Saved/BenchmarkPaths/Deleted for recovery; rendered results are retained.")))
+				.OnClicked_Lambda([this] { if (Subsystem.IsValid()) Subsystem->DeleteSelectedPath(); return FReply::Handled(); })
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+			[
 				SAssignNew(PathName, SEditableTextBox)
 				.HintText(FText::FromString(TEXT("Name for new camera path")))
 				.IsEnabled_Lambda([this] { return Subsystem.IsValid() && Subsystem->CanChangePath(); })
@@ -391,8 +399,8 @@ public:
 			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
 			[
 				SNew(SButton)
-				.Text_Lambda([this] { return FText::FromString(Subsystem.IsValid() && Subsystem->IsPreviewing() ? TEXT("Stop Preview") : TEXT("Preview Recorded Path")); })
-				.IsEnabled_Lambda([this] { return Subsystem.IsValid() && (Subsystem->CanChangePath() || Subsystem->IsPreviewing()); })
+				.Text_Lambda([this] { return FText::FromString(Subsystem.IsValid() && Subsystem->IsPreviewing() ? TEXT("Close Preview") : TEXT("Preview / Trim Recorded Path")); })
+				.IsEnabled_Lambda([this] { return Subsystem.IsValid() && ((Subsystem->CanChangePath() && Subsystem->HasRecordedPath()) || Subsystem->IsPreviewing()); })
 				.OnClicked_Lambda([this]
 				{
 					if (Subsystem.IsValid())
@@ -402,6 +410,84 @@ public:
 					}
 					return FReply::Handled();
 				})
+			]
+
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+			[
+				SNew(SVerticalBox)
+				.Visibility_Lambda([this] { return Subsystem.IsValid() && Subsystem->IsPreviewing() ? EVisibility::Visible : EVisibility::Collapsed; })
+				+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+				[
+					SNew(STextBlock).AutoWrapText(true).Text_Lambda([this]
+					{
+						if (!Subsystem.IsValid()) return FText::GetEmpty();
+						const double FPS = Subsystem->GetPathFPS();
+						return FText::FromString(FString::Printf(TEXT("Pose %d / %d (%.3f s) | Start %.3f s | End %.3f s | %d frames retained"),
+							Subsystem->GetPreviewFrame(), FMath::Max(0, Subsystem->GetPathFrameCount() - 1), Subsystem->GetPreviewFrame() / FPS,
+							Subsystem->GetTrimStartFrame() / FPS, Subsystem->GetTrimEndFrame() / FPS,
+							Subsystem->GetTrimEndFrame() - Subsystem->GetTrimStartFrame() + 1));
+					})
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+				[
+					SNew(SSlider)
+					.Value_Lambda([this] { return Subsystem.IsValid() ? float(Subsystem->GetPreviewFrame()) / FMath::Max(1, Subsystem->GetPathFrameCount() - 1) : 0.f; })
+					.OnValueChanged_Lambda([this](float Value)
+					{
+						if (Subsystem.IsValid()) Subsystem->SeekPreviewFrame(FMath::RoundToInt(Value * (Subsystem->GetPathFrameCount() - 1)));
+					})
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+				[
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot().FillWidth(1)
+					[
+						SNew(SButton).Text(FText::FromString(TEXT("Previous Frame")))
+						.IsEnabled_Lambda([this] { return Subsystem.IsValid() && Subsystem->GetPreviewFrame() > 0; })
+						.OnClicked_Lambda([this] { if (Subsystem.IsValid()) Subsystem->SeekPreviewFrame(Subsystem->GetPreviewFrame() - 1); return FReply::Handled(); })
+					]
+					+ SHorizontalBox::Slot().FillWidth(1).Padding(4, 0)
+					[
+						SNew(SButton).Text_Lambda([this] { return FText::FromString(Subsystem.IsValid() && Subsystem->IsPreviewPlaying() ? TEXT("Pause") : TEXT("Play Selected Range")); })
+						.OnClicked_Lambda([this] { if (Subsystem.IsValid()) Subsystem->TogglePreviewPlayback(); return FReply::Handled(); })
+					]
+					+ SHorizontalBox::Slot().FillWidth(1)
+					[
+						SNew(SButton).Text(FText::FromString(TEXT("Next Frame")))
+						.IsEnabled_Lambda([this] { return Subsystem.IsValid() && Subsystem->GetPreviewFrame() < Subsystem->GetPathFrameCount() - 1; })
+						.OnClicked_Lambda([this] { if (Subsystem.IsValid()) Subsystem->SeekPreviewFrame(Subsystem->GetPreviewFrame() + 1); return FReply::Handled(); })
+					]
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+				[
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot().FillWidth(1)
+					[
+						SNew(SButton).Text(FText::FromString(TEXT("Set Start Here")))
+						.IsEnabled_Lambda([this] { return Subsystem.IsValid() && Subsystem->GetPreviewFrame() < Subsystem->GetTrimEndFrame(); })
+						.OnClicked_Lambda([this] { if (Subsystem.IsValid()) Subsystem->SetTrimStartAtPreview(); return FReply::Handled(); })
+					]
+					+ SHorizontalBox::Slot().FillWidth(1).Padding(4, 0)
+					[
+						SNew(SButton).Text(FText::FromString(TEXT("Set End Here")))
+						.IsEnabled_Lambda([this] { return Subsystem.IsValid() && Subsystem->GetPreviewFrame() > Subsystem->GetTrimStartFrame(); })
+						.OnClicked_Lambda([this] { if (Subsystem.IsValid()) Subsystem->SetTrimEndAtPreview(); return FReply::Handled(); })
+					]
+					+ SHorizontalBox::Slot().FillWidth(1)
+					[
+						SNew(SButton).Text(FText::FromString(TEXT("Reset Range")))
+						.OnClicked_Lambda([this] { if (Subsystem.IsValid()) Subsystem->ResetTrimRange(); return FReply::Handled(); })
+					]
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+				[
+					SNew(SButton).Text(FText::FromString(TEXT("Save Trimmed Copy")))
+					.OnClicked_Lambda([this] { if (Subsystem.IsValid()) Subsystem->SaveTrimmedPath(); return FReply::Handled(); })
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+				[
+					SNew(STextBlock).AutoWrapText(true).Text(FText::FromString(TEXT("Scrub the full recording or step one frame at a time. Both start and end poses are included. Save to create and select the trimmed benchmark path; the original stays available.")))
+				]
 			]
 
 			// ---- Method Selector ----

@@ -22,6 +22,8 @@ struct FSLRecordedCameraPath
 
 	bool Save(const FString& Filename) const;
 	bool Load(const FString& Filename);
+	/** Inclusive endpoints; retains exact samples and leaves the source untouched. */
+	bool MakeTrimmedCopy(int32 StartFrame, int32 EndFrame, FSLRecordedCameraPath& OutPath) const;
 	static FSLRecordedCameraSample Interpolate(const FSLRecordedCameraSample& A,
 		const FSLRecordedCameraSample& B, double Alpha);
 };

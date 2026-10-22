@@ -87,10 +87,25 @@ public:
 	const TArray<FSLRecordedCameraPath>& GetRecordedPaths() const { return RecordedPaths; }
 	FString GetSelectedPathName() const;
 	bool SelectPath(const FString& Id);
+	/** Remove the selected recording from the list; retain its file in Deleted for recovery. */
+	bool DeleteSelectedPath();
 	bool CanChangePath() const { return !IsBusy() && !bBatchActive && !bComputingMetrics && !bRecording && !bPreviewing; }
 	bool StartPathPreview();
 	void StopPathPreview();
 	bool IsPreviewing() const { return bPreviewing; }
+	bool HasRecordedPath() const { return GetRecordedPath() != nullptr; }
+	bool IsPreviewPlaying() const { return bPreviewPlaying; }
+	void TogglePreviewPlayback();
+	bool SeekPreviewFrame(int32 Frame);
+	int32 GetPreviewFrame() const { return PreviewFrame; }
+	int32 GetPathFrameCount() const;
+	int32 GetPathFPS() const;
+	int32 GetTrimStartFrame() const { return TrimStartFrame; }
+	int32 GetTrimEndFrame() const { return TrimEndFrame; }
+	bool SetTrimStartAtPreview();
+	bool SetTrimEndAtPreview();
+	void ResetTrimRange();
+	bool SaveTrimmedPath();
 	bool StartRecording(const FString& Name);
 	bool StopRecording();
 	void DiscardRecording();
@@ -136,6 +151,7 @@ public:
 
 private:
 	friend class FSLRecordedPathViewTest;
+	friend class FSLRecordedPathDeleteTest;
 	const FSLRecordedCameraPath* GetRecordedPath() const;
 	FString GetPathFolder() const;
 	void TickRecording();
@@ -148,6 +164,11 @@ private:
 	bool bRecording = false;
 	bool bSpawnedPlaybackCamera = false;
 	bool bPreviewing = false;
+	bool bPreviewPlaying = false;
+	int32 PreviewFrame = 0;
+	int32 PreviewAnchorFrame = 0;
+	int32 TrimStartFrame = 0;
+	int32 TrimEndFrame = 0;
 	double PreviewStartTime = 0;
 	void RefreshSummariesForRoot(const FString& RendersRoot);
 	void RegisterMethods();
@@ -246,4 +267,6 @@ private:
 	// ---- Summary Cache ----
 	TArray<FSLMethodSummary> CachedSummaries;
 	TSet<FString> CompletedMethods;
+	/** Files discovered on disk, including imports whose filename differs from their ID. */
+	TMap<FString, FString> RecordedPathFiles;
 };

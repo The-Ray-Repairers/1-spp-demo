@@ -4,6 +4,19 @@
 #include "Misc/FileHelper.h"
 #include "HAL/FileManager.h"
 
+bool FSLRecordedCameraPath::MakeTrimmedCopy(int32 StartFrame, int32 EndFrame, FSLRecordedCameraPath& OutPath) const
+{
+	if (StartFrame < 0 || EndFrame <= StartFrame || !Frames.IsValidIndex(EndFrame)) return false;
+	FSLRecordedCameraPath Copy;
+	Copy.Id = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	Copy.Name = Name + TEXT(" (trimmed)");
+	Copy.Map = Map;
+	Copy.FPS = FPS;
+	Copy.Frames.Append(Frames.GetData() + StartFrame, EndFrame - StartFrame + 1);
+	OutPath = MoveTemp(Copy);
+	return true;
+}
+
 FSLRecordedCameraSample FSLRecordedCameraPath::Interpolate(const FSLRecordedCameraSample& A,
 	const FSLRecordedCameraSample& B, double Alpha)
 {
