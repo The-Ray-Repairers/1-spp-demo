@@ -133,11 +133,13 @@ void USLFlythroughSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
 	RegisterMethods();
-	RefreshSummaries();
+	RefreshPaths();
 }
 
 void USLFlythroughSubsystem::Deinitialize()
 {
+	if (bPreviewing) StopPathPreview();
+	if (bRecording) DiscardRecording();
 	if (IsBusy()) CancelFlythrough();
 	Super::Deinitialize();
 }
@@ -258,7 +260,7 @@ FString USLFlythroughSubsystem::GetRendersRoot() const
 	const FString ModeRoot = IsUsingSoftwareFallback() ? FPaths::Combine(Root, TEXT("software_fallback")) : Root;
 	ASLFlythroughScenario* Scenario = nullptr;
 	FText Reason;
-	return ResolveScenario(Scenario, Reason) ? FPaths::Combine(ModeRoot, GetScenarioFolder(GetWorld(), Scenario)) : ModeRoot;
+	return ResolveScenario(Scenario, Reason) ? FPaths::Combine(ModeRoot, GetPathFolder()) : ModeRoot;
 }
 
 bool USLFlythroughSubsystem::IsUsingSoftwareFallback() const
@@ -346,6 +348,7 @@ void USLFlythroughSubsystem::RefreshSummariesForRoot(const FString& RendersRoot)
 bool USLFlythroughSubsystem::ResolveScenario(ASLFlythroughScenario*& OutScenario, FText& Reason) const
 {
 	OutScenario = nullptr;
+	if (GetRecordedPath()) return true;
 	for (TActorIterator<ASLFlythroughScenario> It(GetWorld()); It; ++It)
 	{
 		if (OutScenario)
@@ -476,19 +479,34 @@ bool USLFlythroughSubsystem::ValidateSequenceBindings(FText& Reason)
 
 bool USLFlythroughSubsystem::EvaluateSequenceFrame(int32 FrameIndex)
 {
-	const FFrameTime Position(SequenceStartFrame + FrameIndex);
-	// A stopped player's Jump flushes synchronously unless it is queued as a latent action
-	// during another evaluation. Check the cursor so a deferred update cannot be captured.
-	SequencePlayer->SetPlaybackPosition(FMovieSceneSequencePlaybackParams(Position, EUpdatePositionMethod::Jump));
-	if (SequencePlayer->GetCurrentTime().Time != Position)
+	if (const auto* Path = GetRecordedPath())
 	{
-		UE_LOG(LogSL_Test, Error, TEXT("Flythrough: Sequence did not evaluate display frame %d."), Position.FrameNumber.Value);
-		return false;
+		if (!FlythroughCamera || !Path->Frames.IsValidIndex(FrameIndex)) return false;
+		const auto& Frame = Path->Frames[FrameIndex];
+		FlythroughCamera->SetActorLocationAndRotation(Frame.Position, Frame.Rotation);
+		auto* Camera = FlythroughCamera->GetCameraComponent();
+		Camera->FieldOfView = Frame.FOV;
+		Camera->AspectRatio = Frame.AspectRatio;
+		Camera->bConstrainAspectRatio = Frame.bConstrainAspectRatio;
+	}
+	else
+	{
+		const FFrameTime Position(SequenceStartFrame + FrameIndex);
+		// Jump evaluates synchronously unless queued during another sequence evaluation.
+		SequencePlayer->SetPlaybackPosition(FMovieSceneSequencePlaybackParams(Position, EUpdatePositionMethod::Jump));
+		if (SequencePlayer->GetCurrentTime().Time != Position)
+		{
+			UE_LOG(LogSL_Test, Error, TEXT("Flythrough: Sequence did not evaluate display frame %d."), Position.FrameNumber.Value);
+			return false;
+		}
 	}
 	// Camera property tracks may write post-process settings; keep the method's SPP override pinned.
 	auto& PP = FlythroughCamera->GetCameraComponent()->PostProcessSettings;
 	PP.bOverride_PathTracingSamplesPerPixel = true;
 	PP.PathTracingSamplesPerPixel = TargetSPP;
+	// Gameplay is paused during capture. Moving the actor alone leaves the rendered
+	// view cached at the player's last pose. Both path sources must publish each
+	// evaluated pose/lens to the camera manager before capture or preview.
 	GetWorld()->GetFirstPlayerController()->PlayerCameraManager->UpdateCamera(0.f);
 	return true;
 }
@@ -592,9 +610,11 @@ void USLFlythroughSubsystem::RestoreSettings()
 bool USLFlythroughSubsystem::SetupCamera()
 {
 	auto* PC = GetWorld()->GetFirstPlayerController();
-	if (!PC || !PC->PlayerCameraManager || !ActiveScenario) return false;
+	if (!PC || !PC->PlayerCameraManager || (!ActiveScenario && !GetRecordedPath())) return false;
 
-	FlythroughCamera = ActiveScenario->Camera;
+	bSpawnedPlaybackCamera = GetRecordedPath() != nullptr;
+	FlythroughCamera = bSpawnedPlaybackCamera ? GetWorld()->SpawnActor<ACameraActor>() : ActiveScenario->Camera.Get();
+	if (!FlythroughCamera) return false;
 	const UCameraComponent* CameraComponent = FlythroughCamera->GetCameraComponent();
 	SavedCameraPostProcessSettings = CameraComponent->PostProcessSettings;
 	SavedCameraActorTransform = FlythroughCamera->GetActorTransform();
@@ -605,21 +625,24 @@ bool USLFlythroughSubsystem::SetupCamera()
 	bSavedCameraConstrainAspectRatio = CameraComponent->bConstrainAspectRatio;
 	PreviousViewTarget = PC->GetViewTarget();
 	bWasPaused = PC->IsPaused();
-	FMovieSceneSequencePlaybackSettings Settings;
-	Settings.bDisableCameraCuts = true;
-	// Restore KeepState sections too. Play() normally enables this capture, but the benchmark only jumps.
-	Settings.FinishCompletionStateOverride = EMovieSceneCompletionModeOverride::ForceRestoreState;
-	ALevelSequenceActor* CreatedActor = nullptr;
-	SequencePlayer = ULevelSequencePlayer::CreateLevelSequencePlayer(GetWorld(), ActiveScenario->Sequence, Settings, CreatedActor);
-	SequenceActor = CreatedActor;
-	if (!SequencePlayer || !SequenceActor)
+	if (!bSpawnedPlaybackCamera)
 	{
-		MetricsStatus = TEXT("Unable to create a player for the scenario Sequence.");
-		return false;
+		FMovieSceneSequencePlaybackSettings Settings;
+		Settings.bDisableCameraCuts = true;
+		// Restore KeepState sections too. Play() normally enables this capture, but the benchmark only jumps.
+		Settings.FinishCompletionStateOverride = EMovieSceneCompletionModeOverride::ForceRestoreState;
+		ALevelSequenceActor* CreatedActor = nullptr;
+		SequencePlayer = ULevelSequencePlayer::CreateLevelSequencePlayer(GetWorld(), ActiveScenario->Sequence, Settings, CreatedActor);
+		SequenceActor = CreatedActor;
+		if (!SequencePlayer || !SequenceActor)
+		{
+			MetricsStatus = TEXT("Unable to create a player for the scenario Sequence.");
+			return false;
+		}
+		SequencePlayer->GetEvaluationTemplate().EnableGlobalPreAnimatedStateCapture();
+		TArray<AActor*> CameraBinding{FlythroughCamera};
+		SequenceActor->SetBindingByTag(ActiveScenario->CameraBindingTag, CameraBinding, false);
 	}
-	SequencePlayer->GetEvaluationTemplate().EnableGlobalPreAnimatedStateCapture();
-	TArray<AActor*> CameraBinding{FlythroughCamera};
-	SequenceActor->SetBindingByTag(ActiveScenario->CameraBindingTag, CameraBinding, false);
 	PC->SetViewTarget(FlythroughCamera);
 	PC->SetPause(true);
 	FText BindingReason;
@@ -628,7 +651,7 @@ bool USLFlythroughSubsystem::SetupCamera()
 		MetricsStatus = TEXT("The scenario Sequence did not evaluate its first frame.");
 		return false;
 	}
-	if (!ValidateSequenceBindings(BindingReason))
+	if (!bSpawnedPlaybackCamera && !ValidateSequenceBindings(BindingReason))
 	{
 		MetricsStatus = BindingReason.ToString();
 		return false;
@@ -664,6 +687,8 @@ void USLFlythroughSubsystem::ReleaseCamera()
 		CameraComponent->OrthoWidth = SavedCameraOrthoWidth;
 		CameraComponent->bConstrainAspectRatio = bSavedCameraConstrainAspectRatio;
 		CameraComponent->PostProcessSettings = SavedCameraPostProcessSettings;
+		if (bSpawnedPlaybackCamera) FlythroughCamera->Destroy();
+		bSpawnedPlaybackCamera = false;
 		FlythroughCamera = nullptr;
 		PreviousViewTarget = nullptr;
 	}
@@ -692,6 +717,8 @@ void USLFlythroughSubsystem::ReleaseCamera()
 
 bool USLFlythroughSubsystem::CanStartFlythrough(FText& Reason) const
 {
+	if (bPreviewing) { Reason = FText::FromString(TEXT("Stop the camera preview first.")); return false; }
+	if (bRecording) { Reason = FText::FromString(TEXT("Stop recording before capturing.")); return false; }
 	if (IsBusy())
 	{
 		Reason = FText::FromString(TEXT("A flythrough is already in progress."));
@@ -867,14 +894,23 @@ bool USLFlythroughSubsystem::StartFlythrough()
 	ASLFlythroughScenario* Scenario = nullptr;
 	if (!ResolveScenario(Scenario, ScenarioReason)) return false;
 	ActiveScenario = Scenario;
-	const UMovieScene* MovieScene = ActiveScenario->Sequence->GetMovieScene();
-	TargetFPS = MovieScene->GetDisplayRate().Numerator;
-	const TRange<FFrameNumber> PlaybackRange = MovieScene->GetPlaybackRange();
-	SequenceStartFrame = FFrameRate::TransformTime(FFrameTime(PlaybackRange.GetLowerBoundValue()),
-		MovieScene->GetTickResolution(), MovieScene->GetDisplayRate()).CeilToFrame().Value;
-	const int32 EndFrame = FFrameRate::TransformTime(FFrameTime(PlaybackRange.GetUpperBoundValue()),
-		MovieScene->GetTickResolution(), MovieScene->GetDisplayRate()).CeilToFrame().Value;
-	TotalFrames = EndFrame - SequenceStartFrame;
+	if (const auto* Path = GetRecordedPath())
+	{
+		TargetFPS = Path->FPS;
+		SequenceStartFrame = 0;
+		TotalFrames = Path->Frames.Num();
+	}
+	else
+	{
+		const UMovieScene* MovieScene = ActiveScenario->Sequence->GetMovieScene();
+		TargetFPS = MovieScene->GetDisplayRate().Numerator;
+		const TRange<FFrameNumber> PlaybackRange = MovieScene->GetPlaybackRange();
+		SequenceStartFrame = FFrameRate::TransformTime(FFrameTime(PlaybackRange.GetLowerBoundValue()),
+			MovieScene->GetTickResolution(), MovieScene->GetDisplayRate()).CeilToFrame().Value;
+		const int32 EndFrame = FFrameRate::TransformTime(FFrameTime(PlaybackRange.GetUpperBoundValue()),
+			MovieScene->GetTickResolution(), MovieScene->GetDisplayRate()).CeilToFrame().Value;
+		TotalFrames = EndFrame - SequenceStartFrame;
+	}
 	if (TotalFrames <= 0)
 	{
 		ActiveScenario = nullptr;
@@ -888,7 +924,7 @@ bool USLFlythroughSubsystem::StartFlythrough()
 	bSoftwareFallbackRun = !IsRayTracingEnabled() && CVarSLFlythroughAllowSoftwareFallback.GetValueOnGameThread() != 0;
 	const FString DefaultRoot = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectDir(), TEXT("renders")));
 	const FString ModeRoot = bSoftwareFallbackRun ? FPaths::Combine(DefaultRoot, TEXT("software_fallback")) : DefaultRoot;
-	CurrentRunRoot = FPaths::Combine(ModeRoot, GetScenarioFolder(GetWorld(), ActiveScenario));
+	CurrentRunRoot = FPaths::Combine(ModeRoot, GetPathFolder());
 	// Release comparison overlays, view extensions and renderer overrides first.
 	if (auto* Comparison = GetWorld()->GetSubsystem<USLComparisonSubsystem>(); Comparison && Comparison->OwnsRenderer())
 		Comparison->Restore();
@@ -924,9 +960,17 @@ bool USLFlythroughSubsystem::StartFlythrough()
 	Manifest.SPP = Method.SPP;
 	Manifest.DenoiserMethod = Method.DenoiserMethod;
 	Manifest.Map = GetBenchmarkMapPackage(GetWorld());
-	Manifest.CameraPath = ActiveScenario->Sequence->GetPathName();
-	Manifest.CameraParameters = FString::Printf(TEXT("scenario=%s;camera_tag=%s;start_frame=%d"),
-		*ActiveScenario->ScenarioId.ToString(), *ActiveScenario->CameraBindingTag.ToString(), SequenceStartFrame);
+	if (const auto* Path = GetRecordedPath())
+	{
+		Manifest.CameraPath = TEXT("recorded:") + Path->Id;
+		Manifest.CameraParameters = TEXT("recorded_v1;playback=2;perspective;default_camera_postprocess");
+	}
+	else
+	{
+		Manifest.CameraPath = ActiveScenario->Sequence->GetPathName();
+		Manifest.CameraParameters = FString::Printf(TEXT("scenario=%s;camera_tag=%s;start_frame=%d"),
+			*ActiveScenario->ScenarioId.ToString(), *ActiveScenario->CameraBindingTag.ToString(), SequenceStartFrame);
+	}
 	// Fingerprint every sampled camera state so route and FOV edits invalidate older GT runs.
 	FString CameraSamples;
 	CameraSamples.Reserve(TotalFrames * 160);
@@ -1047,6 +1091,8 @@ bool USLFlythroughSubsystem::StartFlythrough()
 
 void USLFlythroughSubsystem::CancelFlythrough()
 {
+	if (bRecording) { DiscardRecording(); return; }
+	if (bPreviewing) { StopPathPreview(); return; }
 	if (!IsBusy()) return;
 
 	UGameViewportClient::OnScreenshotCaptured().Remove(ScreenshotHandle);
@@ -1184,6 +1230,14 @@ void USLFlythroughSubsystem::EndBatch(bool bSucceeded, const FString& Message)
 
 void USLFlythroughSubsystem::Tick(float DeltaTime)
 {
+	if (bRecording) { TickRecording(); return; }
+	if (bPreviewing)
+	{
+		const auto* Path = GetRecordedPath();
+		const int32 Frame = int32((FPlatformTime::Seconds() - PreviewStartTime) * Path->FPS);
+		if (Frame >= Path->Frames.Num() || !EvaluateSequenceFrame(Frame)) StopPathPreview();
+		return;
+	}
 	if (IsBusy())
 	{
 		// A minimized game draws no viewport, so no samples or screenshots arrive. Wait without
@@ -1410,6 +1464,10 @@ void USLFlythroughSubsystem::FinishFlythrough()
 
 FText USLFlythroughSubsystem::GetStatusText() const
 {
+	if (bPreviewing) return FText::FromString(TEXT("Previewing saved camera path."));
+	if (bRecording && !MetricsStatus.IsEmpty()) return FText::FromString(MetricsStatus);
+	if (bRecording) return FText::FromString(FString::Printf(TEXT("Recording %s: %.1f s. Close GM to move; reopen to stop and save."),
+		*Recording.Name, Recording.Frames.Num() / 30.0));
 	if (bComputingMetrics) return FText::FromString(MetricsStatus);
 	if (Phase == ESLFlythroughPhase::Idle && !MetricsStatus.IsEmpty())
 		return FText::FromString(MetricsStatus);
@@ -1433,6 +1491,8 @@ float USLFlythroughSubsystem::GetProgress() const
 
 bool USLFlythroughSubsystem::CanComputeMetrics(FText& Reason) const
 {
+	if (bPreviewing) { Reason = FText::FromString(TEXT("Stop the camera preview first.")); return false; }
+	if (bRecording) { Reason = FText::FromString(TEXT("Stop recording before computing metrics.")); return false; }
 	if (IsBusy())
 	{
 		Reason = FText::FromString(TEXT("A flythrough is in progress."));
@@ -1604,4 +1664,191 @@ bool USLFlythroughSubsystem::ComputeMetrics()
 		Summaries.Num(), *FPaths::Combine(Root, TEXT("summary_metrics.csv")));
 
 	return true;
+}
+
+// Recorded paths are user data: no editor APIs or project-specific pawn dependencies.
+static FString RecordedPathsDirectory()
+{
+	return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("BenchmarkPaths"));
+}
+
+const FSLRecordedCameraPath* USLFlythroughSubsystem::GetRecordedPath() const
+{
+	return RecordedPaths.FindByPredicate([this](const FSLRecordedCameraPath& P) { return P.Id == SelectedPathId; });
+}
+
+FString USLFlythroughSubsystem::GetSelectedPathName() const
+{
+	const auto* Path = GetRecordedPath();
+	return Path ? Path->Name : TEXT("Level Sequence (scene default)");
+}
+
+FString USLFlythroughSubsystem::GetPathFolder() const
+{
+	if (const auto* Path = GetRecordedPath())
+	{
+		// Earlier playback did not refresh the rendered camera cache. Keep those
+		// captures out of completion detection, resume, metrics, and batch skipping.
+		FString Samples = TEXT("playback=2;") + FString::FromInt(Path->FPS);
+		for (const auto& F : Path->Frames)
+			Samples += FString::Printf(TEXT(";%.17g;%.17g;%.17g;%.17g;%.17g;%.17g;%.17g;%.9g;%.9g;%d"),
+				F.Position.X, F.Position.Y, F.Position.Z, F.Rotation.X, F.Rotation.Y, F.Rotation.Z, F.Rotation.W,
+				F.FOV, F.AspectRatio, F.bConstrainAspectRatio);
+		return FString::Printf(TEXT("recorded_%08x/%s_%08x"), FCrc::StrCrc32(*Path->Map), *Path->Id, FCrc::StrCrc32(*Samples));
+	}
+	ASLFlythroughScenario* Scenario = nullptr;
+	FText Reason;
+	return ResolveScenario(Scenario, Reason) && Scenario ? GetScenarioFolder(GetWorld(), Scenario) : FString();
+}
+
+void USLFlythroughSubsystem::RefreshPaths()
+{
+	if (!CanChangePath()) return;
+	RecordedPaths.Reset();
+	TArray<FString> Files;
+	IFileManager::Get().FindFiles(Files, *FPaths::Combine(RecordedPathsDirectory(), TEXT("*.json")), true, false);
+	Files.Sort();
+	for (const FString& File : Files)
+	{
+		FSLRecordedCameraPath Path;
+		if (Path.Load(FPaths::Combine(RecordedPathsDirectory(), File)) && Path.Map == GetBenchmarkMapPackage(GetWorld())
+			&& !RecordedPaths.ContainsByPredicate([&Path](const FSLRecordedCameraPath& P) { return P.Id == Path.Id; }))
+			RecordedPaths.Add(MoveTemp(Path));
+	}
+	if (!GetRecordedPath()) SelectedPathId.Reset();
+	CurrentRunRoot.Reset();
+	Phase = ESLFlythroughPhase::Idle;
+	RefreshSummaries();
+	OnStateChanged.Broadcast();
+}
+
+bool USLFlythroughSubsystem::SelectPath(const FString& Id)
+{
+	if (!CanChangePath()) return false;
+	if (!Id.IsEmpty() && !RecordedPaths.ContainsByPredicate([&Id](const FSLRecordedCameraPath& P) { return P.Id == Id; })) return false;
+	SelectedPathId = Id;
+	CurrentRunRoot.Reset();
+	Phase = ESLFlythroughPhase::Idle;
+	MetricsStatus.Reset();
+	RefreshSummaries();
+	OnStateChanged.Broadcast();
+	return true;
+}
+
+static bool ReadRecordingCamera(UWorld* World, FSLRecordedCameraSample& Sample)
+{
+	const auto* PC = World->GetFirstPlayerController();
+	if (!PC || !PC->PlayerCameraManager || PC->IsPaused()) return false;
+	const FMinimalViewInfo& View = PC->PlayerCameraManager->GetCameraCacheView();
+	// Version 1 records perspective lenses; unsupported projections must never be silently changed.
+	if (View.ProjectionMode != ECameraProjectionMode::Perspective || View.Location.ContainsNaN()
+		|| View.Rotation.ContainsNaN() || !FMath::IsFinite(View.FOV) || View.FOV <= 1 || View.FOV >= 179
+		|| !FMath::IsFinite(View.AspectRatio) || View.AspectRatio < 0.1f || View.AspectRatio > 10.f) return false;
+	Sample.Position = View.Location;
+	Sample.Rotation = View.Rotation.Quaternion();
+	Sample.FOV = View.FOV;
+	Sample.AspectRatio = View.AspectRatio;
+	Sample.bConstrainAspectRatio = View.bConstrainAspectRatio;
+	return true;
+}
+
+bool USLFlythroughSubsystem::StartRecording(const FString& Name)
+{
+	if (!CanChangePath()) return false;
+	if (const auto* Comparison = GetWorld()->GetSubsystem<USLComparisonSubsystem>(); Comparison && Comparison->IsBusy()) return false;
+	FSLRecordedCameraSample First;
+	if (!ReadRecordingCamera(GetWorld(), First))
+	{
+		MetricsStatus = TEXT("Recording needs an unpaused game and a perspective camera.");
+		return false;
+	}
+	MetricsStatus.Reset();
+	CurrentRunRoot.Reset();
+	Recording = FSLRecordedCameraPath();
+	Recording.Id = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+	Recording.Name = Name.TrimStartAndEnd().Left(128);
+	if (Recording.Name.IsEmpty()) Recording.Name = TEXT("Camera path");
+	Recording.Map = GetBenchmarkMapPackage(GetWorld());
+	Recording.Frames.Add(First);
+	PreviousRecordedSample = First;
+	PreviousRecordedTime = 0;
+	RecordingStartTime = FPlatformTime::Seconds();
+	bRecording = true;
+	Phase = ESLFlythroughPhase::Idle;
+	OnStateChanged.Broadcast();
+	return true;
+}
+
+void USLFlythroughSubsystem::TickRecording()
+{
+	FSLRecordedCameraSample Current;
+	if (!ReadRecordingCamera(GetWorld(), Current))
+	{
+		DiscardRecording();
+		MetricsStatus = TEXT("Recording discarded: camera became unavailable, unsupported, or game paused.");
+		return;
+	}
+	const double Now = FPlatformTime::Seconds() - RecordingStartTime;
+	// Interpolate between observed views, never simulate pawn input during benchmark replay.
+	const bool bWasBelowLimit = Recording.Frames.Num() < 18000;
+	while (Recording.Frames.Num() < 18000 && double(Recording.Frames.Num()) / Recording.FPS <= Now)
+	{
+		const double Time = double(Recording.Frames.Num()) / Recording.FPS;
+		const double Alpha = FMath::Clamp((Time - PreviousRecordedTime) / FMath::Max(Now - PreviousRecordedTime, 1.e-9), 0.0, 1.0);
+		Recording.Frames.Add(FSLRecordedCameraPath::Interpolate(PreviousRecordedSample, Current, Alpha));
+	}
+	PreviousRecordedSample = Current;
+	PreviousRecordedTime = Now;
+	if (bWasBelowLimit && Recording.Frames.Num() == 18000) StopRecording();
+}
+
+bool USLFlythroughSubsystem::StopRecording()
+{
+	if (!bRecording) return false;
+	if (Recording.Frames.Num() < 2)
+	{
+		MetricsStatus = TEXT("Record at least two frames before saving.");
+		return false;
+	}
+	IFileManager::Get().MakeDirectory(*RecordedPathsDirectory(), true);
+	if (!Recording.Save(FPaths::Combine(RecordedPathsDirectory(), Recording.Id + TEXT(".json"))))
+	{
+		MetricsStatus = TEXT("Could not save camera path. Check Saved/BenchmarkPaths is writable and retry Stop and Save.");
+		return false;
+	}
+	bRecording = false;
+	const FString Id = Recording.Id;
+	Recording = FSLRecordedCameraPath();
+	RefreshPaths();
+	SelectPath(Id);
+	MetricsStatus = TEXT("Camera path saved and selected. Render GT, then the test methods.");
+	return true;
+}
+
+void USLFlythroughSubsystem::DiscardRecording()
+{
+	bRecording = false;
+	Recording = FSLRecordedCameraPath();
+	MetricsStatus = TEXT("Recording discarded.");
+	OnStateChanged.Broadcast();
+}
+
+bool USLFlythroughSubsystem::StartPathPreview()
+{
+	if (!CanChangePath() || !GetRecordedPath()) return false;
+	if (const auto* Comparison = GetWorld()->GetSubsystem<USLComparisonSubsystem>(); Comparison && Comparison->IsBusy()) return false;
+	if (!SetupCamera()) { ReleaseCamera(); return false; }
+	bPreviewing = true;
+	PreviewStartTime = FPlatformTime::Seconds();
+	OnStateChanged.Broadcast();
+	return true;
+}
+
+void USLFlythroughSubsystem::StopPathPreview()
+{
+	if (!bPreviewing) return;
+	ReleaseCamera();
+	bPreviewing = false;
+	MetricsStatus = TEXT("Camera preview finished.");
+	OnStateChanged.Broadcast();
 }

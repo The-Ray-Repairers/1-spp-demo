@@ -97,14 +97,67 @@ Changing it during a capture does not redirect that run's output. The completed
 run remains selected for results; the new switch value applies to the next run.
 This is a runtime opt-in; the project default remains `0`.
 
+### Recording and selecting camera paths
+
+The **Camera path** menu in Flythrough Benchmark selects either the level's
+existing Sequence scenario or a saved recording for the current map.
+
+1. Start play in any scene with a controllable perspective camera, open `gm`,
+   enter a path name, and click **Record Camera Path (30 FPS)**.
+2. Close GM to restore game input, then move and look around. The recorder samples
+   the player camera's resulting world-space view, so it works with different
+   pawn classes and camera offsets. Reopen GM and click **Stop and Save Recording**.
+   **Discard Recording** abandons the take. Recordings are limited to 10 minutes.
+3. The saved path is selected automatically. Use **Preview Recorded Path** to
+   inspect it; preview restores the previous view and pause state when finished
+   or stopped. Preview is available for recordings; use Sequencer for authored
+   Sequence previews.
+4. Render GT and the desired methods as usual. Path changes, recording, and preview
+   are blocked during captures and batch runs. Each method uses the exact saved
+   frame schedule. `SL.Flythrough.RunAll` uses the current selection in that game
+   session; a new session initially selects the level's Sequence.
+
+Recordings are versioned JSON files in `Saved/BenchmarkPaths/`, so they persist
+across play sessions without recompiling C++ or creating editor assets. To import
+one, copy its JSON into that directory and click **Refresh Camera Paths**. Only
+valid files matching the current map's package name appear. Names are display
+labels; a generated ID provides identity. The runtime code does not require a
+FlythroughScenario actor for recorded paths. Existing Level Sequence behavior and
+its results directory remain supported.
+
+Version 1 stores a map package, ID, name, integer FPS, and an array of frames:
+`[x, y, z, quaternion_x, quaternion_y, quaternion_z, quaternion_w, fov, aspect_ratio, constrain_aspect]`.
+Position uses Unreal world coordinates in centimeters. The recorder interpolates
+observed views onto a 30 FPS schedule using linear position/lens interpolation and
+quaternion rotation interpolation. Replay reads those frozen frames, independent
+of render speed. Low recording FPS or stalls can smooth out motion that was not
+observed; preview the take before benchmarking.
+
+Version 1 supports perspective cameras and records pose, FOV, aspect ratio, and
+aspect constraint. It uses a standard playback camera with default camera
+post-process settings; it does not record camera-specific post-process effects,
+CineCamera focus/aperture, pawn animation, or dynamic scene state. World
+post-process volumes and benchmark rendering overrides still apply. A paused game
+or unsupported camera discards an active take. Scene changes still require a new
+GT. Recorded paths are tied to the original map and world coordinate system.
+
+Recorded playback explicitly refreshes the player camera cache at every frame,
+including while gameplay is paused.
+
+Recorded results go under
+`renders/recorded_<map_hash>/<path_id>_<content_hash>/<method>/run_NNN/`
+(or `renders/software_fallback/recorded_...` for synthetic tests). Switching paths
+switches GT availability, summaries, and completion indicators. The path content
+hash separates revised recordings, and the existing manifest comparison continues
+to reject incompatible camera/settings identities.
+
 ### Capturing and comparing methods
 
 1. In each benchmark level, place one `SLFlythroughScenario` actor. Assign a
    stable `Scenario Id`, a Level Sequence, and a placed CameraActor (a CineCameraActor
    also works). In Sequencer, bind that camera as a possessable and tag its actor
    binding `BenchmarkCamera`, or change `Camera Binding Tag` on the scenario actor
-   to match. Animate only that camera and its camera component. Use an integer
-   Sequence display rate; its playback range sets the captured frames. Save the
+   to match. Animate only that camera and its camera componw sets the captured frames. Save the
    level and Sequence, start play, then enter `gm`.
    `LVL_RT_Room` already has this setup (`/Game/Benchmark/LS_RT_Room_Flythrough`,
    scenario `RT_Room`): the former interior loop, 300 frames at 30 FPS with an
@@ -408,4 +461,4 @@ selected SPP. `RenderingStatus` adds the live status row wherever desired.
 Panel title, minimize/restore labels, reference SPP variable and capture timeout
 are also fields on this asset. No JSON profiles or separate comparison INI section
 are used. C++ implements the reusable controls and rendering operations. The separate
-flythrough section currently defines its methods and path defaults in C++.
+flythrough section defines its methods in C++; camera routes come from Level Sequences or saved recordings.

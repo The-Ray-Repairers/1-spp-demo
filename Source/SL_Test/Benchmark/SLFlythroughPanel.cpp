@@ -8,6 +8,9 @@
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SComboButton.h"
+#include "Widgets/Input/SEditableTextBox.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Notifications/SProgressBar.h"
@@ -287,7 +290,7 @@ public:
 		Subsystem = Args._Subsystem;
 
 		// Method selector
-		if (Subsystem.IsValid()) Subsystem->RefreshSummaries();
+		if (Subsystem.IsValid()) Subsystem->RefreshPaths();
 		TSharedRef<SVerticalBox> MethodButtons = SNew(SVerticalBox);
 		if (Subsystem.IsValid())
 		{
@@ -317,6 +320,88 @@ public:
 						? TEXT("Flythrough Benchmark - SYNTHETIC TEST") : TEXT("Flythrough Benchmark"));
 				})
 				.ColorAndOpacity(FLinearColor(0.6f, 0.8f, 1.0f))
+			]
+
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+			[
+				SNew(SComboButton)
+				.IsEnabled_Lambda([this] { return Subsystem.IsValid() && Subsystem->CanChangePath(); })
+				.OnGetMenuContent_Lambda([this]() -> TSharedRef<SWidget>
+				{
+					FMenuBuilder Menu(true, nullptr);
+					if (Subsystem.IsValid())
+					{
+						Menu.AddMenuEntry(FText::FromString(TEXT("Level Sequence (scene default)")), FText(), FSlateIcon(),
+							FUIAction(FExecuteAction::CreateSPLambda(this, [this] { if (Subsystem.IsValid()) Subsystem->SelectPath(FString()); })));
+						for (const auto& Path : Subsystem->GetRecordedPaths())
+						{
+							const FString Id = Path.Id;
+							Menu.AddMenuEntry(FText::FromString(Path.Name + TEXT(" [") + Id.Left(8) + TEXT("]")), FText(), FSlateIcon(),
+								FUIAction(FExecuteAction::CreateSPLambda(this, [this, Id] { if (Subsystem.IsValid()) Subsystem->SelectPath(Id); })));
+						}
+					}
+					return Menu.MakeWidget();
+				})
+				.ButtonContent()
+				[
+					SNew(STextBlock).Text_Lambda([this] { return FText::FromString(Subsystem.IsValid()
+						? TEXT("Camera path: ") + Subsystem->GetSelectedPathName() : FString()); })
+				]
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+			[
+				SAssignNew(PathName, SEditableTextBox)
+				.HintText(FText::FromString(TEXT("Name for new camera path")))
+				.IsEnabled_Lambda([this] { return Subsystem.IsValid() && Subsystem->CanChangePath(); })
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+			[
+				SNew(SButton)
+				.IsEnabled_Lambda([this] { return Subsystem.IsValid() && (Subsystem->CanChangePath() || Subsystem->IsRecording()); })
+				.Text_Lambda([this] { return FText::FromString(Subsystem.IsValid() && Subsystem->IsRecording()
+					? TEXT("Stop and Save Recording") : TEXT("Record Camera Path (30 FPS)")); })
+				.OnClicked_Lambda([this]
+				{
+					if (Subsystem.IsValid())
+					{
+						if (Subsystem->IsRecording()) Subsystem->StopRecording();
+						else Subsystem->StartRecording(PathName->GetText().ToString());
+					}
+					return FReply::Handled();
+				})
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+			[
+				SNew(SButton).Text(FText::FromString(TEXT("Discard Recording")))
+				.IsEnabled_Lambda([this] { return Subsystem.IsValid() && Subsystem->IsRecording(); })
+				.OnClicked_Lambda([this] { if (Subsystem.IsValid()) Subsystem->DiscardRecording(); return FReply::Handled(); })
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+			[
+				SNew(SButton).Text(FText::FromString(TEXT("Refresh Camera Paths")))
+				.IsEnabled_Lambda([this] { return Subsystem.IsValid() && Subsystem->CanChangePath(); })
+				.OnClicked_Lambda([this] { if (Subsystem.IsValid()) Subsystem->RefreshPaths(); return FReply::Handled(); })
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+			[
+				SNew(STextBlock).AutoWrapText(true)
+				.Text(FText::FromString(TEXT("Record, close GM and move/look around, then reopen GM to stop and save. Perspective camera; up to 10 minutes. Replay uses standard camera post-process settings.")))
+			]
+
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4)
+			[
+				SNew(SButton)
+				.Text_Lambda([this] { return FText::FromString(Subsystem.IsValid() && Subsystem->IsPreviewing() ? TEXT("Stop Preview") : TEXT("Preview Recorded Path")); })
+				.IsEnabled_Lambda([this] { return Subsystem.IsValid() && (Subsystem->CanChangePath() || Subsystem->IsPreviewing()); })
+				.OnClicked_Lambda([this]
+				{
+					if (Subsystem.IsValid())
+					{
+						if (Subsystem->IsPreviewing()) Subsystem->StopPathPreview();
+						else Subsystem->StartPathPreview();
+					}
+					return FReply::Handled();
+				})
 			]
 
 			// ---- Method Selector ----
@@ -485,6 +570,7 @@ public:
 	}
 
 private:
+	TSharedPtr<SEditableTextBox> PathName;
 	TWeakObjectPtr<USLFlythroughSubsystem> Subsystem;
 };
 

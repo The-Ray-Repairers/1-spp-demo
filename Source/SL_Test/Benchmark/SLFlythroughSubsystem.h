@@ -4,6 +4,7 @@
 #include "Subsystems/WorldSubsystem.h"
 #include "Engine/Scene.h"
 #include "SLFlythroughMetrics.h"
+#include "SLRecordedCameraPath.h"
 #include "SLFlythroughSubsystem.generated.h"
 
 DECLARE_MULTICAST_DELEGATE(FSLFlythroughStateChanged);
@@ -63,7 +64,7 @@ public:
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
 	virtual void Tick(float DeltaTime) override;
-	virtual bool IsTickable() const override { return IsBusy() || bBatchActive; }
+	virtual bool IsTickable() const override { return IsBusy() || bBatchActive || bRecording || bPreviewing; }
 	virtual bool IsTickableWhenPaused() const override { return true; }
 	virtual TStatId GetStatId() const override;
 
@@ -77,9 +78,23 @@ public:
 	bool CanStartFlythrough(FText& Reason) const;
 	bool StartFlythrough();
 	void CancelFlythrough();
-	bool IsBusy() const { return Phase != ESLFlythroughPhase::Idle && Phase != ESLFlythroughPhase::Finished; }
+	bool IsBusy() const { return bRecording || bPreviewing || (Phase != ESLFlythroughPhase::Idle && Phase != ESLFlythroughPhase::Finished); }
 	/** Capture GT and every method in order, then compute metrics. Used by SL.Flythrough.RunAll. */
 	bool StartBatch(bool bQuitWhenDone);
+
+	// A blank path ID selects the level's existing Sequence scenario.
+	void RefreshPaths();
+	const TArray<FSLRecordedCameraPath>& GetRecordedPaths() const { return RecordedPaths; }
+	FString GetSelectedPathName() const;
+	bool SelectPath(const FString& Id);
+	bool CanChangePath() const { return !IsBusy() && !bBatchActive && !bComputingMetrics && !bRecording && !bPreviewing; }
+	bool StartPathPreview();
+	void StopPathPreview();
+	bool IsPreviewing() const { return bPreviewing; }
+	bool StartRecording(const FString& Name);
+	bool StopRecording();
+	void DiscardRecording();
+	bool IsRecording() const { return bRecording; }
 
 	// ---- Metrics ----
 	bool CanComputeMetrics(FText& Reason) const;
@@ -120,6 +135,20 @@ public:
 	bool IsUsingSoftwareFallback() const;
 
 private:
+	friend class FSLRecordedPathViewTest;
+	const FSLRecordedCameraPath* GetRecordedPath() const;
+	FString GetPathFolder() const;
+	void TickRecording();
+	TArray<FSLRecordedCameraPath> RecordedPaths;
+	FString SelectedPathId;
+	FSLRecordedCameraPath Recording;
+	FSLRecordedCameraSample PreviousRecordedSample;
+	double RecordingStartTime = 0;
+	double PreviousRecordedTime = 0;
+	bool bRecording = false;
+	bool bSpawnedPlaybackCamera = false;
+	bool bPreviewing = false;
+	double PreviewStartTime = 0;
 	void RefreshSummariesForRoot(const FString& RendersRoot);
 	void RegisterMethods();
 	bool ResolveScenario(class ASLFlythroughScenario*& OutScenario, FText& Reason) const;
