@@ -6,7 +6,7 @@
 // Console variables
 // -----------------
 //   SL.Denoiser.Method                int  0 = None, 1 = GaussianBlur, 2 = BilateralFilter, 3 = NeuralPlaceholder,
-//                                          4 = NNE Candy, 5 = RayRepair
+//                                          4 = NNE Candy, 5 = RayRepair, 6 = NBDirect
 //   SL.Denoiser.RayRepair.Model       string  NNE model asset for method 5
 //   SL.Denoiser.GaussianBlur.Sigma    float  standard deviation in pixels (default 1.5)
 //   SL.Denoiser.Bilateral.SigmaSpatial float  spatial sigma (default 2.0)
@@ -18,6 +18,7 @@
 #include "RenderGraphUtils.h"
 #include "RHIStaticStates.h"      // TStaticSamplerState
 #include "HAL/IConsoleManager.h"
+#include "Misc/Paths.h"
 #include "RenderingThread.h"      // ENQUEUE_RENDER_COMMAND
 #include "SystemTextures.h"       // GSystemTextures — black/white fallback textures
 #include "NNE.h"
@@ -28,7 +29,7 @@
 // Console variables
 // ---------------------------------------------------------------------------
 
-/** Selects the active denoiser.  0 = None, 1 = GaussianBlur, 2 = BilateralFilter, 3 = NeuralPlaceholder, 4 = NNE Candy, 5 = RayRepair. */
+/** Selects the active denoiser.  0 = None, 1 = GaussianBlur, 2 = BilateralFilter, 3 = NeuralPlaceholder, 4 = NNE Candy, 5 = RayRepair, 6 = NBDirect. */
 TAutoConsoleVariable<int32> CVarSLDenoiserMethod(
 	TEXT("SL.Denoiser.Method"),
 	0,
@@ -39,8 +40,16 @@ TAutoConsoleVariable<int32> CVarSLDenoiserMethod(
 	TEXT("  3: NeuralPlaceholder  — diagnostic pass reading all G-Buffer inputs (see SL.Denoiser.Neural.DebugMode)\n")
 	TEXT("  4: NNE Candy Model    — direct C++ inference of ONNX model via NNERuntimeRDG\n")
 	TEXT("  5: RayRepair          — Ray Repair format v1 neural denoiser (see SL.Denoiser.RayRepair.Model)\n")
+	TEXT("  6: NBDirect           — NoiseBase-trained Ray Repair U-Net (/Game/ML/nb_direct, NoiseBase input encoding)\n")
 	TEXT("Changes take effect on the next rendered frame."),
 	ECVF_RenderThreadSafe);
+
+/**
+ * NNE model asset for method 6: nb_direct (neural-denoiser runs/nb_direct) rewrapped by
+ * Scripts/rewrap_rayrepair_onnx.py --encoding noisebase, so it expects camera-basis normals
+ * and camera distance, and accepts any resolution.
+ */
+static const TCHAR* GSLNBDirectModelPath = TEXT("/Game/ML/nb_direct.nb_direct");
 
 /**
  * NNE model asset loaded by the Ray Repair denoiser (method 5).
@@ -433,10 +442,103 @@ FScreenPassTexture FSLDenoiserNNE::Apply(
 }
 
 // ---------------------------------------------------------------------------
-// FSLDenoiserRayRepair::Apply
-// Runs a Ray Repair format v1 ONNX model (raw UE buffers in, linear HDR out)
-// at full view-rect resolution. See neural-denoiser docs/UE_INTEGRATION.md.
+// FSLDenoiserRayRepair
+// Runs a Ray Repair ONNX model (raw UE buffers in, linear HDR out) at full
+// view-rect resolution. See neural-denoiser docs/UE_INTEGRATION.md and
+// Scripts/rewrap_rayrepair_onnx.py.
 // ---------------------------------------------------------------------------
+static constexpr uint32 GSLRayRepairRawChannels = 10;
+static constexpr uint32 GSLRayRepairOutChannels = 3;
+
+bool FSLDenoiserRayRepair::LoadModel(const FString& ModelPath)
+{
+	UNNEModelData* ModelData = LoadObject<UNNEModelData>(nullptr, *ModelPath);
+	if (!ModelData && !ModelPath.Contains(TEXT(".")))
+	{
+		// Accept "/Game/ML/Name" as well as the full object path "/Game/ML/Name.Name".
+		ModelData = LoadObject<UNNEModelData>(nullptr, *(ModelPath + TEXT(".") + FPaths::GetBaseFilename(ModelPath)));
+	}
+	if (!ModelData)
+	{
+		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: Failed to load %s"), *Name, *ModelPath);
+		return false;
+	}
+
+	TWeakInterfacePtr<INNERuntimeRDG> Runtime = UE::NNE::GetRuntime<INNERuntimeRDG>(TEXT("NNERuntimeORTDml"));
+	if (!Runtime.IsValid())
+	{
+		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: NNERuntimeORTDml is not available"), *Name);
+		return false;
+	}
+
+	TSharedPtr<UE::NNE::IModelRDG> Model = Runtime->CreateModelRDG(ModelData);
+	TSharedPtr<UE::NNE::IModelInstanceRDG> Instance = Model.IsValid() ? Model->CreateModelInstanceRDG() : nullptr;
+	if (!Instance.IsValid())
+	{
+		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: Failed to create model instance for %s"), *Name, *ModelPath);
+		return false;
+	}
+
+	// Still models have exactly one [1, 10, H, W] input. History models (motion_px,
+	// history_rgb) need frame-to-frame state and are not wired up yet.
+	const TConstArrayView<UE::NNE::FTensorDesc> InputDescs = Instance->GetInputTensorDescs();
+	if (InputDescs.Num() != 1)
+	{
+		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: %s has %d inputs; only single-input (non-history) models are supported"),
+			*Name, *ModelPath, InputDescs.Num());
+		return false;
+	}
+	const UE::NNE::FSymbolicTensorShape& InShape = InputDescs[0].GetShape();
+	const TConstArrayView<int32> Dims = InShape.GetData();
+	if (Dims.Num() != 4 || (Dims[0] != 1 && Dims[0] != -1) || Dims[1] != (int32)GSLRayRepairRawChannels)
+	{
+		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: %s input is not a [1, %u, H, W] tensor"), *Name, *ModelPath, GSLRayRepairRawChannels);
+		return false;
+	}
+
+	ModelInstance = Instance;
+	TensorSize    = FIntPoint::ZeroValue;
+	bDynamicSize  = Dims[2] < 0 || Dims[3] < 0;
+	if (bDynamicSize)
+	{
+		UE_LOG(LogTemp, Display, TEXT("SLDenoiser%s: Loaded %s (dynamic resolution)"), *Name, *ModelPath);
+		return true;
+	}
+
+	// Static export: prepare its one resolution now.
+	if (!ResizeTo(FIntPoint(Dims[3], Dims[2])))
+	{
+		ModelInstance.Reset();
+		return false;
+	}
+	UE_LOG(LogTemp, Display, TEXT("SLDenoiser%s: Loaded %s (%dx%d)"), *Name, *ModelPath, TensorSize.X, TensorSize.Y);
+	return true;
+}
+
+bool FSLDenoiserRayRepair::ResizeTo(FIntPoint Size)
+{
+	TArray<UE::NNE::FTensorShape> InputShapes = { UE::NNE::FTensorShape::Make(
+		{ 1u, GSLRayRepairRawChannels, static_cast<uint32>(Size.Y), static_cast<uint32>(Size.X) }) };
+	if (ModelInstance->SetInputTensorShapes(InputShapes) != UE::NNE::EResultStatus::Ok)
+	{
+		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: SetInputTensorShapes failed for %dx%d"), *Name, Size.X, Size.Y);
+		TensorSize = FIntPoint::ZeroValue;
+		return false;
+	}
+	// Output shapes are resolved here when the runtime can infer them; check the volume we bind.
+	const TConstArrayView<UE::NNE::FTensorShape> OutShapes = ModelInstance->GetOutputTensorShapes();
+	const uint64 Expected = uint64(GSLRayRepairOutChannels) * Size.X * Size.Y;
+	if (OutShapes.Num() > 0 && OutShapes[0].Volume() != Expected)
+	{
+		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: output has %llu values, expected [1, 3, %d, %d]"),
+			*Name, (unsigned long long)OutShapes[0].Volume(), Size.Y, Size.X);
+		TensorSize = FIntPoint::ZeroValue;
+		return false;
+	}
+	TensorSize = Size;
+	return true;
+}
+
 FScreenPassTexture FSLDenoiserRayRepair::Apply(
 	FRDGBuilder&          GraphBuilder,
 	const FSceneView&     View,
@@ -445,94 +547,39 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 	const FScreenPassTexture& Input = Context.SceneColor;
 	if (!Input.IsValid()) return Input;
 
-	static constexpr uint32 RawChannels = 10;
-	static constexpr uint32 OutChannels = 3;
-
-	// 0. Load the model and create the instance once (again if the CVar changes)
-	static FString LoadedPath;
-	static bool bLoadFailed = false;
-	static TSharedPtr<UE::NNE::IModelInstanceRDG> ModelInstance;
-	static FIntPoint TensorSize = FIntPoint::ZeroValue;
-
-	const FString& ModelPath = GSLRayRepairModelPath_RenderThread;
+	// 0. Load the model and create the instance once (again if the asset path changes)
+	const FString ModelPath = GetModelPath();
 	if (ModelPath != LoadedPath)
 	{
-		LoadedPath  = ModelPath;
-		bLoadFailed = true;
+		LoadedPath = ModelPath;
 		ModelInstance.Reset();
-
-		UNNEModelData* ModelData = LoadObject<UNNEModelData>(nullptr, *ModelPath);
-		if (!ModelData)
-		{
-			UE_LOG(LogTemp, Error, TEXT("SLDenoiserRayRepair: Failed to load %s"), *ModelPath);
-			return Input;
-		}
-
-		TWeakInterfacePtr<INNERuntimeRDG> Runtime = UE::NNE::GetRuntime<INNERuntimeRDG>(TEXT("NNERuntimeORTDml"));
-		if (!Runtime.IsValid())
-		{
-			UE_LOG(LogTemp, Error, TEXT("SLDenoiserRayRepair: NNERuntimeORTDml is not available"));
-			return Input;
-		}
-
-		TSharedPtr<UE::NNE::IModelRDG> Model = Runtime->CreateModelRDG(ModelData);
-		TSharedPtr<UE::NNE::IModelInstanceRDG> Instance = Model.IsValid() ? Model->CreateModelInstanceRDG() : nullptr;
-		if (!Instance.IsValid())
-		{
-			UE_LOG(LogTemp, Error, TEXT("SLDenoiserRayRepair: Failed to create model instance for %s"), *ModelPath);
-			return Input;
-		}
-
-		// Format v1 still models have exactly one [1, 10, H, W] input with static H, W.
-		// History models (motion_px, history_rgb) need frame-to-frame state and are not wired up yet.
-		const TConstArrayView<UE::NNE::FTensorDesc> InputDescs = Instance->GetInputTensorDescs();
-		if (InputDescs.Num() != 1)
-		{
-			UE_LOG(LogTemp, Error, TEXT("SLDenoiserRayRepair: %s has %d inputs; only single-input (non-history) format v1 models are supported"),
-				*ModelPath, InputDescs.Num());
-			return Input;
-		}
-		const UE::NNE::FSymbolicTensorShape& InShape = InputDescs[0].GetShape();
-		const TConstArrayView<int32> Dims = InShape.GetData();
-		if (!InShape.IsConcrete() || Dims.Num() != 4 || Dims[0] != 1 || Dims[1] != RawChannels)
-		{
-			UE_LOG(LogTemp, Error, TEXT("SLDenoiserRayRepair: %s input is not a static [1, %u, H, W] tensor"), *ModelPath, RawChannels);
-			return Input;
-		}
-
-		TArray<UE::NNE::FTensorShape> InputShapes = { UE::NNE::FTensorShape::MakeFromSymbolic(InShape) };
-		if (Instance->SetInputTensorShapes(InputShapes) != UE::NNE::EResultStatus::Ok)
-		{
-			UE_LOG(LogTemp, Error, TEXT("SLDenoiserRayRepair: SetInputTensorShapes failed for %s"), *ModelPath);
-			return Input;
-		}
-
-		TensorSize    = FIntPoint(Dims[3], Dims[2]);
-		ModelInstance = Instance;
-		bLoadFailed   = false;
-		UE_LOG(LogTemp, Display, TEXT("SLDenoiserRayRepair: Loaded %s (%dx%d)"), *ModelPath, TensorSize.X, TensorSize.Y);
+		bLoadFailed = !LoadModel(ModelPath);
+		LastWarnedSize = FIntPoint::ZeroValue;
 	}
-
 	if (bLoadFailed || !ModelInstance.IsValid()) return Input;
 
-	// v1 shapes are static: the view rect must match the export resolution exactly.
+	// Dynamic models follow the view rect; static exports must match it exactly.
 	const FIntRect ViewRect = Input.ViewRect;
 	if (ViewRect.Size() != TensorSize)
 	{
-		static FIntPoint LastWarnedSize = FIntPoint::ZeroValue;
-		if (LastWarnedSize != ViewRect.Size())
+		const bool bResized = bDynamicSize && ViewRect.Width() > 0 && ViewRect.Height() > 0 && ResizeTo(ViewRect.Size());
+		if (!bResized)
 		{
-			UE_LOG(LogTemp, Error, TEXT("SLDenoiserRayRepair: view rect %dx%d does not match model %dx%d; passing through. ")
-				TEXT("Re-export at this resolution or set r.ScreenPercentage 100 and a matching window size."),
-				ViewRect.Width(), ViewRect.Height(), TensorSize.X, TensorSize.Y);
-			LastWarnedSize = ViewRect.Size();
+			if (LastWarnedSize != ViewRect.Size())
+			{
+				UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: view rect %dx%d does not match model %dx%d; passing through. ")
+					TEXT("Use a dynamic-resolution model (Scripts/rewrap_rayrepair_onnx.py), re-export at this resolution, ")
+					TEXT("or set r.ScreenPercentage 100 and a matching window size."),
+					*Name, ViewRect.Width(), ViewRect.Height(), TensorSize.X, TensorSize.Y);
+				LastWarnedSize = ViewRect.Size();
+			}
+			return Input;
 		}
-		return Input;
 	}
 
 	if (!Context.SceneTextures.SceneTextures)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("SLDenoiserRayRepair: scene textures unavailable; passing through"));
+		UE_LOG(LogTemp, Warning, TEXT("SLDenoiser%s: scene textures unavailable; passing through"), *Name);
 		return Input;
 	}
 
@@ -544,7 +591,7 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 
 	// 1. Preprocess: scene color + decoded G-Buffer -> ue_buffers [1, 10, H, W]
 	FRDGBufferRef InputTensorBuffer = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(float), RawChannels * Plane), TEXT("RayRepair.UEBuffers"));
+		FRDGBufferDesc::CreateBufferDesc(sizeof(float), GSLRayRepairRawChannels * Plane), TEXT("RayRepair.UEBuffers"));
 	{
 		FSLRayRepairPreprocessCS::FParameters* Params = GraphBuilder.AllocParameters<FSLRayRepairPreprocessCS::FParameters>();
 		Params->View              = View.ViewUniformBuffer;
@@ -552,15 +599,16 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 		Params->SceneColorTexture = Input.Texture;
 		Params->ViewRectMin       = ViewRectMin;
 		Params->TensorSize        = TensorSizeU;
+		Params->InputEncoding     = static_cast<uint32>(Encoding);
 		Params->OutputTensor      = GraphBuilder.CreateUAV(InputTensorBuffer, PF_R32_FLOAT);
 
 		TShaderMapRef<FSLRayRepairPreprocessCS> ComputeShader(GetGlobalShaderMap(FeatureLevel));
-		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("RayRepairPreprocess"), ComputeShader, Params, GroupCount);
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("%sPreprocess", *Name), ComputeShader, Params, GroupCount);
 	}
 
 	// 2. Inference
 	FRDGBufferRef OutputTensorBuffer = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateBufferDesc(sizeof(float), OutChannels * Plane), TEXT("RayRepair.DenoisedRGB"));
+		FRDGBufferDesc::CreateBufferDesc(sizeof(float), GSLRayRepairOutChannels * Plane), TEXT("RayRepair.DenoisedRGB"));
 
 	TArray<UE::NNE::FTensorBindingRDG> InputBindings;
 	UE::NNE::FTensorBindingRDG InBinding;
@@ -574,7 +622,7 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 
 	if (ModelInstance->EnqueueRDG(GraphBuilder, InputBindings, OutputBindings) != UE::NNE::EResultStatus::Ok)
 	{
-		UE_LOG(LogTemp, Error, TEXT("SLDenoiserRayRepair: EnqueueRDG failed; passing through"));
+		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: EnqueueRDG failed; passing through"), *Name);
 		return Input;
 	}
 
@@ -590,7 +638,7 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 		Params->TensorSize    = TensorSizeU;
 
 		TShaderMapRef<FSLRayRepairPostprocessCS> ComputeShader(GetGlobalShaderMap(FeatureLevel));
-		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("RayRepairPostprocess"), ComputeShader, Params, GroupCount);
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("%sPostprocess", *Name), ComputeShader, Params, GroupCount);
 	}
 
 	return FScreenPassTexture(OutputTexture, ViewRect);
@@ -608,7 +656,11 @@ ISLDenoiserPass* GetDenoiserForMethod(ESLDenoiserMethod Method)
 	static FSLDenoiserBilateralFilter    s_BilateralFilter;
 	static FSLDenoiserNeuralPlaceholder  s_NeuralPlaceholder;
 	static FSLDenoiserNNE                s_NNE;
-	static FSLDenoiserRayRepair          s_RayRepair;
+	// Methods 5 and 6 share one pass type; each instance keeps its own model and tensor size.
+	static FSLDenoiserRayRepair          s_RayRepair(TEXT("RayRepair"),
+		[] { return GSLRayRepairModelPath_RenderThread; }, ESLRayRepairInputEncoding::FormatV1);
+	static FSLDenoiserRayRepair          s_NBDirect(TEXT("NBDirect"),
+		[] { return FString(GSLNBDirectModelPath); }, ESLRayRepairInputEncoding::NoiseBase);
 
 	switch (Method)
 	{
@@ -626,6 +678,9 @@ ISLDenoiserPass* GetDenoiserForMethod(ESLDenoiserMethod Method)
 
 	case ESLDenoiserMethod::RayRepair:
 		return &s_RayRepair;
+
+	case ESLDenoiserMethod::NBDirect:
+		return &s_NBDirect;
 
 	case ESLDenoiserMethod::None:
 	default:
