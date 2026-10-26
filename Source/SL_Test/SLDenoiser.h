@@ -40,6 +40,12 @@ enum class ESLDenoiserMethod : int32
 
 	/** NNE Candy 9 Model — direct C++ inference */
 	NNE = 4,
+
+	/** Ray Repair neural denoiser (format v1 ONNX) via NNERuntimeRDG */
+	RayRepair = 5,
+
+	/** nb_direct: NoiseBase-trained Ray Repair U-Net (/Game/ML/nb_direct, NoiseBase input encoding) */
+	NBDirect = 6,
 };
 
 // ---------------------------------------------------------------------------
@@ -321,6 +327,101 @@ public:
 		FRDGBuilder&          GraphBuilder,
 		const FSceneView&     View,
 		const FSLDenoiserContext& Context) override;
+};
+
+// ---------------------------------------------------------------------------
+// Ray Repair Denoisers (methods 5 and 6)
+//
+// Run format v1 exports from neural-denoiser (denoiser/export_ue.py), or
+// models rewrapped by Scripts/rewrap_rayrepair_onnx.py:
+//   input  ue_buffers   [1, 10, H, W]  color(3) base_color(3) normal(3) depth(1)
+//   output denoised_rgb [1,  3, H, W]  linear HDR, same exposure as color
+// All normalisation happens inside the ONNX graph; the shaders only copy
+// and decode buffers. The input encoding decides what channels 6-9 hold:
+//   FormatV1   world-space normal, z-depth in cm         (export_ue.py, --data ue)
+//   NoiseBase  camera-basis normal, camera distance in cm (rewrap --encoding noisebase)
+// Static models must match the view rect exactly (r.ScreenPercentage 100);
+// dynamic models (symbolic H, W) are resized to the view rect on the fly.
+// ---------------------------------------------------------------------------
+
+enum class ESLRayRepairInputEncoding : uint32
+{
+	FormatV1  = 0,
+	NoiseBase = 1,
+};
+
+class FSLRayRepairPreprocessCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSLRayRepairPreprocessCS);
+	SHADER_USE_PARAMETER_STRUCT(FSLRayRepairPreprocessCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureShaderParameters, SceneTextures)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)
+		SHADER_PARAMETER(FUintVector2, ViewRectMin)
+		SHADER_PARAMETER(FUintVector2, TensorSize)
+		SHADER_PARAMETER(uint32, InputEncoding)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, OutputTensor)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P)
+	{
+		return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+class FSLRayRepairPostprocessCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSLRayRepairPostprocessCS);
+	SHADER_USE_PARAMETER_STRUCT(FSLRayRepairPostprocessCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, InputTensor)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
+		SHADER_PARAMETER(FUintVector2, ViewRectMin)
+		SHADER_PARAMETER(FUintVector2, TensorSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P)
+	{
+		return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+namespace UE::NNE { class IModelInstanceRDG; }
+
+class FSLDenoiserRayRepair final : public ISLDenoiserPass
+{
+public:
+	/**
+	 * @param InName          Log prefix, e.g. TEXT("RayRepair")
+	 * @param InGetModelPath  Render-thread getter for the NNE model asset path; a change reloads the model
+	 * @param InEncoding      What the preprocess shader writes into ue_buffers channels 6-9
+	 */
+	FSLDenoiserRayRepair(const TCHAR* InName, TFunction<FString()> InGetModelPath, ESLRayRepairInputEncoding InEncoding)
+		: Name(InName), GetModelPath(MoveTemp(InGetModelPath)), Encoding(InEncoding) {}
+
+	virtual FScreenPassTexture Apply(
+		FRDGBuilder&          GraphBuilder,
+		const FSceneView&     View,
+		const FSLDenoiserContext& Context) override;
+
+private:
+	bool LoadModel(const FString& ModelPath);
+	bool ResizeTo(FIntPoint Size);
+
+	const FString Name;
+	const TFunction<FString()> GetModelPath;
+	const ESLRayRepairInputEncoding Encoding;
+
+	// Render thread only
+	FString LoadedPath;
+	bool bLoadFailed = false;
+	bool bDynamicSize = false;                 // model input has symbolic H, W
+	TSharedPtr<UE::NNE::IModelInstanceRDG> ModelInstance;
+	FIntPoint TensorSize = FIntPoint::ZeroValue;   // current input H x W (as X = W, Y = H)
+	FIntPoint LastWarnedSize = FIntPoint::ZeroValue;
 };
 
 // ---------------------------------------------------------------------------

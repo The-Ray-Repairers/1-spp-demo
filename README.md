@@ -16,6 +16,9 @@ The project provides two workflows:
 
 Neural Placeholder is a diagnostic pass. NNE Candy is a style-transfer model,
 not a validated denoising model. These are experimental demonstration methods.
+RayRepair (method 5) and NB Direct (method 6) run the team's neural denoisers
+from [neural-denoiser](https://github.com/The-Ray-Repairers/neural-denoiser);
+see [Neural denoisers](#neural-denoisers-methods-5-and-6).
 Hardware ray tracing is required for normal benchmarks. A synthetic noise
 fallback supports pipeline testing without a ray-tracing GPU.
 
@@ -196,6 +199,8 @@ UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScr
 | `1SPP_Bilateral` | Edge-preserving bilateral filter. |
 | `1SPP_NeuralPlaceholder` | Diagnostic neural-placeholder pass. |
 | `1SPP_NNE` | Experimental NNE Candy inference. |
+| `1SPP_RayRepair` | Ray Repair format v1 model from `SL.Denoiser.RayRepair.Model` (method 5). |
+| `1SPP_NBDirect` | NoiseBase-trained Ray Repair U-Net, `/Game/ML/nb_direct` (method 6). |
 | `<N>SPP_GT` | Undenoised reference accumulating N samples; defaults to `64SPP_GT`. |
 
 SVGF and Lumen/RR are interactive GM profiles, not registered flythrough methods.
@@ -343,15 +348,55 @@ relevant rendering settings and restores them afterward.
 | `SL.PathTracer.ResetEveryFrame` | `1` | Reset accumulation every frame; `0` permits accumulation. |
 | `SL.PathTracer.TargetSPP` | `1` | Set hardware path-tracing samples or the synthetic fallback's noise scaling. |
 | `SL.NoiseFallback.Scale` | `1.0` | Synthetic noise intensity; `0` disables injected noise. |
-| `SL.Denoiser.Method` | `0` | Custom filter: `0` none, `1` Gaussian, `2` bilateral, `3` Neural Placeholder, `4` NNE Candy. |
+| `SL.Denoiser.Method` | `0` | Custom filter: `0` none, `1` Gaussian, `2` bilateral, `3` Neural Placeholder, `4` NNE Candy, `5` RayRepair, `6` NB Direct. |
+| `SL.Denoiser.RayRepair.Model` | `/Game/ML/RayRepair_v1_1920x1080` | NNE model asset for method 5 (format v1 export from `export_ue.py`); changing it reloads the model. |
 | `SL.Denoiser.GaussianBlur.Sigma` | `1.5` | Gaussian standard deviation in pixels; larger values blur more. |
 | `SL.Denoiser.Bilateral.SigmaSpatial` | `2.0` | Bilateral spatial neighborhood scale. |
 | `SL.Denoiser.Bilateral.SigmaColor` | `0.1` | Bilateral color similarity scale; smaller values preserve edges more strongly. |
 | `SL.Denoiser.Neural.DebugMode` | `0` | Placeholder visualization: `0` composite, `1` noisy color, `2` albedo, `3` normals, `4` depth, `5` motion vectors. |
 
 Selecting NNE Candy locks auto-exposure because its model expects display-referred
-images in the 0-255 range. The active custom denoising method is displayed in the
-viewport.
+images in the 0-255 range. Methods 5 and 6 lock it as well, so pre-exposed HDR input
+stays on one scale between frames. The active custom denoising method is displayed
+in the viewport.
+
+### Neural denoisers (methods 5 and 6)
+
+Both run a Ray Repair ONNX model through NNE (`NNERuntimeORTDml`) on the
+pre-tonemap linear-HDR scene colour, at full view-rect resolution. The model takes
+`ue_buffers` `[1,10,H,W]` (colour, base colour, normal, depth) and returns
+`denoised_rgb` `[1,3,H,W]`; all normalisation happens inside the graph.
+
+| Method | Model | Channels 6-9 written by `SLRayRepairPreprocess.usf` |
+| --- | --- | --- |
+| `5` RayRepair | `SL.Denoiser.RayRepair.Model`, a format v1 export (`export_ue.py`, trained with `--data ue`) | World-space normal, z-depth (cm) |
+| `6` NB Direct | `/Game/ML/nb_direct`, neural-denoiser `runs/nb_direct` (direct U-Net trained on NoiseBase) | Camera-basis normal `[n·forward, n·right, n·up]`, camera distance (cm) |
+
+Models with symbolic height/width follow the viewport size. Static exports must
+match the view rect exactly (`r.ScreenPercentage 100` and a matching window);
+otherwise the pass logs an error and passes the noisy frame through.
+
+**Setting up a NoiseBase-trained model (nb_direct).** `export_ue.py` wraps every
+checkpoint with the UE format v1 encoding at one fixed resolution, but a NoiseBase
+checkpoint learned NoiseBase's encoding: colour clamped at its per-frame 99.5th
+percentile, camera-basis normals, and `log(1 + 1/distance)` depth min-max
+normalised per frame. `Scripts/rewrap_rayrepair_onnx.py` keeps the trained U-Net,
+replaces the input encoding, and makes H and W dynamic. The percentile is estimated
+on every 4th pixel in x and y. Then `Scripts/import_nb_direct.py` imports the
+result as `/Game/ML/nb_direct` and adds it to the GM denoiser list:
+
+```bash
+python Scripts/rewrap_rayrepair_onnx.py nb_direct.onnx nb_direct_noisebase.onnx --encoding noisebase
+UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScriptPlugin -script="<project>/Scripts/import_nb_direct.py C:/path/to/nb_direct_noisebase.onnx" -unattended -nosplash
+```
+
+Use forward slashes in the `.onnx` path: the commandlet unescapes backslashes.
+The automation test `SL.Denoiser.NBDirectModel` runs the asset on DirectML through
+RDG at three sizes and compares it with `NNERuntimeORTCpu`; it needs a D3D12 RHI
+(for example `-RenderOffscreen -dx12`).
+
+NoiseBase scenes differ from UE scenes (metres versus centimetres, renderer, and
+materials), so nb_direct is a transfer experiment rather than a tuned UE denoiser.
 
 ### Built-in path-tracer denoiser experiments
 
@@ -409,7 +454,9 @@ is defined in C++; camera paths come from recordings or Level Sequences.
 | `Source/SL_Test/Benchmark/SLComparison*` | Interactive rendering profiles, references, and live comparison. |
 | `Source/SL_Test/Debug/GMTools/` | GM configuration, commands, panel, and comparison widgets. |
 | `Source/SL_Test/SLPathTracerSubsystem.*` | Startup path tracing, sampling controls, and fallback integration. |
-| `Source/SL_Test/SLDenoiser*`, `Shaders/` | Filter implementations and shader passes. |
+| `Source/SL_Test/SLDenoiser*`, `Shaders/` | Filter implementations and shader passes, including the NNE neural denoisers (methods 4-6). |
+| `Source/SL_Test/SLNBDirectModelTests.cpp` | DirectML-versus-CPU check of `/Game/ML/nb_direct`. |
+| `Scripts/rewrap_rayrepair_onnx.py`, `Scripts/import_nb_direct.py` | Ray Repair ONNX re-encoding and nb_direct import/GM registration. |
 | `Source/SL_Test/SL_Test.Build.cs` | Module dependencies. |
 
 ### Shader development

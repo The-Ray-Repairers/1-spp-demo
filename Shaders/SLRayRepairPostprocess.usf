@@ -1,0 +1,28 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// SLRayRepairPostprocess.usf
+//
+// Unpacks the Ray Repair output tensor "denoised_rgb" [1, 3, H, W] (NCHW
+// planar, linear HDR at the same exposure as the input color) straight into
+// the full-resolution scene color, before tonemapping. No upsample pass.
+//
+// Used by:
+//   SL.Denoiser.Method 5
+
+#include "/Engine/Public/Platform.ush"
+
+Buffer<float> InputTensor;             // 3 * H * W floats
+RWTexture2D<float4> OutputTexture;     // same desc as SceneColor
+uint2 ViewRectMin;
+uint2 TensorSize;                      // (W, H)
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (any(Id.xy >= TensorSize)) return;
+
+    uint Plane = TensorSize.x * TensorSize.y;
+    uint I     = Id.y * TensorSize.x + Id.x;
+
+    OutputTexture[ViewRectMin + Id.xy] =
+        float4(InputTensor[I], InputTensor[Plane + I], InputTensor[2 * Plane + I], 1.0);
+}
