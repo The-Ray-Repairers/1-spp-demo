@@ -207,6 +207,17 @@ void USLFlythroughSubsystem::RegisterMethods()
 		Methods.Add(MoveTemp(M));
 	}
 
+	// 1SPP_RayRepair
+	{
+		FSLFlythroughMethod M;
+		M.Name = TEXT("1SPP_RayRepair");
+		M.SPP = 1;
+		M.DenoiserMethod = 5;
+		M.bAccumulate = false;
+		M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), TEXT("1")});
+		Methods.Add(MoveTemp(M));
+	}
+
 	// <N>SPP_GT — ground truth baseline; N comes from SL.Flythrough.GTSPP
 	{
 		FSLFlythroughMethod M;
