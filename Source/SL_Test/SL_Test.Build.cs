@@ -8,15 +8,9 @@ public class SL_Test : ModuleRules
 	public SL_Test(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
-        if (Target.bBuildEditor)
-        {
-            PrivateDependencyModuleNames.AddRange(new string[] { "UnrealEd", "UMGEditor", "KismetCompiler", "AssetRegistry" });
-        }
-        PrivateIncludePaths.AddRange(new string[] {
-            Path.Combine(GetModuleDirectory("Renderer"), "Private"),
-            Path.Combine(GetModuleDirectory("Renderer"), "Internal")
-        });
 
+		// The ray tracing demo tools (GM panel, denoisers, flythrough benchmark) and
+		// their rendering dependencies live in the RT_Demo plugin: Plugins/RT_Demo.
 		PublicDependencyModuleNames.AddRange(new string[] {
 			"Core",
 			"CoreUObject",
@@ -27,22 +21,11 @@ public class SL_Test : ModuleRules
 			"StateTreeModule",
 			"GameplayStateTreeModule",
 			"UMG",
-			"Slate",
-			"NNE"
+			"Slate"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] {
-			"SlateCore",
-			"DeveloperSettings",
-			"RenderCore",
-			"Renderer",   // FRDGBuilder, FScreenPassTexture, AddDrawScreenPass, FPostProcessingInputs
-			"RHI",        // TStaticSamplerState, FRHICopyTextureInfo
-			"DLSSBlueprint",
-			"LevelSequence", // frame-addressed camera evaluation
-			"MovieScene",    // sequence range and binding validation
-			"MovieSceneTracks",
-			"Json",         // flythrough run manifests
-			"ImageWrapper", // PNG loading for flythrough metric computation
+			"SlateCore"
 		});
 
 		PublicIncludePaths.AddRange(new string[] {
