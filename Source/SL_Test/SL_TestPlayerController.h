@@ -12,23 +12,15 @@ class UUserWidget;
 /**
  *  Basic PlayerController class for a third person game
  *  Manages input mappings
+ *
+ *  The `gm` rendering panel is provided by the RT_Demo plugin, which attaches
+ *  itself to the local player controller; nothing here refers to it.
  */
 UCLASS(abstract)
 class ASL_TestPlayerController : public APlayerController
 {
 	GENERATED_BODY()
 
-public:
-	ASL_TestPlayerController();
-
-	/** Open the runtime GM panel from the local player's console. */
-	UFUNCTION(Exec)
-	void gm();
-
-private:
-	UPROPERTY(VisibleAnywhere, Category="Debug")
-	TObjectPtr<class USLGMToolsComponent> GMTools;
-	
 protected:
 
 	/** Input Mapping Contexts */

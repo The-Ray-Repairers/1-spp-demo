@@ -79,7 +79,7 @@ def main():
     for channel in channels[6:9]:
         channel.set_default(1.0)
 
-    scenario_class = unreal.load_class(None, "/Script/SL_Test.SLFlythroughScenario")
+    scenario_class = unreal.load_class(None, "/Script/RT_Demo.SLFlythroughScenario")
     scenario = actors.spawn_actor_from_class(scenario_class, unreal.Vector(0, 0, 0))
     scenario.set_actor_label(SCENARIO_LABEL)
     scenario.set_editor_property("scenario_id", SCENARIO_ID)

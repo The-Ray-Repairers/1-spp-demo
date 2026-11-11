@@ -1,0 +1,38 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "RT Demo",
+	"Description": "Real-time ray tracing demo tools: the in-game GM rendering panel (console command `gm`), 1-SPP path tracing with custom and neural denoisers, a live before/after comparison slider, and a flythrough benchmark with image-quality metrics.",
+	"Category": "Rendering",
+	"CreatedBy": "The Ray Repairers",
+	"CreatedByURL": "https://github.com/The-Ray-Repairers",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "RT_Demo",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "NNERuntimeORT",
+			"Enabled": true
+		},
+		{
+			"Name": "DLSS",
+			"Enabled": true,
+			"Optional": true,
+			"PlatformAllowList": [
+				"Win64"
+			]
+		}
+	]
+}

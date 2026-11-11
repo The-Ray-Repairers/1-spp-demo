@@ -22,6 +22,12 @@ see [Neural denoisers](#neural-denoisers-methods-5-and-6).
 Hardware ray tracing is required for normal benchmarks. A synthetic noise
 fallback supports pipeline testing without a ray-tracing GPU.
 
+The tools themselves (GM panel, comparison, flythrough benchmark, denoisers,
+shaders, and models) are packaged as the **RT_Demo** plugin in `Plugins/RT_Demo`.
+This project supplies the demo scene and sample game code. To use the tools in
+another project, copy that folder into its `Plugins/` directory; see
+[Plugins/RT_Demo/README.md](Plugins/RT_Demo/README.md).
+
 ## Developer setup
 
 1. Install **Unreal Engine 5.8**, Visual Studio 2022 with C++ game-development
@@ -32,9 +38,10 @@ fallback supports pipeline testing without a ray-tracing GPU.
    `StreamlineNGXCommon`, `StreamlineCore`, `StreamlineDLSSG`, and
    `StreamlineReflex`. Install complete plugin directories, including source and
    `.uplugin` descriptors, in an Unreal plugin search location such as the
-   project's `Plugins/` directory. The project enables DLSS, DLSSG, and Reflex;
-   `DLSSBlueprint` is a required C++ module. These external plugins are not shipped
-   in this repository.
+   project's `Plugins/` directory. The project enables DLSS, DLSSG, and Reflex.
+   The RT_Demo plugin itself treats DLSS as optional and only builds its
+   Lumen + DLSS RR profile when the DLSS plugin is present. These external
+   plugins are not shipped in this repository.
 3. Keep the project-enabled engine plugins available, including StateTree,
    GameplayStateTree, NeuralRendering, and NNERuntimeRDG. Generate project files
    from `SL_Test.uproject`, close the editor, and build
@@ -50,12 +57,15 @@ $ProjectFile = (Resolve-Path .\SL_Test.uproject).Path
 & "$EngineRoot\Engine\Build\BatchFiles\Build.bat" SL_TestEditor Win64 Development "-Project=$ProjectFile" -WaitMutex -NoHotReloadFromIDE
 ```
 
-Restart the editor after rebuilding to load the new module. Renderer startup
+This builds both the `SL_Test` game module and the `RT_Demo` plugin module.
+Restart the editor after rebuilding to load the new modules. Renderer startup
 settings, including `r.VelocityOutputPass=1` for SVGF guides, also require a restart.
 
 ## GM tools and interactive comparison
 
-Enter `gm` during play to open the panel. **Minimize** collapses it to a **GM**
+Enter `gm` during play to open the panel. The command is registered by the
+RT_Demo plugin and attaches the tools to the local player controller, so game
+code does not reference them. **Minimize** collapses it to a **GM**
 button and returns movement/look input to the viewport. Click that button or enter
 `gm` again to restore the panel. Closing the panel restores game-only input and
 exits the live comparison overlay.
@@ -200,7 +210,7 @@ UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScr
 | `1SPP_NeuralPlaceholder` | Diagnostic neural-placeholder pass. |
 | `1SPP_NNE` | Experimental NNE Candy inference. |
 | `1SPP_RayRepair` | Ray Repair format v1 model from `SL.Denoiser.RayRepair.Model` (method 5). |
-| `1SPP_NBDirect` | NoiseBase-trained Ray Repair U-Net, `/Game/ML/nb_direct` (method 6). |
+| `1SPP_NBDirect` | NoiseBase-trained Ray Repair U-Net, `/RT_Demo/ML/nb_direct` (method 6). |
 | `<N>SPP_GT` | Undenoised reference accumulating N samples; defaults to `64SPP_GT`. |
 
 SVGF and Lumen/RR are interactive GM profiles, not registered flythrough methods.
@@ -349,7 +359,7 @@ relevant rendering settings and restores them afterward.
 | `SL.PathTracer.TargetSPP` | `1` | Set hardware path-tracing samples or the synthetic fallback's noise scaling. |
 | `SL.NoiseFallback.Scale` | `1.0` | Synthetic noise intensity; `0` disables injected noise. |
 | `SL.Denoiser.Method` | `0` | Custom filter: `0` none, `1` Gaussian, `2` bilateral, `3` Neural Placeholder, `4` NNE Candy, `5` RayRepair, `6` NB Direct. |
-| `SL.Denoiser.RayRepair.Model` | `/Game/ML/RayRepair_v1_1920x1080` | NNE model asset for method 5 (format v1 export from `export_ue.py`); changing it reloads the model. |
+| `SL.Denoiser.RayRepair.Model` | `/RT_Demo/ML/RayRepair_v1_1920x1080` | NNE model asset for method 5 (format v1 export from `export_ue.py`); changing it reloads the model. |
 | `SL.Denoiser.GaussianBlur.Sigma` | `1.5` | Gaussian standard deviation in pixels; larger values blur more. |
 | `SL.Denoiser.Bilateral.SigmaSpatial` | `2.0` | Bilateral spatial neighborhood scale. |
 | `SL.Denoiser.Bilateral.SigmaColor` | `0.1` | Bilateral color similarity scale; smaller values preserve edges more strongly. |
@@ -370,7 +380,7 @@ pre-tonemap linear-HDR scene colour, at full view-rect resolution. The model tak
 | Method | Model | Channels 6-9 written by `SLRayRepairPreprocess.usf` |
 | --- | --- | --- |
 | `5` RayRepair | `SL.Denoiser.RayRepair.Model`, a format v1 export (`export_ue.py`, trained with `--data ue`) | World-space normal, z-depth (cm) |
-| `6` NB Direct | `/Game/ML/nb_direct`, neural-denoiser `runs/nb_direct` (direct U-Net trained on NoiseBase) | Camera-basis normal `[n·forward, n·right, n·up]`, camera distance (cm) |
+| `6` NB Direct | `/RT_Demo/ML/nb_direct`, neural-denoiser `runs/nb_direct` (direct U-Net trained on NoiseBase) | Camera-basis normal `[n·forward, n·right, n·up]`, camera distance (cm) |
 
 Models with symbolic height/width follow the viewport size. Static exports must
 match the view rect exactly (`r.ScreenPercentage 100` and a matching window);
@@ -380,14 +390,15 @@ otherwise the pass logs an error and passes the noisy frame through.
 checkpoint with the UE format v1 encoding at one fixed resolution, but a NoiseBase
 checkpoint learned NoiseBase's encoding: colour clamped at its per-frame 99.5th
 percentile, camera-basis normals, and `log(1 + 1/distance)` depth min-max
-normalised per frame. `Scripts/rewrap_rayrepair_onnx.py` keeps the trained U-Net,
-replaces the input encoding, and makes H and W dynamic. The percentile is estimated
-on every 4th pixel in x and y. Then `Scripts/import_nb_direct.py` imports the
-result as `/Game/ML/nb_direct` and adds it to the GM denoiser list:
+normalised per frame. `Plugins/RT_Demo/Scripts/rewrap_rayrepair_onnx.py` keeps the
+trained U-Net, replaces the input encoding, and makes H and W dynamic. The percentile
+is estimated on every 4th pixel in x and y. Then
+`Plugins/RT_Demo/Scripts/import_nb_direct.py` imports the result as
+`/RT_Demo/ML/nb_direct` and adds it to the GM denoiser list:
 
 ```bash
-python Scripts/rewrap_rayrepair_onnx.py nb_direct.onnx nb_direct_noisebase.onnx --encoding noisebase
-UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScriptPlugin -script="<project>/Scripts/import_nb_direct.py C:/path/to/nb_direct_noisebase.onnx" -unattended -nosplash
+python Plugins/RT_Demo/Scripts/rewrap_rayrepair_onnx.py nb_direct.onnx nb_direct_noisebase.onnx --encoding noisebase
+UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScriptPlugin -script="<project>/Plugins/RT_Demo/Scripts/import_nb_direct.py C:/path/to/nb_direct_noisebase.onnx" -unattended -nosplash
 ```
 
 Use forward slashes in the `.onnx` path: the commandlet unescapes backslashes.
@@ -429,7 +440,9 @@ r.PathTracing.TemporalDenoiser.Name NFOR
 
 ### Configure GM tools
 
-Edit `/Game/Debug/GMTools/DA_RenderGMTools` in the Content Browser. Its `Entries`
+Edit `/RT_Demo/GMTools/DA_RenderGMTools` in the Content Browser (enable
+**Settings > Show Plugin Content** to see the plugin's folder). A different asset
+can be selected under **Project Settings > Game > GM Tools**. Its `Entries`
 array configures labels, groups, ordering, radio options, and rendering settings.
 `RenderingAction` entries select operations with ordered `RenderSettings` pairs;
 `RenderingStatus` inserts the status display. The asset also configures the panel
@@ -444,26 +457,39 @@ is defined in C++; camera paths come from recordings or Level Sequences.
 
 ### Source map
 
+The tools live in the plugin; paths below are relative to `Plugins/RT_Demo/`.
+
 | Location | Responsibility |
 | --- | --- |
-| `Source/SL_Test/Benchmark/SLFlythroughSubsystem.*` | Recording, preview, trimming workflow, camera playback, capture, resume, and metric orchestration. |
-| `Source/SL_Test/Benchmark/SLRecordedCameraPath.*` | Runtime recording data, JSON validation/storage, interpolation, and trimmed copies. |
-| `Source/SL_Test/Benchmark/SLFlythroughScenario.*` | Level Sequence scenario configuration. |
-| `Source/SL_Test/Benchmark/SLFlythroughPanel.*` | Path/method selectors, preview/trim controls, progress, and charts. |
-| `Source/SL_Test/Benchmark/SLFlythroughMetrics.*` | PNG decoding, metrics, CSV I/O, and complete-run validation. |
-| `Source/SL_Test/Benchmark/SLComparison*` | Interactive rendering profiles, references, and live comparison. |
-| `Source/SL_Test/Debug/GMTools/` | GM configuration, commands, panel, and comparison widgets. |
-| `Source/SL_Test/SLPathTracerSubsystem.*` | Startup path tracing, sampling controls, and fallback integration. |
-| `Source/SL_Test/SLDenoiser*`, `Shaders/` | Filter implementations and shader passes, including the NNE neural denoisers (methods 4-6). |
-| `Source/SL_Test/SLNBDirectModelTests.cpp` | DirectML-versus-CPU check of `/Game/ML/nb_direct`. |
+| `RT_Demo.uplugin`, `Source/RT_Demo/RT_Demo.Build.cs` | Plugin descriptor, module dependencies, optional DLSS detection. |
+| `Source/RT_Demo/Private/Benchmark/SLFlythroughSubsystem.*` | Recording, preview, trimming workflow, camera playback, capture, resume, and metric orchestration. |
+| `Source/RT_Demo/Private/Benchmark/SLRecordedCameraPath.*` | Runtime recording data, JSON validation/storage, interpolation, and trimmed copies. |
+| `Source/RT_Demo/Private/Benchmark/SLFlythroughScenario.*` | Level Sequence scenario configuration. |
+| `Source/RT_Demo/Private/Benchmark/SLFlythroughPanel.*` | Path/method selectors, preview/trim controls, progress, and charts. |
+| `Source/RT_Demo/Private/Benchmark/SLFlythroughMetrics.*` | PNG decoding, metrics, CSV I/O, and complete-run validation. |
+| `Source/RT_Demo/Private/Benchmark/SLComparison*` | Interactive rendering profiles, references, and live comparison. |
+| `Source/RT_Demo/Public/Debug/GMTools/`, `Source/RT_Demo/Private/Debug/GMTools/` | GM configuration, the `gm` command, panel, and comparison widgets. |
+| `Source/RT_Demo/Private/SLPathTracerSubsystem.*` | Startup path tracing, sampling controls, and fallback integration. |
+| `Source/RT_Demo/Private/SLDenoiser*`, `Shaders/Private/` | Filter implementations and shader passes, including the NNE neural denoisers (methods 4-6). |
+| `Source/RT_Demo/Private/SLNBDirectModelTests.cpp` | DirectML-versus-CPU check of `/RT_Demo/ML/nb_direct`. |
+| `Content/GMTools/`, `Content/ML/` | GM configuration asset, comparison widget, and NNE models. |
 | `Scripts/rewrap_rayrepair_onnx.py`, `Scripts/import_nb_direct.py` | Ray Repair ONNX re-encoding and nb_direct import/GM registration. |
-| `Source/SL_Test/SL_Test.Build.cs` | Module dependencies. |
+
+Project-side files, relative to the repository root:
+
+| Location | Responsibility |
+| --- | --- |
+| `Source/SL_Test/` | Sample third-person game code; it has no dependency on the plugin. |
+| `Content/Levels/LVL_RT_Room`, `Content/Benchmark/` | Demo scene and its flythrough Level Sequence. |
+| `Scripts/author_room_flythrough.py` | Regenerates the room Sequence and benchmark actors. |
+| `Config/DefaultEngine.ini` | Renderer settings and the class redirects from the pre-plugin module layout. |
 
 ### Shader development
 
 Close the editor and perform a normal build when introducing a new
 `IMPLEMENT_GLOBAL_SHADER` registration or changing a shader parameter struct's
-layout. The runtime module loads at `PostConfigInit` for shader registration.
+layout. The `RT_Demo` module loads at `PostConfigInit` and maps
+`Plugins/RT_Demo/Shaders` to `/Plugin/RT_Demo` for shader registration.
 Recompile shader source edits in the editor with `Ctrl+Shift+.`. Live Coding is
 appropriate only for compatible C++ implementation changes that do not alter
 shader registration or parameter layouts.
@@ -481,6 +507,14 @@ The test prefix covers recording serialization/interpolation, camera-view update
 result routing, trimming, and recoverable path deletion. Use the executable matching the built configuration;
 DebugGame uses `UnrealEditor-Win64-DebugGame-Cmd.exe`. Inspect test results in the
 report or log, not just the process exit code.
+
+Tests that need a renderer run in a DX12 game instance. This checks that `gm`
+opens the panel on the project's unmodified player controller and that the live
+comparison switches methods:
+
+```text
+UnrealEditor.exe SL_Test.uproject /Game/Levels/LVL_RT_Room -game -RenderOffscreen -dx12 -unattended -ExecCmds="Automation RunTests SL.GMTools.ConsoleCommand+SL.Comparison.LiveMethods" -TestExit="Automation Test Queue Empty"
+```
 
 Headless tests do not validate GPU output or the visual UI. For end-to-end
 validation, capture GT plus noisy and filtered runs at the same resolution, check
