@@ -14,15 +14,16 @@ The project provides two workflows:
   Sequences, deterministic frame capture, PNG export, timings, full-reference
   metrics, and summary charts.
 
-Neural Placeholder is a diagnostic pass. NNE Candy is a style-transfer model,
+The former Neural Placeholder is preserved as the `raw-inputs` diagnostic capture command. NNE Candy is a style-transfer model,
 not a validated denoising model. These are experimental demonstration methods.
 Hardware ray tracing is required for normal benchmarks. A synthetic noise
 fallback supports pipeline testing without a ray-tracing GPU.
 
 ## Developer setup
 
-1. Install **Unreal Engine 5.8**, Visual Studio 2022 with C++ game-development
-   tools, and a Windows SDK. The configured development target is Win64 with
+1. Install **Unreal Engine 5.8**, **Visual Studio 2026 (18.0 or newer)** with C++
+   game-development tools, and a Windows SDK. The engine's .NET 10 tooling requires
+   Visual Studio 18.0 or newer when built inside the IDE. The configured development target is Win64 with
    DX12/SM6. Targets use `BuildSettingsVersion.V7` and
    `EngineIncludeOrderVersion.Unreal5_8`.
 2. Install UE 5.8-compatible NVIDIA plugins and their dependencies: `DLSS`,
@@ -50,6 +51,13 @@ $ProjectFile = (Resolve-Path .\SL_Test.uproject).Path
 Restart the editor after rebuilding to load the new module. Renderer startup
 settings, including `r.VelocityOutputPass=1` for SVGF guides, also require a restart.
 
+If Visual Studio reports that it cannot target .NET 10, open the solution in
+Visual Studio 2026 (18.0 or newer). Visual Studio 2022 cannot build those .NET
+projects; installing the .NET 10 SDK alone does not change that IDE limitation.
+Alternatively, use the PowerShell build command above: Unreal's `Build.bat`
+uses its bundled .NET SDK and can use the installed VS 2022 C++ toolchain.
+Do not retarget Unreal's C# projects to .NET 9 to suppress this error.
+
 ## GM tools and interactive comparison
 
 Enter `gm` during play to open the panel. **Minimize** collapses it to a **GM**
@@ -57,8 +65,11 @@ button and returns movement/look input to the viewport. Click that button or ent
 `gm` again to restore the panel. Closing the panel restores game-only input and
 exits the live comparison overlay.
 
-Use the rendering profiles for raw 1 SPP, SVGF, Lumen + DLSS RR, and high-SPP
-references. Single-view references are separate from flythrough GT runs. Each
+Rendering Comparisons, Active Method, and Flythrough Benchmark share this order:
+**1spp, 512spp, SVGF, DLSS, Ours, KPN/Direct, Open Image Denoise**.
+Active Method selects the same full rendering profiles as Rendering Comparisons.
+DLSS uses Lumen + DLSS Ray Reconstruction. Ours and KPN/Direct are disabled until their implementations are integrated; tooltips explain
+availability. Single-view references are separate from flythrough GT runs. Each
 saved reference contains `output.png` and `capture.txt` under:
 
 ```text
@@ -67,6 +78,30 @@ Saved/References/YYYY-MM-DD_HH-MM-SS_<samples>SPP/
 
 Timestamps use local time. A numeric suffix avoids overwriting an existing folder.
 Use the panel's results-folder control to locate the capture.
+
+## Diagnostic input grid
+
+During Play or Standalone Game, open the console and enter:
+
+```text
+raw-inputs
+```
+
+The command preserves the former Neural Placeholder's six-tile grid: scene color,
+albedo, world normals, depth, motion vectors, and the placeholder composite.
+It is a diagnostic visualization, not a denoising method; the existing grid has
+no roughness tile. It temporarily uses deferred rendering from a frozen copy of
+the current camera, disables custom filters/noise injection and the comparison
+wipe, and saves `raw-inputs.png` plus `capture.txt` under a unique folder in
+`Saved/RawInputs/`. Missing renderer buffers use fallback textures; holding the
+camera/gameplay can make motion vectors zero. The image is tone-mapped diagnostic
+output, not a lossless dump of numerical G-buffer data.
+
+On completion, cancellation (`raw-inputs cancel`), resize, or timeout, the camera,
+pause state, renderer settings, and comparison wipe are restored. Concurrent
+reference/flythrough captures, recording, and preview are rejected. The command
+needs a rendered game viewport; `-nullrhi` cannot produce an image. For the intended
+camera position, invoke it after moving the camera in Play, rather than at startup.
 
 ## Defining a benchmark camera path
 
@@ -178,7 +213,7 @@ UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScr
 ## Capturing and comparing methods
 
 1. Select a recorded path, trimmed copy, or configured Level Sequence in GM.
-2. Select **64SPP_GT** and click **Render Flythrough** to capture the default
+2. Select **512spp** and click **Render Flythrough** to capture the default
    ground-truth baseline.
 3. Render the desired test methods from the registry below at the same viewport
    resolution and with the same scene and shared rendering settings.
@@ -191,14 +226,49 @@ UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScr
 
 | Flythrough method | Behavior |
 | --- | --- |
-| `1SPP_Noisy` | Raw path tracing without denoising. |
-| `1SPP_Gaussian` | Separable Gaussian blur. |
-| `1SPP_Bilateral` | Edge-preserving bilateral filter. |
-| `1SPP_NeuralPlaceholder` | Diagnostic neural-placeholder pass. |
-| `1SPP_NNE` | Experimental NNE Candy inference. |
-| `<N>SPP_GT` | Undenoised reference accumulating N samples; defaults to `64SPP_GT`. |
+| `1spp` | Raw path tracing without denoising; results remain in `1SPP_Noisy`. |
+| `512spp` | Undenoised reference; defaults to 512 samples and `512SPP_GT` results. |
+| `SVGF` | 1-sample path tracing with same-frame guide buffers and SVGF filtering. |
+| `DLSS` | Lumen + DLSS Ray Reconstruction; requires supported NVIDIA hardware and DX12. |
+| `Ours` | Disabled: implementation not integrated. |
+| `KPN/Direct` | Disabled: implementation not integrated. |
+| `Open Image Denoise` | Engine OIDN spatial denoiser on 1-sample path tracing, using albedo and normal guides. |
 
-SVGF and Lumen/RR are interactive GM profiles, not registered flythrough methods.
+Open Image Denoise uses the enabled UE `OpenImageDenoise` plugin (Win64 x64).
+It denoises on the CPU, including GPU-to-CPU input readback and output upload;
+these costs are included in flythrough timings. It uses one warm-up view, not the
+32-view temporal settling used by SVGF and DLSS. The input is 1-sample path tracing
+with albedo and normal auxiliary inputs, which OIDN also prefilters. Path tracing
+hardware support is required; synthetic fallback is rejected. Interactive wipes
+render a separate raw view with denoising disabled. `r.OIDN.*` tuning is recorded
+in method metadata so changes invalidate resume. Engine plugin errors are reported
+in the Output Log under `LogOpenImageDenoise`; successful GPU output still needs
+validation on a path-tracing-capable machine.
+
+SVGF and DLSS capture each held camera pose after a camera-cut history reset and
+32 rendered warm-up views. Warm-up runs again after resuming or restoring a
+minimized window. This is an offline pose capture benchmark, not continuous-motion
+temporal playback: timings include warm-up, rendering, and screenshot readback.
+Lumen scene caches can still affect convergence; the fixed warm-up is not a
+claim of bit-identical renders across sessions. DLSS compares the complete Lumen
+rendering pipeline against the path-traced reference, not just a denoising filter.
+
+SVGF requires hardware ray tracing, `r.VelocityOutputPass=1`, and
+`r.Substrate.ProjectGBufferFormat=0` (restart after changing startup settings).
+Neither SVGF nor DLSS accepts synthetic software fallback. The selector explains
+hardware/profile failures in its tooltips. A run aborts if SVGF guide inputs are
+missing, its filter does not execute, or DLSS RR becomes disabled.
+
+Capture protocol 2 records effective backend tuning and warm-up in
+`run_manifest.json` under `method_settings`. Backend tuning may differ from GT,
+but changing it invalidates resume of that method. Re-capture the GT after this
+update; protocol 1 captures cannot be scored against protocol 2 captures.
+Shared scene quality stays fixed; only backend settings are imported from the
+matching GM profile. Completion, cancellation, and startup failure restore the
+previous renderer state and release the guide/view extensions.
+
+Batch capture skips unavailable methods and logs the reason. Display labels are separate from output
+folder IDs, so the slash in KPN/Direct cannot create nested result directories.
 
 Capture pauses gameplay, evaluates each saved or Sequence camera frame, and holds
 that pose until its screenshot completes. Camera sampling, exposure, and shared
@@ -207,19 +277,41 @@ in real time: high-SPP GT can accumulate at each fixed pose. A 300-frame path at
 30 FPS describes 10 seconds of camera motion, regardless of capture wall time.
 
 Set `SL.Flythrough.GTSPP <N>` before capture to choose a GT sample count (1 through
-65536). Its method and folder name become `<N>SPP_GT`. Test-method SPP and denoiser
+65536). Its display label becomes `<N>spp` and its folder name becomes `<N>SPP_GT`. Test-method SPP and denoiser
 choice may differ from GT; matching map, path, frame schedule, dimensions, capture
 mode, and shared settings are still required.
 
+### Single-method console capture
+
+Use `SL.Flythrough.Methods` to list actual labels, IDs, and availability. In a
+ready game viewport, select a camera path in GM, then use a display label or ID:
+
+```text
+SL.Flythrough.Render 1spp
+SL.Flythrough.Render 512spp
+SL.Flythrough.Render SVGF
+SL.Flythrough.Render DLSS
+SL.Flythrough.Render OpenImageDenoise
+```
+
+Run these one at a time. `Open Image Denoise` is also accepted as a display label.
+The GT display label follows `SL.Flythrough.GTSPP`; after overriding it, use the
+label reported by `SL.Flythrough.Methods`. Unknown or unavailable names are
+rejected without capturing another method. Ours and KPN/Direct remain unavailable;
+Gaussian, bilateral, Neural Placeholder and Candy are not benchmark methods.
+Single-method capture does not score results or exit. Use GM's Compute Metrics
+after capturing a matching GT, or use the batch command below for unattended runs.
+
 ### Batch capture and resume
 
-`SL.Flythrough.RunAll` captures GT first, then the test methods, computes metrics,
+`SL.Flythrough.RunAll [quit]` captures GT first (512 SPP by default), then available
+1spp, SVGF, DLSS, and Open Image Denoise runs, computes metrics,
 and logs a `Flythrough result:` line per method. It uses the selected path in the
 current game session. Add `quit` to exit afterward; failure returns a nonzero exit
 code. For a level with a configured Sequence, a standalone example is:
 
 ```text
-UnrealEditor.exe SL_Test.uproject /Game/Levels/LVL_RT_Room -game -windowed -ResX=1280 -ResY=720 -ExecCmds="SL.Flythrough.GTSPP 64,SL.Flythrough.RunAll quit"
+UnrealEditor.exe SL_Test.uproject /Game/Levels/LVL_RT_Room -game -windowed -ResX=1280 -ResY=720 -ExecCmds="SL.Flythrough.GTSPP 512,SL.Flythrough.RunAll quit"
 ```
 
 Each completed frame writes its PNG and timing to `timings_partial.csv`. Starting
@@ -336,14 +428,17 @@ relevant rendering settings and restores them afterward.
 | Command / CVar | Default | Purpose |
 | --- | --- | --- |
 | `gm` | ? | Open or restore the GM panel. |
-| `SL.Flythrough.GTSPP` | `64` | Set GT samples per pixel before capturing. |
+| `SL.Flythrough.GTSPP` | `512` | Set GT samples per pixel before capturing. |
 | `SL.Flythrough.AllowSoftwareFallback` | `0` | Opt into synthetic benchmarks without hardware ray tracing. |
-| `SL.Flythrough.RunAll [quit]` | ? | Capture the selected path across all methods, then compute metrics. |
+| `SL.Flythrough.RunAll [quit]` | ? | Capture GT and available methods, compute metrics, optionally exit. |
+| `SL.Flythrough.Methods` | ? | List current method labels, stable IDs, and availability. |
+| `SL.Flythrough.Render <method>` | ? | Capture the selected path with one method; no scoring or automatic exit. |
+| `raw-inputs [cancel]` | ? | Save the current camera diagnostic grid; `cancel` restores without saving. |
 | `SL.PathTracer.AutoEnable` | `1` | Enable path tracing automatically when a game world begins play; `0` leaves viewport selection to the user. |
 | `SL.PathTracer.ResetEveryFrame` | `1` | Reset accumulation every frame; `0` permits accumulation. |
 | `SL.PathTracer.TargetSPP` | `1` | Set hardware path-tracing samples or the synthetic fallback's noise scaling. |
 | `SL.NoiseFallback.Scale` | `1.0` | Synthetic noise intensity; `0` disables injected noise. |
-| `SL.Denoiser.Method` | `0` | Custom filter: `0` none, `1` Gaussian, `2` bilateral, `3` Neural Placeholder, `4` NNE Candy. |
+| `SL.Denoiser.Method` | `0` | Legacy/debug custom pass: `0` none, `1` Gaussian, `2` bilateral, `3` diagnostic grid, `4` NNE Candy. These values do not select GM renderer backends. |
 | `SL.Denoiser.GaussianBlur.Sigma` | `1.5` | Gaussian standard deviation in pixels; larger values blur more. |
 | `SL.Denoiser.Bilateral.SigmaSpatial` | `2.0` | Bilateral spatial neighborhood scale. |
 | `SL.Denoiser.Bilateral.SigmaColor` | `0.1` | Bilateral color similarity scale; smaller values preserve edges more strongly. |
@@ -430,7 +525,10 @@ this headless Development-editor command after building:
 UnrealEditor-Cmd.exe SL_Test.uproject -unattended -nullrhi -nosplash -nosound -ExecCmds="Automation RunTests SL.Flythrough.RecordedPath" -TestExit="Automation Test Queue Empty" -ReportExportPath="<project>/Saved/FlythroughVerification/RecordedPaths"
 ```
 
-The test prefix covers recording serialization/interpolation, camera-view updates,
+Use `Automation RunTests SL.Flythrough.Renderer` with the same command to run
+backend routing/history-reset and capture-identity regression tests.
+
+The recorded-path test prefix covers recording serialization/interpolation, camera-view updates,
 result routing, trimming, and recoverable path deletion. Use the executable matching the built configuration;
 DebugGame uses `UnrealEditor-Win64-DebugGame-Cmd.exe`. Inspect test results in the
 report or log, not just the process exit code.

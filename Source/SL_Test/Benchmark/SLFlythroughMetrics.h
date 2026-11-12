@@ -41,6 +41,8 @@ struct FSLFlythroughRunManifest
 	FString CameraPath;
 	FString CameraParameters;
 	FString RenderSettings;
+	/** Backend, warm-up protocol and effective tuning; checked for resume, not GT comparison. */
+	FString MethodSettings;
 	int32 Width = 0;
 	int32 Height = 0;
 	int32 FrameCount = 0;
@@ -51,6 +53,7 @@ struct FSLFlythroughRunManifest
 	FString CaptureId;
 
 	bool IsComparableTo(const FSLFlythroughRunManifest& Other) const;
+	bool IsSameCaptureAs(const FSLFlythroughRunManifest& Other) const;
 };
 
 /**

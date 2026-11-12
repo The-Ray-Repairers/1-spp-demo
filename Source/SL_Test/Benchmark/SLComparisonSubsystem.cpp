@@ -1,4 +1,7 @@
 #include "SLComparisonSubsystem.h"
+#include "SLRawInputsSubsystem.h"
+#include "SLOpenImageDenoise.h"
+#include "Debug/GMTools/SLRenderingMethods.h"
 #include "SLFlythroughSubsystem.h"
 #include "SLComparisonView.h"
 #include "SLGuideProbe.h"
@@ -48,12 +51,16 @@ bool USLComparisonSubsystem::CanExecute(ESLComparisonAction Action, FText& Reaso
 
 bool USLComparisonSubsystem::CanExecute(const FSLGMToolEntry& Requested, FText& Reason) const
 {
+    if (const auto* Raw = GetWorld()->GetSubsystem<USLRawInputsSubsystem>(); Raw && Raw->IsActive())
+    { Reason = FText::FromString(TEXT("Wait for raw-inputs capture to finish.")); return false; }
     const auto& Entry = ResolveEntry(Requested);
     auto Reject = [&Reason](const TCHAR* Text) { Reason = FText::FromString(Text); return false; };
     if (const auto* Flythrough = GetWorld()->GetSubsystem<USLFlythroughSubsystem>(); Flythrough && Flythrough->IsBusy())
         return Reject(TEXT("Wait for the flythrough benchmark to finish."));
     if (Entry.Action == ESLComparisonAction::Restore) return OwnsRenderer();
     if (Entry.Action == ESLComparisonAction::OpenResults) return !Output.IsEmpty();
+    for (const auto& Method : SLRenderingMethods::Get())
+        if (Entry.Id == FName(Method.Id) && Method.UnavailableReason[0]) return Reject(Method.UnavailableReason);
     if (Entry.Id.IsNone()) return Reject(TEXT("Give each rendering profile a unique Id."));
     if (Configuration && Configuration->Entries.FilterByPredicate([&](const FSLGMToolEntry& E) { return E.Id == Entry.Id; }).Num() > 1)
         return Reject(TEXT("Rendering profile Ids must be unique."));
@@ -77,6 +84,7 @@ bool USLComparisonSubsystem::CanExecute(const FSLGMToolEntry& Requested, FText& 
     for (const auto& Context : GEngine->GetWorldContexts())
         if (Context.World() && Context.World() != GetWorld() && Context.World()->IsGameWorld())
             return Reject(TEXT("Close other game instances before comparing."));
+    if (Profile.Backend == ESLGMRenderBackend::OpenImageDenoise && !SLOpenImageDenoise::IsAvailable(Reason)) return false;
     if (Profile.Backend == ESLGMRenderBackend::SVGF)
     {
         if (IConsoleManager::Get().FindConsoleVariable(TEXT("r.VelocityOutputPass"))->GetInt() != 1)
@@ -159,6 +167,11 @@ bool USLComparisonSubsystem::Apply()
         SetVariable(TEXT("r.PathTracing.SpatialDenoiser.Type"), TEXT("0"));
         SetVariable(TEXT("r.PathTracing.Denoiser.Name"), TEXT("SLGuides"));
     }
+    if (Profile.Backend == ESLGMRenderBackend::OpenImageDenoise)
+    {
+        SLOpenImageDenoise::Apply([this](const TCHAR* Name, const TCHAR* Value) { SetVariable(Name, Value); });
+        View->DenoiserOverride = 1;
+    }
     if (CaptureCamera)
     {
         auto& PP = CaptureCamera->GetCameraComponent()->PostProcessSettings;
@@ -194,6 +207,7 @@ bool USLComparisonSubsystem::Execute(const FSLGMToolEntry& Requested, USLGMToolC
 
 void USLComparisonSubsystem::Restore()
 {
+    if (auto* Raw = GetWorld()->GetSubsystem<USLRawInputsSubsystem>(); Raw && Raw->IsActive()) Raw->Cancel();
     bResumeLiveAfterCapture = false;
     DisableLiveComparison();
     CancelCapture(TEXT("Cancelled. Partial results were retained."));
@@ -259,6 +273,7 @@ void USLComparisonSubsystem::Deinitialize() { Restore(); Super::Deinitialize(); 
 
 void USLComparisonSubsystem::Tick(float DeltaTime)
 {
+    if (const auto* Raw = GetWorld()->GetSubsystem<USLRawInputsSubsystem>(); Raw && Raw->IsActive()) return;
     if (RefreshSelectedProfile()) return;
     if (RefreshPreviewMethod()) return;
     TickCapture();

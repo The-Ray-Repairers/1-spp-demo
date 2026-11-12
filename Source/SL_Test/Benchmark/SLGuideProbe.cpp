@@ -26,6 +26,8 @@ IMPLEMENT_GLOBAL_SHADER(FSLGuidePS, "/Project/SLGuideProbe.usf", "MainPS", SF_Pi
 struct FSLGuideFrame
 {
     TAtomic<float> ComparisonPosition{-1.f};
+    TAtomic<bool> MissingInputs{false};
+    TAtomic<uint32> FilteredFrames{0};
     FRDGBuilder* Graph = nullptr;
     uint32 Number = 0;
     TArray<FRDGTextureRef> Textures;
@@ -87,11 +89,15 @@ public:
             && Frame->Textures[0]->Desc.Extent == Inputs.ColorTex->Desc.Extent;
         if (!bSameFrame)
         {
+            Frame->MissingInputs.Store(true);
             UE_LOG(LogSL_Test, Error, TEXT("SLGuides: missing same-frame inputs"));
         }
         auto Result = Inputs.ColorTex;
         if (bSameFrame)
+        {
+            ++Frame->FilteredFrames;
             Result = Filter.AddPasses(Graph, View, Inputs.ColorTex, Frame->Textures[0], Frame->Textures[1], Frame->Textures[2], Frame->Textures[3]);
+        }
         AddCopyTexturePass(Graph, Result, Inputs.OutputTex);
         // Composite only the display output, AFTER SVGF has queued its own history.
         // Both sources share the same sample, camera, exposure and tonemapping path.
@@ -143,3 +149,8 @@ void FSLGuideProbe::BeginRenderViewFamily(FSceneViewFamily& Family)
     Input.CustomRenderPass = new FSLGuidePass(View.UnscaledViewRect.Size(), Frame);
     Family.Scene->AddCustomRenderPass(&Family, Input);
 }
+
+bool FSLGuideProbe::HasMissingInputs() const { return Frame->MissingInputs.Load(); }
+uint32 FSLGuideProbe::GetFilteredFrames() const { return Frame->FilteredFrames.Load(); }
+
+void FSLGuideProbe::ResetFrameCounters() { Frame->FilteredFrames.Store(0); Frame->MissingInputs.Store(false); }

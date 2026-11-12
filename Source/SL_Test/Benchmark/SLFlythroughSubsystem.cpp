@@ -1,6 +1,10 @@
 #include "SLFlythroughSubsystem.h"
+#include "SLRawInputsSubsystem.h"
+#include "Debug/GMTools/SLRenderingMethods.h"
 #include "SLFlythroughScenario.h"
 #include "SLComparisonView.h"
+#include "SLGuideProbe.h"
+#include "SLOpenImageDenoise.h"
 #include "SLComparisonSubsystem.h"
 #include "SLPathTracerSubsystem.h"
 #include "SL_Test.h"
@@ -21,6 +25,7 @@
 #include "Tracks/MovieSceneCameraCutTrack.h"
 #include "Tracks/MovieScenePropertyTrack.h"
 #include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
@@ -94,8 +99,8 @@ static TAutoConsoleVariable<int32> CVarSLFlythroughAllowSoftwareFallback(
 	}), ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarSLFlythroughGTSPP(
-	TEXT("SL.Flythrough.GTSPP"), 64,
-	TEXT("Samples per pixel accumulated for the flythrough ground truth (default 64).\n")
+	TEXT("SL.Flythrough.GTSPP"), 512,
+	TEXT("Samples per pixel accumulated for the flythrough ground truth (default 512).\n")
 	TEXT("The GT method and its results folder are named <N>SPP_GT. Changes during capture apply to the next run."),
 	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*)
 	{
@@ -112,13 +117,50 @@ static TAutoConsoleVariable<int32> CVarSLFlythroughGTSPP(
 
 static FAutoConsoleCommandWithWorldAndArgs CmdSLFlythroughRunAll(
 	TEXT("SL.Flythrough.RunAll"),
-	TEXT("Capture the GT (SL.Flythrough.GTSPP) and every flythrough method for this level's scenario, then compute metrics.\n")
+	TEXT("Capture GT (default 512 SPP), then available 1spp, SVGF, DLSS and Open Image Denoise methods for the selected path, then compute metrics.\n")
 	TEXT("Pass 'quit' to exit when finished, e.g. -ExecCmds=\"SL.Flythrough.RunAll quit\"."),
 	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
 	{
-		if (auto* Flythrough = World ? World->GetSubsystem<USLFlythroughSubsystem>() : nullptr)
-			Flythrough->StartBatch(Args.Contains(TEXT("quit")));
+        if (Args.Num() > 1 || (Args.Num() == 1 && !Args[0].Equals(TEXT("quit"), ESearchCase::IgnoreCase)))
+        { UE_LOG(LogSL_Test, Warning, TEXT("Usage: SL.Flythrough.RunAll [quit]")); return; }
+        if (auto* Flythrough = World ? World->GetSubsystem<USLFlythroughSubsystem>() : nullptr)
+            Flythrough->StartBatch(Args.Num() == 1);
 	}));
+
+static FAutoConsoleCommandWithWorldAndArgs CmdFlythroughMethods(TEXT("SL.Flythrough.Methods"),
+    TEXT("List current benchmark method names, IDs and hardware availability."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World) {
+        if (auto* F = World ? World->GetSubsystem<USLFlythroughSubsystem>() : nullptr)
+            for (int32 Index = 0; Index < F->GetMethods().Num(); ++Index)
+            {
+                FText Reason; const bool bAvailable = F->IsMethodAvailable(Index, Reason);
+                const auto& M = F->GetMethods()[Index];
+                UE_LOG(LogSL_Test, Display, TEXT("%s [%s]: %s"), *M.DisplayName, *M.Name, bAvailable ? TEXT("available") : *Reason.ToString());
+            }
+    }));
+
+static FAutoConsoleCommandWithWorldAndArgs CmdFlythroughRender(TEXT("SL.Flythrough.Render"),
+    TEXT("SL.Flythrough.Render <method>: capture the selected camera path using a display name or ID from SL.Flythrough.Methods. Does not compute metrics or quit."),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World) {
+        auto* F = World ? World->GetSubsystem<USLFlythroughSubsystem>() : nullptr;
+        if (!F || !F->CanChangePath() || Args.IsEmpty())
+        { UE_LOG(LogSL_Test, Warning, TEXT("SL.Flythrough.Render requires a method and an idle game viewport.")); return; }
+        const FString Name = FString::Join(Args, TEXT(" "));
+        const int32 Index = F->GetMethods().IndexOfByPredicate([&](const FSLFlythroughMethod& M) {
+            return M.Name.Equals(Name, ESearchCase::IgnoreCase) || M.DisplayName.Equals(Name, ESearchCase::IgnoreCase);
+        });
+        FText Reason;
+        if (!F->IsMethodAvailable(Index, Reason))
+        { UE_LOG(LogSL_Test, Warning, TEXT("Cannot render '%s': %s. Use SL.Flythrough.Methods."), *Name, *Reason.ToString()); return; }
+        F->SelectMethod(Index);
+        F->StartFlythrough();
+    }));
+
+bool USLFlythroughSubsystem::CanChangePath() const
+{
+    const auto* Raw = GetWorld()->GetSubsystem<USLRawInputsSubsystem>();
+    return !IsBusy() && !bBatchActive && !bComputingMetrics && (!Raw || !Raw->IsActive());
+}
 
 TStatId USLFlythroughSubsystem::GetStatId() const
 {
@@ -151,71 +193,20 @@ void USLFlythroughSubsystem::Deinitialize()
 void USLFlythroughSubsystem::RegisterMethods()
 {
 	Methods.Reset();
-
-	// 1SPP_Noisy — raw path tracer, no denoising
-	{
-		FSLFlythroughMethod M;
-		M.Name = TEXT("1SPP_Noisy");
-		M.SPP = 1;
-		M.DenoiserMethod = 0;
-		M.bAccumulate = false;
-		M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), TEXT("1")});
-		Methods.Add(MoveTemp(M));
-	}
-
-	// 1SPP_Gaussian
-	{
-		FSLFlythroughMethod M;
-		M.Name = TEXT("1SPP_Gaussian");
-		M.SPP = 1;
-		M.DenoiserMethod = 1;
-		M.bAccumulate = false;
-		M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), TEXT("1")});
-		Methods.Add(MoveTemp(M));
-	}
-
-	// 1SPP_Bilateral
-	{
-		FSLFlythroughMethod M;
-		M.Name = TEXT("1SPP_Bilateral");
-		M.SPP = 1;
-		M.DenoiserMethod = 2;
-		M.bAccumulate = false;
-		M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), TEXT("1")});
-		Methods.Add(MoveTemp(M));
-	}
-
-	// 1SPP_NeuralPlaceholder
-	{
-		FSLFlythroughMethod M;
-		M.Name = TEXT("1SPP_NeuralPlaceholder");
-		M.SPP = 1;
-		M.DenoiserMethod = 3;
-		M.bAccumulate = false;
-		M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), TEXT("1")});
-		Methods.Add(MoveTemp(M));
-	}
-
-	// 1SPP_NNE
-	{
-		FSLFlythroughMethod M;
-		M.Name = TEXT("1SPP_NNE");
-		M.SPP = 1;
-		M.DenoiserMethod = 4;
-		M.bAccumulate = false;
-		M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), TEXT("1")});
-		Methods.Add(MoveTemp(M));
-	}
-
-	// <N>SPP_GT — ground truth baseline; N comes from SL.Flythrough.GTSPP
-	{
-		FSLFlythroughMethod M;
-		M.DenoiserMethod = 0; // no denoising on GT
-		M.bAccumulate = true;
-		M.bIsGT = true;
-		M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), TEXT("0")});
-		Methods.Add(MoveTemp(M));
-	}
+    for (const auto& Definition : SLRenderingMethods::Get())
+    {
+        FSLFlythroughMethod M;
+        M.Name = Definition.Id;
+        M.DisplayName = Definition.Label;
+        M.UnavailableReason = Definition.UnavailableReason;
+        M.DenoiserMethod = 0;
+        M.bIsGT = M.bAccumulate = Definition.Action == ESLComparisonAction::Reference;
+        M.SPP = M.bIsGT ? 512 : 1;
+        M.Backend = SLRenderingMethods::GetBackend(Definition);
+        M.WarmUpFrames = (M.Backend == ESLGMRenderBackend::SVGF || M.Backend == ESLGMRenderBackend::LumenDLSSRR) ? 32 : 1;
+        M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), M.bAccumulate ? TEXT("0") : TEXT("1")});
+        Methods.Add(MoveTemp(M));
+    }
 	ApplyGTSPP();
 }
 
@@ -228,6 +219,7 @@ void USLFlythroughSubsystem::ApplyGTSPP()
 		{
 			// Each sample count gets its own results folder, so GTs at different SPP never mix.
 			Method.SPP = SPP;
+            Method.DisplayName = FString::Printf(TEXT("%dspp"), SPP);
 			Method.Name = FString::Printf(TEXT("%dSPP_GT"), SPP);
 		}
 }
@@ -238,9 +230,43 @@ FString USLFlythroughSubsystem::GetGTMethodName() const
 	return GT ? GT->Name : FString();
 }
 
+bool USLFlythroughSubsystem::IsMethodAvailable(int32 Index, FText& Reason) const
+{
+    Reason = FText::GetEmpty();
+    auto Reject = [&Reason](const FString& Message) { Reason = FText::FromString(Message); return false; };
+    if (!Methods.IsValidIndex(Index)) return Reject(TEXT("No method selected."));
+    const auto& Method = Methods[Index];
+    if (!Method.UnavailableReason.IsEmpty()) return Reject(Method.UnavailableReason);
+    if (Method.Backend == ESLGMRenderBackend::PathTracing) return true;
+    if (!IsRayTracingEnabled()) return Reject(TEXT("Renderer denoiser benchmarks require hardware ray tracing; synthetic fallback is not supported."));
+    const auto* Config = GetDefault<USLGMToolSettings>()->Configuration.LoadSynchronous();
+    const auto* Profile = Config ? Config->FindProfile(FName(*Method.Name)) : nullptr;
+    if (!Profile || Profile->Profile.Backend != Method.Backend) return Reject(TEXT("The matching GM rendering profile is missing or has a different backend."));
+    for (const auto& Setting : Profile->RenderSettings)
+        if (!IConsoleManager::Get().FindConsoleVariable(*Setting.Name)) return Reject(TEXT("Unavailable rendering setting: ") + Setting.Name);
+    if (Method.Backend == ESLGMRenderBackend::LumenDLSSRR)
+    {
+        if (!UDLSSLibrary::IsDLSSSupported() || !UDLSSLibrary::IsDLSSRRSupported())
+            return Reject(TEXT("DLSS Ray Reconstruction requires a supported GPU and DX12 Standalone Game."));
+    }
+    else if (Method.Backend == ESLGMRenderBackend::OpenImageDenoise)
+    {
+        if (!SLOpenImageDenoise::IsAvailable(Reason)) return false;
+    }
+    else
+    {
+        const auto* Velocity = IConsoleManager::Get().FindConsoleVariable(TEXT("r.VelocityOutputPass"));
+        const auto* GBuffer = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Substrate.ProjectGBufferFormat"));
+        if (!Velocity || Velocity->GetInt() != 1 || !GBuffer || GBuffer->GetInt() != 0)
+            return Reject(TEXT("SVGF requires r.VelocityOutputPass=1 and r.Substrate.ProjectGBufferFormat=0; restart after changing startup settings."));
+    }
+    return true;
+}
+
 void USLFlythroughSubsystem::SelectMethod(int32 Index)
 {
-	if (!IsBusy() && Index >= 0 && Index < Methods.Num())
+	FText Reason;
+	if (!IsBusy() && IsMethodAvailable(Index, Reason))
 		SelectedMethod = Index;
 }
 
@@ -515,15 +541,25 @@ bool USLFlythroughSubsystem::EvaluateSequenceFrame(int32 FrameIndex)
 // Settings Management
 // -----------------------------------------------------------------------
 
-void USLFlythroughSubsystem::ApplyMethodSettings(const FSLFlythroughMethod& Method)
+// Flythrough keeps shared scene quality fixed. Import only the profile's renderer adapter settings,
+// not its scalability presets (which mutate many unrelated CVars through callbacks).
+static bool IsBackendSetting(const FString& Name)
+{
+    return Name.StartsWith(TEXT("r.Lumen.")) || Name.StartsWith(TEXT("SL.SVGF."))
+        || Name.StartsWith(TEXT("r.TemporalAA."))
+        || Name == TEXT("r.DynamicGlobalIlluminationMethod") || Name == TEXT("r.ReflectionMethod")
+        || Name == TEXT("r.AntiAliasingMethod") || Name == TEXT("r.ScreenPercentage")
+        || Name == TEXT("r.DynamicRes.OperationMode");
+}
+
+bool USLFlythroughSubsystem::ApplyMethodSettings(const FSLFlythroughMethod& Method)
 {
 	SavedCVars.Reset();
 	bSavedPathTracing = GetWorld()->GetGameViewport()->EngineShowFlags.PathTracing;
 	bSavedDLSS = UDLSSLibrary::IsDLSSEnabled();
 	bSavedRR = UDLSSLibrary::IsDLSSRREnabled();
-	UDLSSLibrary::EnableDLSSRR(false);
-	UDLSSLibrary::EnableDLSS(false);
-	UKismetRenderingLibrary::EnablePathTracing(!bSoftwareFallbackRun);
+
+	UKismetRenderingLibrary::EnablePathTracing(!bSoftwareFallbackRun && Method.Backend != ESLGMRenderBackend::LumenDLSSRR);
 	if (bSoftwareFallbackRun)
 	{
 		const auto* PathTracer = GetWorld()->GetSubsystem<USLPathTracerSubsystem>();
@@ -544,6 +580,19 @@ void USLFlythroughSubsystem::ApplyMethodSettings(const FSLFlythroughMethod& Meth
 		}
 	};
 
+    // Snapshot profile CVars before DLSS/scalability can mutate them.
+    const auto* Config = GetDefault<USLGMToolSettings>()->Configuration.LoadSynchronous();
+    const auto* Profile = Config ? Config->FindProfile(FName(*Method.Name)) : nullptr;
+    if (Method.Backend != ESLGMRenderBackend::PathTracing && Profile)
+        for (const auto& Setting : Profile->RenderSettings)
+            if (IsBackendSetting(Setting.Name))
+            if (const auto* Var = IConsoleManager::Get().FindConsoleVariable(*Setting.Name))
+                SavedCVars.Add(Setting.Name, Var->GetString());
+    // EnableDLSS also changes these values, even when they are absent from the profile.
+    for (const TCHAR* Name : {TEXT("r.TemporalAA.Upscaler"), TEXT("r.TemporalAA.Upsampling")})
+        if (const auto* Var = IConsoleManager::Get().FindConsoleVariable(Name)) SavedCVars.Add(Name, Var->GetString());
+    UDLSSLibrary::EnableDLSSRR(false);
+    UDLSSLibrary::EnableDLSS(false);
 	SetCVar(TEXT("r.PathTracing.SamplesPerPixel"), FString::FromInt(Method.SPP));
 	SetCVar(TEXT("SL.PathTracer.TargetSPP"), FString::FromInt(Method.SPP));
 	SetCVar(TEXT("r.PathTracing.Denoiser"), TEXT("0"));
@@ -569,15 +618,47 @@ void USLFlythroughSubsystem::ApplyMethodSettings(const FSLFlythroughMethod& Meth
 	for (const auto& Override : Method.CVarOverrides)
 		SetCVar(Override.Key, Override.Value);
 
+    if (Method.Backend != ESLGMRenderBackend::PathTracing && Profile)
+        for (const auto& Setting : Profile->RenderSettings)
+            if (IsBackendSetting(Setting.Name)) SetCVar(Setting.Name, Setting.Value);
+    if (Method.Backend == ESLGMRenderBackend::SVGF)
+    {
+        GuideView = FSceneViewExtensions::NewExtension<FSLGuideProbe>(GetWorld());
+        SetCVar(TEXT("r.PathTracing.Denoiser"), TEXT("1"));
+        SetCVar(TEXT("r.PathTracing.SpatialDenoiser"), TEXT("1"));
+        SetCVar(TEXT("r.PathTracing.SpatialDenoiser.Type"), TEXT("0"));
+        SetCVar(TEXT("r.PathTracing.Denoiser.Name"), TEXT("SLGuides"));
+    }
+    else if (Method.Backend == ESLGMRenderBackend::LumenDLSSRR)
+    {
+        UDLSSLibrary::EnableDLSS(true);
+        UDLSSLibrary::EnableDLSSRR(true);
+    }
+    if (Method.Backend == ESLGMRenderBackend::OpenImageDenoise) SLOpenImageDenoise::Apply(SetCVar);
+    // Profile values must never enable a second custom filter or change benchmark sampling.
+    SetCVar(TEXT("SL.Denoiser.Method"), TEXT("0"));
+    SetCVar(TEXT("SL.PathTracer.ResetEveryFrame"), Method.bAccumulate ? TEXT("0") : TEXT("1"));
+    SetCVar(TEXT("SL.PathTracer.TargetSPP"), FString::FromInt(Method.SPP));
+    SetCVar(TEXT("r.PathTracing.SamplesPerPixel"), FString::FromInt(Method.SPP));
+
 	// Lock fixed delta time for deterministic frame pacing
 	SavedFixedDeltaTime = FApp::GetFixedDeltaTime();
 	bSavedUseFixedDeltaTime = FApp::UseFixedTimeStep();
 	FApp::SetFixedDeltaTime(FixedDeltaTime);
 	FApp::SetUseFixedTimeStep(true);
+    if (Method.Backend == ESLGMRenderBackend::LumenDLSSRR &&
+        (!UDLSSLibrary::IsDLSSEnabled() || !UDLSSLibrary::IsDLSSRREnabled()))
+    {
+        MetricsStatus = TEXT("DLSS Ray Reconstruction failed to enable; capture was not started.");
+        return false;
+    }
+    return true;
 }
 
 void USLFlythroughSubsystem::RestoreSettings()
 {
+    UDLSSLibrary::EnableDLSSRR(false);
+    UDLSSLibrary::EnableDLSS(false);
 	// TargetSPP's change delegate also writes the engine SPP; restore it first.
 	const FString TargetName = TEXT("SL.PathTracer.TargetSPP");
 	if (const FString* SavedTarget = SavedCVars.Find(TargetName))
@@ -703,6 +784,12 @@ void USLFlythroughSubsystem::ReleaseCamera()
 		AccumulationView.Reset();
 		FlushRenderingCommands();
 	}
+    if (GuideView)
+    {
+        FlushRenderingCommands();
+        GuideView.Reset();
+        FlushRenderingCommands();
+    }
 	if (SoftwareFallbackView)
 	{
 		FlushRenderingCommands();
@@ -717,6 +804,9 @@ void USLFlythroughSubsystem::ReleaseCamera()
 
 bool USLFlythroughSubsystem::CanStartFlythrough(FText& Reason) const
 {
+    if (const auto* Raw = GetWorld()->GetSubsystem<USLRawInputsSubsystem>(); Raw && Raw->IsActive())
+    { Reason = FText::FromString(TEXT("Wait for raw-inputs capture to finish.")); return false; }
+    if (GetSelectedMethod() && !IsMethodAvailable(SelectedMethod, Reason)) return false;
 	if (bPreviewing) { Reason = FText::FromString(TEXT("Stop the camera preview first.")); return false; }
 	if (bRecording) { Reason = FText::FromString(TEXT("Stop recording before capturing.")); return false; }
 	if (IsBusy())
@@ -759,18 +849,17 @@ bool USLFlythroughSubsystem::CanStartFlythrough(FText& Reason) const
 		Reason = FText::FromString(TEXT("No method selected."));
 		return false;
 	}
+    if (const auto* GI = GetWorld()->GetGameInstance(); !GI || GI->GetLocalPlayers().Num() != 1)
+    { Reason = FText::FromString(TEXT("Flythrough capture requires one local player.")); return false; }
+    for (const auto& Context : GEngine->GetWorldContexts())
+        if (Context.World() && Context.World() != GetWorld() && Context.World()->IsGameWorld())
+        { Reason = FText::FromString(TEXT("Close other game instances before capturing.")); return false; }
 	ASLFlythroughScenario* Scenario = nullptr;
 	if (!ResolveScenario(Scenario, Reason)) return false;
 	return true;
 }
 
 static const TCHAR* PartialTimingsFile = TEXT("timings_partial.csv");
-
-/** Same scene, camera, settings and method; only then may frames from two sessions share a run. */
-static bool IsSameCapture(const FSLFlythroughRunManifest& A, const FSLFlythroughRunManifest& B)
-{
-	return A.IsComparableTo(B) && A.Method == B.Method && A.SPP == B.SPP && A.DenoiserMethod == B.DenoiserMethod;
-}
 
 bool USLFlythroughSubsystem::ChooseRunDirectory(const FString& MethodDir, FSLFlythroughRunManifest& Manifest, bool& bOutAlreadyComplete)
 {
@@ -781,7 +870,7 @@ bool USLFlythroughSubsystem::ChooseRunDirectory(const FString& MethodDir, FSLFly
 	const FString NewestRun = RunNames.IsEmpty() ? FString() : FPaths::Combine(MethodDir, RunNames[0]);
 	FSLFlythroughRunManifest Existing;
 	const bool bNewestMatches = !NewestRun.IsEmpty() && FSLFlythroughMetrics::ReadRunManifest(NewestRun, Existing)
-		&& IsSameCapture(Existing, Manifest);
+		&& Existing.IsSameCaptureAs(Manifest);
 
 	if (bNewestMatches && FSLFlythroughMetrics::IsRunComplete(NewestRun))
 	{
@@ -857,6 +946,18 @@ bool USLFlythroughSubsystem::ChooseRunDirectory(const FString& MethodDir, FSLFly
 	return true;
 }
 
+void USLFlythroughSubsystem::ResetFrameHistory()
+{
+    if (!AccumulationView) return;
+    FlushRenderingCommands();
+    AccumulationView->RenderedFrames.Store(0);
+    AccumulationView->PathTracingSeed = 0;
+    if (GuideView) GuideView->ResetFrameCounters();
+    AccumulationView->bResetHistory.Store(true);
+    AccumulationView->Samples.Store(0);
+    AccumulationView->bResetAccumulation.Store(true);
+}
+
 void USLFlythroughSubsystem::RestartCurrentFrame()
 {
 	// Render time includes the whole frame, so a frame that stalled while minimized starts over.
@@ -874,6 +975,7 @@ void USLFlythroughSubsystem::RestartCurrentFrame()
 		AccumulationView->Samples.Store(0);
 		AccumulationView->bResetAccumulation.Store(true);
 	}
+	ResetFrameHistory();
 	Phase = ESLFlythroughPhase::WarmUp;
 	FrameStartTime = FPlatformTime::Seconds();
 	UE_LOG(LogSL_Test, Display, TEXT("Flythrough: window restored; re-rendering frame %d."), CurrentFrame);
@@ -952,7 +1054,15 @@ bool USLFlythroughSubsystem::StartFlythrough()
 	}
 
 	// Apply method settings
-	ApplyMethodSettings(Method);
+    if (!ApplyMethodSettings(Method))
+    {
+        ReleaseCamera();
+        RestoreSettings();
+        CurrentRunRoot.Reset();
+        Phase = ESLFlythroughPhase::Idle;
+        OnStateChanged.Broadcast();
+        return false;
+    }
 
 	// Persist the capture identity before any frame is written. Incomplete runs are ignored.
 	FSLFlythroughRunManifest Manifest;
@@ -1003,14 +1113,21 @@ bool USLFlythroughSubsystem::StartFlythrough()
 	// Snapshot renderer setting families instead of maintaining a list of individual CVars.
 	// The method-specific sample count and reset mode are intentionally excluded.
 	TArray<FString> SharedSettings;
+    TArray<FString> MethodSettings;
 	const auto CollectSetting = FConsoleObjectVisitor::CreateLambda([&](const TCHAR* Name, IConsoleObject* Object)
 	{
 		const FString Key(Name);
 		if (Key == TEXT("r.PathTracing.SamplesPerPixel")
 			|| Key == TEXT("SL.PathTracer.TargetSPP")
 			|| Key == TEXT("SL.PathTracer.ResetEveryFrame")) return;
-		if (const IConsoleVariable* Variable = Object->AsVariable())
-			SharedSettings.Add(Key + TEXT("=") + Variable->GetString());
+        if (const IConsoleVariable* Variable = Object->AsVariable())
+        {
+            MethodSettings.Add(Key + TEXT("=") + Variable->GetString());
+            // Compare shared scene settings as they were before method overrides.
+            const FString* Saved = (IsBackendSetting(Key) || Key.StartsWith(TEXT("r.PathTracing.Denoiser"))
+                || Key.StartsWith(TEXT("r.PathTracing.SpatialDenoiser"))) ? SavedCVars.Find(Key) : nullptr;
+            SharedSettings.Add(Key + TEXT("=") + (Saved ? *Saved : Variable->GetString()));
+        }
 	});
 	static const TCHAR* SettingFamilies[] = {
 		TEXT("r.PathTracing."), TEXT("r.Tonemapper."), TEXT("r.EyeAdaptation."),
@@ -1019,9 +1136,19 @@ bool USLFlythroughSubsystem::StartFlythrough()
 	for (const TCHAR* Prefix : SettingFamilies)
 		IConsoleManager::Get().ForEachConsoleObjectThatStartsWith(CollectSetting, Prefix);
 	SharedSettings.Sort();
-	Manifest.RenderSettings = FString::Printf(TEXT("path_tracing=%d;exposure_bias=%.6f"),
-		bSoftwareFallbackRun ? 0 : 1,
-		FlythroughCamera->GetCameraComponent()->PostProcessSettings.AutoExposureBias);
+    Manifest.RenderSettings = FString::Printf(TEXT("capture_protocol=2;exposure_bias=%.6f"),
+        FlythroughCamera->GetCameraComponent()->PostProcessSettings.AutoExposureBias);
+    // Backend tuning is relevant to resuming a method, but may differ from the GT.
+    const auto CollectMethodSetting = FConsoleObjectVisitor::CreateLambda([&](const TCHAR* Name, IConsoleObject* Object) {
+        if (const auto* Variable = Object->AsVariable()) MethodSettings.Add(FString(Name) + TEXT("=") + Variable->GetString());
+    });
+    for (const TCHAR* Prefix : {TEXT("r.Lumen."), TEXT("r.NGX."), TEXT("r.OIDN."), TEXT("SL.SVGF."), TEXT("r.AntiAliasingMethod"), TEXT("r.DynamicGlobalIlluminationMethod"), TEXT("r.ReflectionMethod"), TEXT("r.TemporalAA."), TEXT("r.DynamicRes.OperationMode")})
+        IConsoleManager::Get().ForEachConsoleObjectThatStartsWith(CollectMethodSetting, Prefix);
+    MethodSettings.Sort();
+    Manifest.MethodSettings = FString::Printf(TEXT("backend=%d;warmup=%d;history=camera_cut_per_pose;svgf_seed=pose_sequence;path_tracing=%d;dlss_rr=%d"),
+        int32(Method.Backend), Method.WarmUpFrames, GetWorld()->GetGameViewport()->EngineShowFlags.PathTracing ? 1 : 0,
+        UDLSSLibrary::IsDLSSRREnabled() ? 1 : 0);
+    for (const FString& Setting : MethodSettings) Manifest.MethodSettings += TEXT(";") + Setting;
 	Manifest.RenderSettings += FString::Printf(TEXT(";source_postprocess_crc=%08x"),
 		FCrc::StrCrc32(*SourcePostProcessSettings));
 	for (const FString& Setting : SharedSettings)
@@ -1062,14 +1189,18 @@ bool USLFlythroughSubsystem::StartFlythrough()
 	}
 
 	// For multi-SPP accumulation, create a view extension to track samples
-	if (Method.bAccumulate && !bSoftwareFallbackRun)
+	if (!bSoftwareFallbackRun)
 	{
 		AccumulationView = FSceneViewExtensions::NewExtension<FSLComparisonView>(GetWorld());
-		AccumulationView->bReference = true;
-		AccumulationView->DenoiserOverride = -1;
+		AccumulationView->bReference = Method.bAccumulate;
+        AccumulationView->DenoiserOverride = (Method.Backend == ESLGMRenderBackend::SVGF
+            || Method.Backend == ESLGMRenderBackend::OpenImageDenoise) ? 1 : 0;
+        AccumulationView->bAdvancePathTracingSeed = Method.Backend == ESLGMRenderBackend::SVGF;
 		AccumulationView->Samples.Store(0);
 		AccumulationView->bResetAccumulation.Store(true);
 	}
+
+	ResetFrameHistory();
 
 	// Register screenshot delegate
 	ScreenshotHandle = UGameViewportClient::OnScreenshotCaptured().AddUObject(
@@ -1118,7 +1249,7 @@ void USLFlythroughSubsystem::CancelFlythrough()
 
 bool USLFlythroughSubsystem::StartBatch(bool bQuitWhenDone)
 {
-	if (IsBusy() || bBatchActive)
+	if (!CanChangePath())
 	{
 		UE_LOG(LogSL_Test, Warning, TEXT("Flythrough batch: a capture is already running."));
 		return false;
@@ -1144,8 +1275,13 @@ bool USLFlythroughSubsystem::StartBatch(bool bQuitWhenDone)
 	BatchQueue.Reset();
 	const int32 GTIndex = Methods.IndexOfByPredicate([](const FSLFlythroughMethod& M) { return M.bIsGT; });
 	if (GTIndex != INDEX_NONE) BatchQueue.Add(GTIndex);
-	for (int32 Index = 0; Index < Methods.Num(); ++Index)
-		if (Index != GTIndex) BatchQueue.Add(Index);
+    for (int32 Index = 0; Index < Methods.Num(); ++Index)
+    {
+        if (Index == GTIndex) continue;
+        FText Reason;
+        if (IsMethodAvailable(Index, Reason)) BatchQueue.Add(Index);
+        else UE_LOG(LogSL_Test, Display, TEXT("Flythrough batch: skipping %s: %s"), *Methods[Index].DisplayName, *Reason.ToString());
+    }
 	bBatchActive = true;
 	bBatchQuitWhenDone = bQuitWhenDone;
 	bBatchRunInFlight = false;
@@ -1172,8 +1308,13 @@ void USLFlythroughSubsystem::TickBatch()
 		EndBatch(bScored, MetricsStatus);
 		return;
 	}
+    FText Reason;
+    if (!IsMethodAvailable(BatchQueue[0], Reason))
+    {
+        EndBatch(false, Reason.ToString());
+        return;
+    }
 	SelectMethod(BatchQueue[0]);
-	FText Reason;
 	if (!CanStartFlythrough(Reason))
 	{
 		// The player controller and viewport may not exist yet right after startup.
@@ -1256,9 +1397,18 @@ void USLFlythroughSubsystem::Tick(float DeltaTime)
 			RestartCurrentFrame();
 			return;
 		}
+        const auto* ActiveMethod = GetSelectedMethod();
+        if ((GuideView && GuideView->HasMissingInputs()) ||
+            (ActiveMethod && ActiveMethod->Backend == ESLGMRenderBackend::LumenDLSSRR &&
+                (!UDLSSLibrary::IsDLSSEnabled() || !UDLSSLibrary::IsDLSSRREnabled())))
+        {
+            CancelFlythrough();
+            MetricsStatus = TEXT("Capture stopped: SVGF guide inputs were missing or DLSS Ray Reconstruction was disabled.");
+            return;
+        }
 		auto* Viewport = GetWorld()->GetGameViewport();
 		if (!Viewport || !Viewport->Viewport || Viewport->Viewport->GetSizeXY() != CaptureSize
-			|| (Phase != ESLFlythroughPhase::WarmUp && FPlatformTime::Seconds() - FrameStartTime > 600.0))
+			|| (FPlatformTime::Seconds() - FrameStartTime > 600.0))
 		{
 			CancelFlythrough();
 			MetricsStatus = TEXT("Capture stopped: viewport changed or frame timed out.");
@@ -1273,8 +1423,8 @@ void USLFlythroughSubsystem::Tick(float DeltaTime)
 	switch (Phase)
 	{
 	case ESLFlythroughPhase::WarmUp:
-		// After one tick of warm-up, start rendering
-		Phase = ESLFlythroughPhase::Rendering;
+        if (AccumulationView && AccumulationView->RenderedFrames.Load() < uint32(GetSelectedMethod()->WarmUpFrames)) break;
+        Phase = ESLFlythroughPhase::Rendering;
 		break;
 
 	case ESLFlythroughPhase::Rendering:
@@ -1315,6 +1465,13 @@ void USLFlythroughSubsystem::TickRendering()
 	}
 
 	const FSLFlythroughMethod& Method = *GetSelectedMethod();
+    if (GuideView) FlushRenderingCommands();
+    if (GuideView && (GuideView->HasMissingInputs() || GuideView->GetFilteredFrames() < uint32(Method.WarmUpFrames)))
+    {
+        CancelFlythrough();
+        MetricsStatus = TEXT("Capture stopped: the SVGF filter did not execute.");
+        return;
+    }
 
 	if (Method.bAccumulate && !bSoftwareFallbackRun)
 	{
@@ -1360,6 +1517,12 @@ void USLFlythroughSubsystem::CaptureFrame()
 void USLFlythroughSubsystem::OnScreenshotCaptured(int32 Width, int32 Height, const TArray<FColor>& Pixels)
 {
 	if (Phase != ESLFlythroughPhase::AwaitingScreenshot || bFrameInterrupted) return;
+    if (GuideView && GuideView->HasMissingInputs())
+    {
+        CancelFlythrough();
+        MetricsStatus = TEXT("Capture stopped: SVGF guide inputs were missing in the captured frame.");
+        return;
+    }
 	// Include completion/readback of this frame, but exclude PNG compression and disk I/O.
 	LastFrameTimeMs = (FPlatformTime::Seconds() - FrameStartTime) * 1000.0;
 	FSLFrameTiming Timing;
@@ -1427,6 +1590,7 @@ void USLFlythroughSubsystem::AdvanceFrame()
 		AccumulationView->bResetAccumulation.Store(true);
 	}
 
+	ResetFrameHistory();
 	// Continue rendering
 	Phase = ESLFlythroughPhase::WarmUp;
 

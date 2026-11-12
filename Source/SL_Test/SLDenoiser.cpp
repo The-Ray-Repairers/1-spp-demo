@@ -257,7 +257,7 @@ FScreenPassTexture FSLDenoiserNeuralPlaceholder::Apply(
 	Params->NormalsTexture   = NormalsTex;
 	Params->DepthTexture     = DepthTex;
 	Params->VelocityTexture  = VelocityTex;
-	Params->DebugMode        = CVarSLNeuralDebugMode.GetValueOnRenderThread();
+	Params->DebugMode        = DebugModeOverride >= 0 ? DebugModeOverride : CVarSLNeuralDebugMode.GetValueOnRenderThread();
 	Params->RenderTargets[0] = FRenderTargetBinding(OutputTexture, ERenderTargetLoadAction::ENoAction);
 
 	TShaderMapRef<FSLNeuralPlaceholderPS> PixelShader(GetGlobalShaderMap(FeatureLevel));

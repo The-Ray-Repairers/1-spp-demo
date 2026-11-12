@@ -40,26 +40,18 @@ bool FSLComparisonSwitchTest::RunTest(const FString& Parameters)
     { AddError(Comparison->GetStatus().ToString()); return false; }
     Comparison->SetComparisonPosition(0.27f);
     TestTrue(TEXT("SVGF caption matches configured mode"), Comparison->GetLiveAlgorithmLabel().EqualTo(SVGF->Label));
-    for (int32 Value : {1, 2, 0})
+    const auto* Raw = Config->FindProfile(Config->BaselineProfileId);
+    if (TestNotNull(TEXT("Raw profile"), Raw))
     {
-        FText Result;
-        TestTrue(TEXT("Select filter through the same GM action"), Comparison->SelectPreviewMethod(*Method, Value, Result));
+        TestTrue(TEXT("Active method selects a full profile"), Comparison->Execute(*Raw, Config));
         TestTrue(TEXT("Wipe remains enabled"), Comparison->IsLiveComparisonEnabled());
-        TestFalse(TEXT("SVGF is no longer the input to the new filter"), Comparison->IsSVGFPreview());
+        TestFalse(TEXT("Raw selection leaves SVGF"), Comparison->IsSVGFPreview());
         TestEqual(TEXT("Divider position preserved"), Comparison->GetComparisonPosition(), 0.27f);
-        TestEqual(TEXT("Actual renderer method matches selection"), IConsoleManager::Get().FindConsoleVariable(TEXT("SL.Denoiser.Method"))->GetInt(), Value);
-        const auto* Option = Method->RadioOptions.FindByPredicate([Value](const FSLGMRadioOption& O) { return O.Value == Value; });
-        if (TestNotNull(TEXT("Configured option"), Option))
-        {
-            const auto* Raw = Config->Entries.FindByPredicate([](const FSLGMToolEntry& E) {
-                return E.Control == ESLGMControlType::RenderingAction && E.Action == ESLComparisonAction::Raw;
-            });
-            const FText Expected = Value == 0 && Raw ? Raw->Label : Option->Label;
-            TestTrue(TEXT("Caption matches actual selected filter"), Comparison->GetLiveAlgorithmLabel().EqualTo(Expected));
-            FFormatNamedArguments Args;
-            Args.Add(TEXT("Algorithm"), Expected);
-            TestTrue(TEXT("UMG text updates on the mode-change event"), Caption->GetText().EqualTo(FText::Format(Widget->Style.AfterLabelFormat, Args)));
-        }
+        TestEqual(TEXT("Raw selection disables custom filters"), IConsoleManager::Get().FindConsoleVariable(TEXT("SL.Denoiser.Method"))->GetInt(), 0);
+        TestTrue(TEXT("Caption matches selected profile"), Comparison->GetLiveAlgorithmLabel().EqualTo(Raw->Label));
+        FFormatNamedArguments Args;
+        Args.Add(TEXT("Algorithm"), Raw->Label);
+        TestTrue(TEXT("UMG caption updates"), Caption->GetText().EqualTo(FText::Format(Widget->Style.AfterLabelFormat, Args)));
     }
     TestTrue(TEXT("Switch back to SVGF"), Comparison->Execute(*SVGF, Config));
     TestTrue(TEXT("SVGF wipe remains enabled"), Comparison->IsLiveComparisonEnabled());

@@ -17,6 +17,11 @@
 	],
 	"Plugins": [
 		{
+			"Name": "OpenImageDenoise",
+			"Enabled": true,
+			"PlatformAllowList": ["Win64"]
+		},
+		{
 			"Name": "DLSS",
 			"Enabled": true,
 			"PlatformAllowList": [

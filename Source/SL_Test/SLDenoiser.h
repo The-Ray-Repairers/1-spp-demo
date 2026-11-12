@@ -251,6 +251,8 @@ public:
 class FSLDenoiserNeuralPlaceholder final : public ISLDenoiserPass
 {
 public:
+    explicit FSLDenoiserNeuralPlaceholder(int32 InDebugMode = -1) : DebugModeOverride(InDebugMode) {}
+    int32 DebugModeOverride = -1;
 	virtual FScreenPassTexture Apply(
 		FRDGBuilder&          GraphBuilder,
 		const FSceneView&     View,

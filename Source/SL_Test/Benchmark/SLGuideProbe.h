@@ -15,6 +15,10 @@ public:
     virtual void BeginRenderViewFamily(FSceneViewFamily& Family) override;
     /** Negative disables the wipe; otherwise the raw image occupies [0, Position). */
     void SetComparisonPosition(float Position);
+    bool HasMissingInputs() const;
+    uint32 GetFilteredFrames() const;
+    /** Call after flushing rendering, before warming a new benchmark pose. */
+    void ResetFrameCounters();
 private:
     FSceneViewStateReference GuideViewState;
     TSharedPtr<FSLGuideFrame, ESPMode::ThreadSafe> Frame;

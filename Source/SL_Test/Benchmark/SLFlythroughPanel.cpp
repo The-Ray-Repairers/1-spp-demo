@@ -103,11 +103,12 @@ public:
 		MethodIndex = Args._MethodIndex;
 		Subsystem = Args._Subsystem;
 
-		const FString& Name = Subsystem.IsValid() ? Subsystem->GetMethods()[MethodIndex].Name : TEXT("???");
+		const FString& Name = Subsystem.IsValid() ? Subsystem->GetMethods()[MethodIndex].DisplayName : TEXT("???");
 		ChildSlot
 		[
 			SNew(SButton)
-			.IsEnabled_Lambda([this] { return Subsystem.IsValid() && !Subsystem->IsBusy(); })
+			.IsEnabled_Lambda([this] { FText Reason; return Subsystem.IsValid() && !Subsystem->IsBusy() && Subsystem->IsMethodAvailable(MethodIndex, Reason); })
+            .ToolTipText_Lambda([this] { FText Reason; if (Subsystem.IsValid()) Subsystem->IsMethodAvailable(MethodIndex, Reason); return Reason; })
 			.ButtonColorAndOpacity_Lambda([this]
 			{
 				if (!Subsystem.IsValid()) return FLinearColor(0.25f, 0.3f, 0.38f);

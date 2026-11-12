@@ -20,6 +20,12 @@ bool FSLFlythroughRunManifest::IsComparableTo(const FSLFlythroughRunManifest& Ot
 		&& bSoftwareFallback == Other.bSoftwareFallback;
 }
 
+bool FSLFlythroughRunManifest::IsSameCaptureAs(const FSLFlythroughRunManifest& Other) const
+{
+    return IsComparableTo(Other) && Method == Other.Method && SPP == Other.SPP
+        && DenoiserMethod == Other.DenoiserMethod && MethodSettings == Other.MethodSettings;
+}
+
 // -----------------------------------------------------------------------
 // PNG Loading
 // -----------------------------------------------------------------------
@@ -360,6 +366,7 @@ bool FSLFlythroughMetrics::WriteRunManifest(const FString& RunDir, const FSLFlyt
 	Json->SetStringField(TEXT("camera_path"), Manifest.CameraPath);
 	Json->SetStringField(TEXT("camera_parameters"), Manifest.CameraParameters);
 	Json->SetStringField(TEXT("render_settings"), Manifest.RenderSettings);
+	Json->SetStringField(TEXT("method_settings"), Manifest.MethodSettings);
 	Json->SetNumberField(TEXT("width"), Manifest.Width);
 	Json->SetNumberField(TEXT("height"), Manifest.Height);
 	Json->SetNumberField(TEXT("frame_count"), Manifest.FrameCount);
@@ -398,6 +405,7 @@ bool FSLFlythroughMetrics::ReadRunManifest(const FString& RunDir, FSLFlythroughR
 		|| !Json->TryGetNumberField(TEXT("duration_seconds"), Manifest.DurationSeconds)
 		|| !Json->TryGetBoolField(TEXT("software_fallback"), Manifest.bSoftwareFallback)) return false;
 	Json->TryGetStringField(TEXT("capture_id"), Manifest.CaptureId);
+	Json->TryGetStringField(TEXT("method_settings"), Manifest.MethodSettings);
 	Manifest.SPP = static_cast<int32>(SPP);
 	Manifest.DenoiserMethod = static_cast<int32>(Denoiser);
 	Manifest.Width = static_cast<int32>(Width);

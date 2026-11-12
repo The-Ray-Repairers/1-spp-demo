@@ -5,6 +5,7 @@
 #include "Engine/Scene.h"
 #include "SLFlythroughMetrics.h"
 #include "SLRecordedCameraPath.h"
+#include "Debug/GMTools/SLGMToolConfig.h"
 #include "SLFlythroughSubsystem.generated.h"
 
 DECLARE_MULTICAST_DELEGATE(FSLFlythroughStateChanged);
@@ -14,6 +15,10 @@ struct FSLFlythroughMethod
 {
 	/** Display name and directory name, e.g. "1SPP_Noisy". */
 	FString Name;
+	FString DisplayName;
+	FString UnavailableReason;
+	ESLGMRenderBackend Backend = ESLGMRenderBackend::PathTracing;
+	int32 WarmUpFrames = 1;
 	/** Target samples per pixel for the path tracer. */
 	int32 SPP = 1;
 	/** SL.Denoiser.Method value (-1 = do not set). */
@@ -72,6 +77,7 @@ public:
 	const TArray<FSLFlythroughMethod>& GetMethods() const { return Methods; }
 	int32 GetSelectedMethodIndex() const { return SelectedMethod; }
 	void SelectMethod(int32 Index);
+	bool IsMethodAvailable(int32 Index, FText& Reason) const;
 	const FSLFlythroughMethod* GetSelectedMethod() const;
 
 	// ---- Flythrough Control ----
@@ -89,7 +95,7 @@ public:
 	bool SelectPath(const FString& Id);
 	/** Remove the selected recording from the list; retain its file in Deleted for recovery. */
 	bool DeleteSelectedPath();
-	bool CanChangePath() const { return !IsBusy() && !bBatchActive && !bComputingMetrics && !bRecording && !bPreviewing; }
+	bool CanChangePath() const;
 	bool StartPathPreview();
 	void StopPathPreview();
 	bool IsPreviewing() const { return bPreviewing; }
@@ -151,6 +157,7 @@ public:
 
 private:
 	friend class FSLRecordedPathViewTest;
+	friend class FSLFlythroughRendererTest;
 	friend class FSLRecordedPathDeleteTest;
 	const FSLRecordedCameraPath* GetRecordedPath() const;
 	FString GetPathFolder() const;
@@ -177,8 +184,9 @@ private:
 	void ReleaseCamera();
 	bool ValidateSequenceBindings(FText& Reason);
 	bool EvaluateSequenceFrame(int32 FrameIndex);
-	void ApplyMethodSettings(const FSLFlythroughMethod& Method);
+	bool ApplyMethodSettings(const FSLFlythroughMethod& Method);
 	void RestoreSettings();
+	void ResetFrameHistory();
 	void CaptureFrame();
 	void OnScreenshotCaptured(int32 Width, int32 Height, const TArray<FColor>& Pixels);
 	void AdvanceFrame();
@@ -240,6 +248,7 @@ private:
 	TSharedPtr<class FSLNoiseFallbackViewExtension, ESPMode::ThreadSafe> SoftwareFallbackView;
 	bool bSoftwareFallbackRun = false;
 	int32 TargetSPP = 1;
+	TSharedPtr<class FSLGuideProbe, ESPMode::ThreadSafe> GuideView;
 
 	// ---- Settings Restore ----
 	TMap<FString, FString> SavedCVars;

@@ -1,4 +1,5 @@
 #include "SLGMPanel.h"
+#include "SLRenderingMethods.h"
 #include "SLGMToolsStyle.h"
 #include "SLGMToolConfig.h"
 #include "SLGMCommandService.h"
@@ -255,6 +256,29 @@ namespace
                                     return Reason.IsEmpty() && Config.IsValid() ? Config->LiveComparison.Hint : Reason;
                                 })
                                 [SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).Text(Config->LiveComparison.ToggleLabel)]];
+                    }
+                    else if (Entry.Control == ESLGMControlType::RadioGroup && Entry.ConsoleVariable == TEXT("SL.Denoiser.Method"))
+                    {
+                        Rows->AddSlot().AutoHeight().Padding(0, 6)[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body)
+                            .Text(FText::FromString(TEXT("Active Method")))];
+                        for (const auto& Method : SLRenderingMethods::Get())
+                        {
+                            const auto* Found = Config->FindProfile(FName(Method.Id));
+                            if (!Found) continue;
+                            const FSLGMToolEntry Profile = *Found;
+                            Rows->AddSlot().AutoHeight().Padding(0, 2)[SNew(SButton)
+                                .Text(Profile.Label)
+                                .IsEnabled_Lambda([Comparison, Profile] { FText Reason; return Comparison.IsValid() && Comparison->CanExecute(Profile, Reason); })
+                                .ToolTipText_Lambda([Comparison, Profile] { FText Reason; if (Comparison.IsValid()) Comparison->CanExecute(Profile, Reason); return Reason; })
+                                .ButtonColorAndOpacity_Lambda([Comparison, Profile] {
+                                    return Comparison.IsValid() && Comparison->IsProfileSelected(Profile.Id)
+                                        ? FLinearColor(0.1f, 0.55f, 0.95f, 1.f) : FLinearColor(0.25f, 0.3f, 0.38f, 1.f);
+                                })
+                                .OnClicked_Lambda([Comparison, Config, Profile] {
+                                    if (Comparison.IsValid() && Config.IsValid()) Comparison->Execute(Profile, Config.Get());
+                                    return FReply::Handled();
+                                })];
+                        }
                     }
                     else if (Entry.Control == ESLGMControlType::RenderingStatus)
                         Rows->AddSlot().AutoHeight().Padding(0, 6)[SNew(STextBlock).TextStyle(&FGMToolsStyle::Get().Body).AutoWrapText(true)

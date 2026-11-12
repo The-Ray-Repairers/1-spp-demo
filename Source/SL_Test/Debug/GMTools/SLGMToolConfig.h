@@ -23,7 +23,7 @@ enum class ESLComparisonAction : uint8 { Raw, SVGF, RR, Reference, Restore, Open
 
 /** Renderer adapters; presets and comparison behavior are configured separately. */
 UENUM(BlueprintType)
-enum class ESLGMRenderBackend : uint8 { PathTracing, SVGF, LumenDLSSRR };
+enum class ESLGMRenderBackend : uint8 { PathTracing, SVGF, LumenDLSSRR, OpenImageDenoise };
 
 UENUM(BlueprintType)
 enum class ESLGMComparisonSource : uint8 { SharedInput, IndependentRaw };
@@ -152,6 +152,7 @@ public:
     virtual void PostEditChangeProperty(FPropertyChangedEvent& Event) override;
 #endif
     const FSLGMToolEntry* FindProfile(FName Id) const;
+    void StandardizeRenderingMethods();
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Rendering") FName BaselineProfileId;
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Rendering") FName DefaultPreviewProfileId;
     UPROPERTY() int32 RenderingProfileVersion = 0;
