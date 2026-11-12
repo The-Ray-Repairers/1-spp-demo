@@ -12,6 +12,61 @@
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/SViewport.h"
 #include "Styling/CoreStyle.h"
+#include "Engine/Console.h"
+#include "Engine/Engine.h"
+#include "HAL/IConsoleManager.h"
+#include "TimerManager.h"
+#include "SL_Test.h"
+
+namespace
+{
+	APlayerController* FindLocalPlayerController(UWorld* World)
+	{
+		return World && World->IsGameWorld() && GEngine ? GEngine->GetFirstLocalPlayerController(World) : nullptr;
+	}
+
+	/** `gm` works under any GameMode: it adds the GM component to whichever local PlayerController is active. */
+	void OpenGMTools(UWorld* InWorld)
+	{
+		APlayerController* PC = FindLocalPlayerController(InWorld);
+		if (!PC && GEngine)
+		{
+			// Typed from the editor Output Log, the command receives the editor world; fall back to a running game/PIE world.
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if ((PC = FindLocalPlayerController(Context.World())) != nullptr) break;
+			}
+		}
+		if (!PC)
+		{
+			UE_LOG(LogSL_Test, Warning, TEXT("gm: no local player controller; start play first."));
+			return;
+		}
+		USLGMToolsComponent* GMTools = PC->FindComponentByClass<USLGMToolsComponent>();
+		if (!GMTools)
+		{
+			GMTools = NewObject<USLGMToolsComponent>(PC, TEXT("GMTools_Runtime"));
+			GMTools->RegisterComponent();
+		}
+		// Console submission restores viewport focus. Open on the following tick so
+		// that restoration cannot steal focus from the panel's UI input mode.
+		PC->GetWorldTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(GMTools, [GMTools]
+		{
+			APlayerController* Owner = Cast<APlayerController>(GMTools->GetOwner());
+			if (ULocalPlayer* Player = Owner ? Owner->GetLocalPlayer() : nullptr)
+			{
+				if (Player->ViewportClient && Player->ViewportClient->ViewportConsole)
+					Player->ViewportClient->ViewportConsole->FakeGotoState(NAME_None);
+			}
+			GMTools->OpenPanel();
+		}));
+	}
+
+	FAutoConsoleCommandWithWorld GGMCommand(
+		TEXT("gm"),
+		TEXT("Open or restore the runtime GM panel for the local player (works with any PlayerController)."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(&OpenGMTools));
+}
 
 void USLGMToolsComponent::TogglePanel()
 {

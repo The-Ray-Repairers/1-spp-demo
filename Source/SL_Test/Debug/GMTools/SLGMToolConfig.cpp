@@ -68,8 +68,9 @@ void USLGMToolConfig::StandardizeRenderingMethods()
                 && (E.Id == FName(Method.Id) || (E.Action == Method.Action && Method.Action != ESLComparisonAction::ApplyProfile));
         });
         // OIDN uses the same 1-sample path tracing setup as the raw profile.
-        if (SLRenderingMethods::GetBackend(Method) == ESLGMRenderBackend::OpenImageDenoise
+        if ((SLRenderingMethods::GetBackend(Method) == ESLGMRenderBackend::OpenImageDenoise
             && (!Existing || Existing->Profile.Backend != ESLGMRenderBackend::OpenImageDenoise))
+            || (SLRenderingMethods::GetDenoiserMethod(FName(Method.Id)) != 0 && (!Existing || Existing->RenderSettings.Num() <= 1)))
             Existing = Entries.FindByPredicate([](const FSLGMToolEntry& E) {
                 return E.Control == ESLGMControlType::RenderingAction && E.Action == ESLComparisonAction::Raw;
             });
@@ -91,7 +92,7 @@ void USLGMToolConfig::StandardizeRenderingMethods()
         Entry.RenderSettings.RemoveAll([](const FSLGMRenderSetting& S) { return S.Name == TEXT("SL.Denoiser.Method"); });
         FSLGMRenderSetting Denoiser;
         Denoiser.Name = TEXT("SL.Denoiser.Method");
-        Denoiser.Value = TEXT("0");
+        Denoiser.Value = FString::FromInt(SLRenderingMethods::GetDenoiserMethod(Entry.Id));
         Entry.RenderSettings.Add(Denoiser);
         Profiles.Add(MoveTemp(Entry));
     }

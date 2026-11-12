@@ -28,10 +28,12 @@ bool FSLFlythroughRendererTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("OIDN uses the engine denoiser backend"), OIDN.Backend == ESLGMRenderBackend::OpenImageDenoise);
     TestTrue(TEXT("OIDN has no implementation blocker"), OIDN.UnavailableReason.IsEmpty());
     TestEqual(TEXT("Spatial OIDN needs no temporal settling"), OIDN.WarmUpFrames, 1);
+    TestEqual(TEXT("Ours routes to RayRepair"), Capture->Methods[4].DenoiserMethod, 5);
+    TestEqual(TEXT("KPN/Direct routes to NB Direct"), Capture->Methods[5].DenoiserMethod, 6);
     FText Reason;
-    TestFalse(TEXT("Unimplemented method remains blocked"), Capture->IsMethodAvailable(4, Reason));
+    TestFalse(TEXT("Unknown method remains blocked"), Capture->IsMethodAvailable(INDEX_NONE, Reason));
     TestFalse(TEXT("Unavailable reason supplied"), Reason.IsEmpty());
-    Capture->SelectMethod(4);
+    Capture->SelectMethod(INDEX_NONE);
     TestEqual(TEXT("Blocked selection leaves current method alone"), Capture->SelectedMethod, 0);
     Capture->AccumulationView = FSceneViewExtensions::NewExtension<FSLComparisonView>(World);
     Capture->AccumulationView->RenderedFrames.Store(99);

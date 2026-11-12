@@ -16,6 +16,9 @@ The project provides two workflows:
 
 The former Neural Placeholder is preserved as the `raw-inputs` diagnostic capture command. NNE Candy is a style-transfer model,
 not a validated denoising model. These are experimental demonstration methods.
+RayRepair (method 5) and NB Direct (method 6) run the team's neural denoisers
+from [neural-denoiser](https://github.com/The-Ray-Repairers/neural-denoiser);
+see [Neural denoisers](#neural-denoisers-methods-5-and-6).
 Hardware ray tracing is required for normal benchmarks. A synthetic noise
 fallback supports pipeline testing without a ray-tracing GPU.
 
@@ -68,8 +71,8 @@ exits the live comparison overlay.
 Rendering Comparisons, Active Method, and Flythrough Benchmark share this order:
 **1spp, 512spp, SVGF, DLSS, Ours, KPN/Direct, Open Image Denoise**.
 Active Method selects the same full rendering profiles as Rendering Comparisons.
-DLSS uses Lumen + DLSS Ray Reconstruction. Ours and KPN/Direct are disabled until their implementations are integrated; tooltips explain
-availability. Single-view references are separate from flythrough GT runs. Each
+DLSS uses Lumen + DLSS Ray Reconstruction. Ours uses RayRepair (custom pass 5); KPN/Direct uses NB Direct (custom pass 6).
+Availability tooltips identify missing model assets. Single-view references are separate from flythrough GT runs. Each
 saved reference contains `output.png` and `capture.txt` under:
 
 ```text
@@ -230,8 +233,8 @@ UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScr
 | `512spp` | Undenoised reference; defaults to 512 samples and `512SPP_GT` results. |
 | `SVGF` | 1-sample path tracing with same-frame guide buffers and SVGF filtering. |
 | `DLSS` | Lumen + DLSS Ray Reconstruction; requires supported NVIDIA hardware and DX12. |
-| `Ours` | Disabled: implementation not integrated. |
-| `KPN/Direct` | Disabled: implementation not integrated. |
+| `Ours` | RayRepair format v1 model from `SL.Denoiser.RayRepair.Model` (method 5). |
+| `KPN/Direct` | NB Direct, the NoiseBase-trained Ray Repair U-Net at `/Game/ML/nb_direct` (method 6). |
 | `Open Image Denoise` | Engine OIDN spatial denoiser on 1-sample path tracing, using albedo and normal guides. |
 
 Open Image Denoise uses the enabled UE `OpenImageDenoise` plugin (Win64 x64).
@@ -291,13 +294,15 @@ SL.Flythrough.Render 1spp
 SL.Flythrough.Render 512spp
 SL.Flythrough.Render SVGF
 SL.Flythrough.Render DLSS
+SL.Flythrough.Render Ours
+SL.Flythrough.Render KPN/Direct
 SL.Flythrough.Render OpenImageDenoise
 ```
 
 Run these one at a time. `Open Image Denoise` is also accepted as a display label.
 The GT display label follows `SL.Flythrough.GTSPP`; after overriding it, use the
 label reported by `SL.Flythrough.Methods`. Unknown or unavailable names are
-rejected without capturing another method. Ours and KPN/Direct remain unavailable;
+rejected without capturing another method. Ours and KPN/Direct require their model assets;
 Gaussian, bilateral, Neural Placeholder and Candy are not benchmark methods.
 Single-method capture does not score results or exit. Use GM's Compute Metrics
 after capturing a matching GT, or use the batch command below for unattended runs.
@@ -305,7 +310,7 @@ after capturing a matching GT, or use the batch command below for unattended run
 ### Batch capture and resume
 
 `SL.Flythrough.RunAll [quit]` captures GT first (512 SPP by default), then available
-1spp, SVGF, DLSS, and Open Image Denoise runs, computes metrics,
+1spp, SVGF, DLSS, Ours, KPN/Direct, and Open Image Denoise runs, computes metrics,
 and logs a `Flythrough result:` line per method. It uses the selected path in the
 current game session. Add `quit` to exit afterward; failure returns a nonzero exit
 code. For a level with a configured Sequence, a standalone example is:
@@ -438,15 +443,56 @@ relevant rendering settings and restores them afterward.
 | `SL.PathTracer.ResetEveryFrame` | `1` | Reset accumulation every frame; `0` permits accumulation. |
 | `SL.PathTracer.TargetSPP` | `1` | Set hardware path-tracing samples or the synthetic fallback's noise scaling. |
 | `SL.NoiseFallback.Scale` | `1.0` | Synthetic noise intensity; `0` disables injected noise. |
-| `SL.Denoiser.Method` | `0` | Legacy/debug custom pass: `0` none, `1` Gaussian, `2` bilateral, `3` diagnostic grid, `4` NNE Candy. These values do not select GM renderer backends. |
+| `SL.Denoiser.Method` | `0` | Custom/debug pass: `0` none, `1` Gaussian, `2` bilateral, `3` diagnostic grid, `4` NNE Candy, `5` RayRepair (Ours), `6` NB Direct (KPN/Direct). SVGF, DLSS and OIDN use GM renderer profiles rather than this CVar. |
+| `SL.Denoiser.RayRepair.Model` | `/Game/ML/RayRepair_v1_1920x1080` | NNE model asset for Ours/method 5 (format v1 export from `export_ue.py`); changing it reloads the model. |
 | `SL.Denoiser.GaussianBlur.Sigma` | `1.5` | Gaussian standard deviation in pixels; larger values blur more. |
 | `SL.Denoiser.Bilateral.SigmaSpatial` | `2.0` | Bilateral spatial neighborhood scale. |
 | `SL.Denoiser.Bilateral.SigmaColor` | `0.1` | Bilateral color similarity scale; smaller values preserve edges more strongly. |
 | `SL.Denoiser.Neural.DebugMode` | `0` | Placeholder visualization: `0` composite, `1` noisy color, `2` albedo, `3` normals, `4` depth, `5` motion vectors. |
 
 Selecting NNE Candy locks auto-exposure because its model expects display-referred
-images in the 0-255 range. The active custom denoising method is displayed in the
-viewport.
+images in the 0-255 range. Methods 5 and 6 lock it as well, so pre-exposed HDR input
+stays on one scale between frames. The active custom denoising method is displayed
+in the viewport.
+
+### Neural denoisers (methods 5 and 6)
+
+Both run a Ray Repair ONNX model through NNE (`NNERuntimeORTDml`) on the
+pre-tonemap linear-HDR scene colour, at full view-rect resolution. The model takes
+`ue_buffers` `[1,10,H,W]` (colour, base colour, normal, depth) and returns
+`denoised_rgb` `[1,3,H,W]`; all normalisation happens inside the graph.
+
+| Method | Model | Channels 6-9 written by `SLRayRepairPreprocess.usf` |
+| --- | --- | --- |
+| `5` RayRepair | `SL.Denoiser.RayRepair.Model`, a format v1 export (`export_ue.py`, trained with `--data ue`) | World-space normal, z-depth (cm) |
+| `6` NB Direct | `/Game/ML/nb_direct`, neural-denoiser `runs/nb_direct` (direct U-Net trained on NoiseBase) | Camera-basis normal `[n·forward, n·right, n·up]`, camera distance (cm) |
+
+Models with symbolic height/width follow the viewport size. Static exports must
+match the view rect exactly (`r.ScreenPercentage 100` and a matching window);
+otherwise the pass logs an error and passes the noisy frame through.
+
+**Setting up a NoiseBase-trained model (nb_direct).** `export_ue.py` wraps every
+checkpoint with the UE format v1 encoding at one fixed resolution, but a NoiseBase
+checkpoint learned NoiseBase's encoding: colour clamped at its per-frame 99.5th
+percentile, camera-basis normals, and `log(1 + 1/distance)` depth min-max
+normalised per frame. `Scripts/rewrap_rayrepair_onnx.py` keeps the trained U-Net,
+replaces the input encoding, and makes H and W dynamic. The percentile is estimated
+on every 4th pixel in x and y. Then `Scripts/import_nb_direct.py` imports the
+result as `/Game/ML/nb_direct` and updates the legacy radio-option metadata.
+The standardized GM UI and benchmark registry expose this model as **KPN/Direct**:
+
+```bash
+python Scripts/rewrap_rayrepair_onnx.py nb_direct.onnx nb_direct_noisebase.onnx --encoding noisebase
+UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScriptPlugin -script="<project>/Scripts/import_nb_direct.py C:/path/to/nb_direct_noisebase.onnx" -unattended -nosplash
+```
+
+Use forward slashes in the `.onnx` path: the commandlet unescapes backslashes.
+The automation test `SL.Denoiser.NBDirectModel` runs the asset on DirectML through
+RDG at three sizes and compares it with `NNERuntimeORTCpu`; it needs a D3D12 RHI
+(for example `-RenderOffscreen -dx12`).
+
+NoiseBase scenes differ from UE scenes (metres versus centimetres, renderer, and
+materials), so nb_direct is a transfer experiment rather than a tuned UE denoiser.
 
 ### Built-in path-tracer denoiser experiments
 
@@ -504,7 +550,9 @@ is defined in C++; camera paths come from recordings or Level Sequences.
 | `Source/SL_Test/Benchmark/SLComparison*` | Interactive rendering profiles, references, and live comparison. |
 | `Source/SL_Test/Debug/GMTools/` | GM configuration, commands, panel, and comparison widgets. |
 | `Source/SL_Test/SLPathTracerSubsystem.*` | Startup path tracing, sampling controls, and fallback integration. |
-| `Source/SL_Test/SLDenoiser*`, `Shaders/` | Filter implementations and shader passes. |
+| `Source/SL_Test/SLDenoiser*`, `Shaders/` | Filter implementations and shader passes, including the NNE neural denoisers (methods 4-6). |
+| `Source/SL_Test/SLNBDirectModelTests.cpp` | DirectML-versus-CPU check of `/Game/ML/nb_direct`. |
+| `Scripts/rewrap_rayrepair_onnx.py`, `Scripts/import_nb_direct.py` | Ray Repair ONNX re-encoding and nb_direct import/GM registration. |
 | `Source/SL_Test/SL_Test.Build.cs` | Module dependencies. |
 
 ### Shader development

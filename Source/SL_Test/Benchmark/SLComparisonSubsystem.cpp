@@ -61,6 +61,7 @@ bool USLComparisonSubsystem::CanExecute(const FSLGMToolEntry& Requested, FText& 
     if (Entry.Action == ESLComparisonAction::OpenResults) return !Output.IsEmpty();
     for (const auto& Method : SLRenderingMethods::Get())
         if (Entry.Id == FName(Method.Id) && Method.UnavailableReason[0]) return Reject(Method.UnavailableReason);
+    if (!SLRenderingMethods::CheckModelAvailable(SLRenderingMethods::GetDenoiserMethod(Entry.Id), Reason)) return false;
     if (Entry.Id.IsNone()) return Reject(TEXT("Give each rendering profile a unique Id."));
     if (Configuration && Configuration->Entries.FilterByPredicate([&](const FSLGMToolEntry& E) { return E.Id == Entry.Id; }).Num() > 1)
         return Reject(TEXT("Rendering profile Ids must be unique."));

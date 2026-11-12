@@ -42,6 +42,12 @@ bool FSLRenderingMethodsTest::RunTest(const FString& Parameters)
         TestEqual(TEXT("OIDN denoises one sample"), OIDN->Profile.SamplesPerPixel, 1);
         TestFalse(TEXT("OIDN is not the accumulated reference"), OIDN->Profile.bAccumulate);
     }
+    for (const auto& Pair : TArray<TPair<FName, FString>>{{TEXT("Ours"), TEXT("5")}, {TEXT("KPN_Direct"), TEXT("6")}})
+    {
+        const auto* Profile = Config->FindProfile(Pair.Key);
+        const auto* Setting = Profile ? Profile->RenderSettings.FindByPredicate([](const FSLGMRenderSetting& S) { return S.Name == TEXT("SL.Denoiser.Method"); }) : nullptr;
+        if (TestNotNull(TEXT("Neural profile has a filter selection"), Setting)) TestEqual(TEXT("Neural profile selects the incoming implementation"), Setting->Value, Pair.Value);
+    }
     return true;
 }
 #endif

@@ -117,7 +117,7 @@ static TAutoConsoleVariable<int32> CVarSLFlythroughGTSPP(
 
 static FAutoConsoleCommandWithWorldAndArgs CmdSLFlythroughRunAll(
 	TEXT("SL.Flythrough.RunAll"),
-	TEXT("Capture GT (default 512 SPP), then available 1spp, SVGF, DLSS and Open Image Denoise methods for the selected path, then compute metrics.\n")
+	TEXT("Capture GT (default 512 SPP), then available 1spp, SVGF, DLSS, Ours, KPN/Direct and Open Image Denoise methods for the selected path, then compute metrics.\n")
 	TEXT("Pass 'quit' to exit when finished, e.g. -ExecCmds=\"SL.Flythrough.RunAll quit\"."),
 	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args, UWorld* World)
 	{
@@ -199,7 +199,7 @@ void USLFlythroughSubsystem::RegisterMethods()
         M.Name = Definition.Id;
         M.DisplayName = Definition.Label;
         M.UnavailableReason = Definition.UnavailableReason;
-        M.DenoiserMethod = 0;
+        M.DenoiserMethod = SLRenderingMethods::GetDenoiserMethod(FName(Definition.Id));
         M.bIsGT = M.bAccumulate = Definition.Action == ESLComparisonAction::Reference;
         M.SPP = M.bIsGT ? 512 : 1;
         M.Backend = SLRenderingMethods::GetBackend(Definition);
@@ -237,7 +237,7 @@ bool USLFlythroughSubsystem::IsMethodAvailable(int32 Index, FText& Reason) const
     if (!Methods.IsValidIndex(Index)) return Reject(TEXT("No method selected."));
     const auto& Method = Methods[Index];
     if (!Method.UnavailableReason.IsEmpty()) return Reject(Method.UnavailableReason);
-    if (Method.Backend == ESLGMRenderBackend::PathTracing) return true;
+    if (Method.Backend == ESLGMRenderBackend::PathTracing) return SLRenderingMethods::CheckModelAvailable(Method.DenoiserMethod, Reason);
     if (!IsRayTracingEnabled()) return Reject(TEXT("Renderer denoiser benchmarks require hardware ray tracing; synthetic fallback is not supported."));
     const auto* Config = GetDefault<USLGMToolSettings>()->Configuration.LoadSynchronous();
     const auto* Profile = Config ? Config->FindProfile(FName(*Method.Name)) : nullptr;
@@ -636,7 +636,7 @@ bool USLFlythroughSubsystem::ApplyMethodSettings(const FSLFlythroughMethod& Meth
     }
     if (Method.Backend == ESLGMRenderBackend::OpenImageDenoise) SLOpenImageDenoise::Apply(SetCVar);
     // Profile values must never enable a second custom filter or change benchmark sampling.
-    SetCVar(TEXT("SL.Denoiser.Method"), TEXT("0"));
+    SetCVar(TEXT("SL.Denoiser.Method"), FString::FromInt(Method.DenoiserMethod));
     SetCVar(TEXT("SL.PathTracer.ResetEveryFrame"), Method.bAccumulate ? TEXT("0") : TEXT("1"));
     SetCVar(TEXT("SL.PathTracer.TargetSPP"), FString::FromInt(Method.SPP));
     SetCVar(TEXT("r.PathTracing.SamplesPerPixel"), FString::FromInt(Method.SPP));
@@ -1142,7 +1142,7 @@ bool USLFlythroughSubsystem::StartFlythrough()
     const auto CollectMethodSetting = FConsoleObjectVisitor::CreateLambda([&](const TCHAR* Name, IConsoleObject* Object) {
         if (const auto* Variable = Object->AsVariable()) MethodSettings.Add(FString(Name) + TEXT("=") + Variable->GetString());
     });
-    for (const TCHAR* Prefix : {TEXT("r.Lumen."), TEXT("r.NGX."), TEXT("r.OIDN."), TEXT("SL.SVGF."), TEXT("r.AntiAliasingMethod"), TEXT("r.DynamicGlobalIlluminationMethod"), TEXT("r.ReflectionMethod"), TEXT("r.TemporalAA."), TEXT("r.DynamicRes.OperationMode")})
+    for (const TCHAR* Prefix : {TEXT("r.Lumen."), TEXT("r.NGX."), TEXT("r.OIDN."), TEXT("SL.SVGF."), TEXT("SL.Denoiser.RayRepair."), TEXT("r.AntiAliasingMethod"), TEXT("r.DynamicGlobalIlluminationMethod"), TEXT("r.ReflectionMethod"), TEXT("r.TemporalAA."), TEXT("r.DynamicRes.OperationMode")})
         IConsoleManager::Get().ForEachConsoleObjectThatStartsWith(CollectMethodSetting, Prefix);
     MethodSettings.Sort();
     Manifest.MethodSettings = FString::Printf(TEXT("backend=%d;warmup=%d;history=camera_cut_per_pose;svgf_seed=pose_sequence;path_tracing=%d;dlss_rr=%d"),

@@ -21,10 +21,6 @@ class ASL_TestPlayerController : public APlayerController
 public:
 	ASL_TestPlayerController();
 
-	/** Open the runtime GM panel from the local player's console. */
-	UFUNCTION(Exec)
-	void gm();
-
 private:
 	UPROPERTY(VisibleAnywhere, Category="Debug")
 	TObjectPtr<class USLGMToolsComponent> GMTools;

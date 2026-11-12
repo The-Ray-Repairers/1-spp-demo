@@ -1,0 +1,79 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// SLRayRepairPreprocess.usf
+//
+// Packs the Ray Repair format v1 input tensor "ue_buffers" [1, 10, H, W],
+// float32, NCHW planar (element (c, y, x) at c*H*W + y*W + x):
+//
+//   ch 0-2  color       linear HDR scene color, 1 spp, pre-exposed (before tonemapping)
+//   ch 3-5  base_color  linear material base color, [0, 1]
+//   ch 6-8  normal      InputEncoding 0: world-space unit normal, decoded to [-1, 1]
+//                       InputEncoding 1: same normal in the camera basis
+//                                        [n.forward, n.right, n.up] (NoiseBase)
+//   ch 9    depth       InputEncoding 0: linear scene depth along the camera forward axis, cm
+//                       InputEncoding 1: Euclidean distance from the camera, cm (NoiseBase)
+//
+// Copy and decode only: demodulation, log compression and depth encoding all
+// happen inside the ONNX graph (neural-denoiser denoiser/ue_format.py, or
+// Scripts/rewrap_rayrepair_onnx.py --encoding noisebase).
+//
+// G-Buffer decode via GetGBufferData assumes the legacy layout, which this
+// project gets from r.Substrate.ProjectGBufferFormat=0 (blendable GBuffer).
+//
+// Used by:
+//   SL.Denoiser.Method 5 (InputEncoding 0), 6 (InputEncoding 1)
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"   // GetGBufferData, CalcSceneDepth, LookupDeviceZ
+
+Texture2D<float4> SceneColorTexture;
+uint2 ViewRectMin;
+uint2 TensorSize;                      // (W, H) of the model input == view rect size
+uint InputEncoding;                    // 0 = format v1, 1 = NoiseBase
+RWBuffer<float> OutputTensor;          // 10 * H * W floats
+
+// Sky / far plane distance for the NoiseBase encoding; log(1 + 1/d) is ~0 there.
+static const float SkyDistanceCm = 1e8;
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (any(Id.xy >= TensorSize)) return;
+
+    uint2  Pixel    = ViewRectMin + Id.xy;
+    float2 BufferUV = (float2(Pixel) + 0.5) * View.BufferSizeAndInvSize.zw;
+
+    float3 Color = SceneColorTexture.Load(int3(Pixel, 0)).rgb;
+    FGBufferData GBuffer = GetGBufferData(BufferUV);
+    float3 Normal = GBuffer.WorldNormal;
+    float Depth = CalcSceneDepth(BufferUV);
+
+    if (InputEncoding == 1)
+    {
+        // NoiseBase screen_space_normal: projections onto the camera's forward, right and up axes.
+        Normal = float3(dot(Normal, View.ViewForward), dot(Normal, View.ViewRight), dot(Normal, View.ViewUp));
+
+        // NoiseBase log_depth uses the distance to the camera, not z-depth.
+        float DeviceZ = LookupDeviceZ(BufferUV);
+        Depth = SkyDistanceCm;
+        if (DeviceZ > 0.0)
+        {
+            float4 TranslatedWorld = mul(float4(float2(Pixel) + 0.5, DeviceZ, 1), View.SVPositionToTranslatedWorld);
+            if (TranslatedWorld.w > 0.0)
+                Depth = min(length(TranslatedWorld.xyz / TranslatedWorld.w - View.TranslatedWorldCameraOrigin), SkyDistanceCm);
+        }
+    }
+
+    uint Plane = TensorSize.x * TensorSize.y;
+    uint I     = Id.y * TensorSize.x + Id.x;
+
+    OutputTensor[0 * Plane + I] = Color.r;
+    OutputTensor[1 * Plane + I] = Color.g;
+    OutputTensor[2 * Plane + I] = Color.b;
+    OutputTensor[3 * Plane + I] = GBuffer.BaseColor.r;
+    OutputTensor[4 * Plane + I] = GBuffer.BaseColor.g;
+    OutputTensor[5 * Plane + I] = GBuffer.BaseColor.b;
+    OutputTensor[6 * Plane + I] = Normal.x;
+    OutputTensor[7 * Plane + I] = Normal.y;
+    OutputTensor[8 * Plane + I] = Normal.z;
+    OutputTensor[9 * Plane + I] = Depth;
+}
