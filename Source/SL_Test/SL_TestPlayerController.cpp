@@ -18,22 +18,6 @@ ASL_TestPlayerController::ASL_TestPlayerController()
 	GMTools = CreateDefaultSubobject<USLGMToolsComponent>(TEXT("GMTools"));
 }
 
-void ASL_TestPlayerController::gm()
-{
-	if (!IsLocalPlayerController()) return;
-	// Console submission restores viewport focus. Open on the following tick so
-	// that restoration cannot steal focus from the panel's UI input mode.
-	GetWorldTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(this, [this]
-	{
-		if (ULocalPlayer* Player = GetLocalPlayer())
-		{
-			if (Player->ViewportClient && Player->ViewportClient->ViewportConsole)
-				Player->ViewportClient->ViewportConsole->FakeGotoState(NAME_None);
-		}
-		GMTools->OpenPanel();
-	}));
-}
-
 void ASL_TestPlayerController::BeginPlay()
 {
 	Super::BeginPlay();
