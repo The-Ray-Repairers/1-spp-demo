@@ -19,7 +19,11 @@
     "ShowFlag.MotionBlur": 0,
     "ShowFlag.DepthOfField": 0,
     "ShowFlag.Bloom": 0,
-    "ShowFlag.LocalExposure": 0
+    "ShowFlag.LocalExposure": 0,
+    "ShowFlag.Atmosphere": 0,
+    "ShowFlag.Fog": 0,
+    "ShowFlag.Particles": 0,
+    "fx.NiagaraComponentsEnabled": 0
   },
   "validation": {
     "asset_directory": "/Game/RayRepair/Cinematics/MRGConfig/Validation",
