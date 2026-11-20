@@ -6,8 +6,9 @@
 // Console variables
 // -----------------
 //   SL.Denoiser.Method                int  0 = None, 1 = GaussianBlur, 2 = BilateralFilter, 3 = NeuralPlaceholder,
-//                                          4 = NNE Candy, 5 = RayRepair, 6 = NBDirect
+//                                          4 = NNE Candy, 5 = RayRepair, 6 = NBDirect, 7 = RayRepairMotion
 //   SL.Denoiser.RayRepair.Model       string  NNE model asset for method 5
+//   SL.Denoiser.RayRepairMotion.Model string  NNE model asset for method 7 (recurrent, motion-aware)
 //   SL.Denoiser.GaussianBlur.Sigma    float  standard deviation in pixels (default 1.5)
 //   SL.Denoiser.Bilateral.SigmaSpatial float  spatial sigma (default 2.0)
 //   SL.Denoiser.Bilateral.SigmaColor  float  color sigma (default 0.1)
@@ -24,12 +25,15 @@
 #include "NNE.h"
 #include "NNERuntimeRDG.h"
 #include "NNEModelData.h"
+#include "Misc/CoreDelegates.h"
+#include "Misc/DelayedAutoRegister.h"
+#include "UObject/StrongObjectPtr.h"
 
 // ---------------------------------------------------------------------------
 // Console variables
 // ---------------------------------------------------------------------------
 
-/** Selects the active denoiser.  0 = None, 1 = GaussianBlur, 2 = BilateralFilter, 3 = NeuralPlaceholder, 4 = NNE Candy, 5 = RayRepair, 6 = NBDirect. */
+/** Selects the active denoiser.  0 = None, 1 = GaussianBlur, 2 = BilateralFilter, 3 = NeuralPlaceholder, 4 = NNE Candy, 5 = RayRepair, 6 = NBDirect, 7 = RayRepairMotion. */
 TAutoConsoleVariable<int32> CVarSLDenoiserMethod(
 	TEXT("SL.Denoiser.Method"),
 	0,
@@ -41,6 +45,7 @@ TAutoConsoleVariable<int32> CVarSLDenoiserMethod(
 	TEXT("  4: NNE Candy Model    — direct C++ inference of ONNX model via NNERuntimeRDG\n")
 	TEXT("  5: RayRepair          — Ray Repair format v1 neural denoiser (see SL.Denoiser.RayRepair.Model)\n")
 	TEXT("  6: NBDirect           — NoiseBase-trained Ray Repair U-Net (/Game/ML/nb_direct, NoiseBase input encoding)\n")
+	TEXT("  7: RayRepairMotion    — recurrent, motion-aware Ray Repair U-Net (see SL.Denoiser.RayRepairMotion.Model)\n")
 	TEXT("Changes take effect on the next rendered frame."),
 	ECVF_RenderThreadSafe);
 
@@ -68,6 +73,30 @@ static TAutoConsoleVariable<FString> CVarSLRayRepairModel(
 		ENQUEUE_RENDER_COMMAND(SLRayRepairSetModel)([Path = Var->GetString()](FRHICommandListImmediate&)
 		{
 			GSLRayRepairModelPath_RenderThread = Path;
+		});
+	}),
+	ECVF_Default);
+
+/**
+ * NNE model asset for method 7: a recurrent export from neural-denoiser's
+ * denoiser/export_onnx_ue.py (docs/UE_INTEGRATION.md), passed through
+ * Scripts/replace_gridsample_onnx.py so DirectML never runs GridSample. It takes ue_buffers in the
+ * NoiseBase encoding, motion_px and hidden_in0..4, and returns denoised_rgb and hidden_out0..4.
+ * The colour-fixed export (..._et_1920x1080), converted the same way, is a drop-in replacement.
+ */
+static FString GSLRayRepairMotionModelPath_RenderThread = TEXT("/Game/ML/rayrepair_motion_s3area_1920x1080_dmlsafe");
+static TAutoConsoleVariable<FString> CVarSLRayRepairMotionModel(
+	TEXT("SL.Denoiser.RayRepairMotion.Model"),
+	GSLRayRepairMotionModelPath_RenderThread,
+	TEXT("NNE model data asset for SL.Denoiser.Method 7, a recurrent motion-aware export from neural-denoiser's\n")
+	TEXT("denoiser/export_onnx_ue.py, converted with Scripts/replace_gridsample_onnx.py.\n")
+	TEXT("Its size is fixed at export and must equal the view rect (use r.ScreenPercentage 100).\n")
+	TEXT("Changing it reloads the model and clears the recurrent state on the next frame."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* Var)
+	{
+		ENQUEUE_RENDER_COMMAND(SLRayRepairMotionSetModel)([Path = Var->GetString()](FRHICommandListImmediate&)
+		{
+			GSLRayRepairMotionModelPath_RenderThread = Path;
 		});
 	}),
 	ECVF_Default);
@@ -119,6 +148,7 @@ IMPLEMENT_GLOBAL_SHADER(FSLNNEPostprocessCS,     "/Project/SLNNEPostprocess.usf"
 IMPLEMENT_GLOBAL_SHADER(FSLNNEUpsamplePS,        "/Project/SLNNEUpsample.usf",              "MainPS",   SF_Pixel);
 IMPLEMENT_GLOBAL_SHADER(FSLRayRepairPreprocessCS,  "/Project/SLRayRepairPreprocess.usf",    "MainCS",   SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSLRayRepairPostprocessCS, "/Project/SLRayRepairPostprocess.usf",   "MainCS",   SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSLRayRepairMotionCS,      "/Project/SLRayRepairMotion.usf",        "MainCS",   SF_Compute);
 
 // ---------------------------------------------------------------------------
 // FSLDenoiserGaussianBlur::Apply
@@ -446,24 +476,93 @@ FScreenPassTexture FSLDenoiserNNE::Apply(
 // Runs a Ray Repair ONNX model (raw UE buffers in, linear HDR out) at full
 // view-rect resolution. See neural-denoiser docs/UE_INTEGRATION.md and
 // Scripts/rewrap_rayrepair_onnx.py.
+//
+// Recurrent models also take hidden_in<i> and return hidden_out<i>. Last
+// frame's hidden_out<i> is bound as this frame's hidden_in<i>: each frame
+// writes fresh RDG buffers and extracts them into History, and the next
+// frame registers them back. Motion-aware models also take motion_px, which
+// SLRayRepairMotion.usf writes from velocity or camera reprojection.
 // ---------------------------------------------------------------------------
-static constexpr uint32 GSLRayRepairRawChannels = 10;
-static constexpr uint32 GSLRayRepairOutChannels = 3;
-
-bool FSLDenoiserRayRepair::LoadModel(const FString& ModelPath)
+// Model assets are loaded on the game thread and handed to the render thread by pointer. The
+// render thread cannot load packages itself: in a -game or cooked build the loader ignores the
+// request and the method silently passes the noisy frame through.
+namespace SLRayRepairModels
 {
-	UNNEModelData* ModelData = LoadObject<UNNEModelData>(nullptr, *ModelPath);
-	if (!ModelData && !ModelPath.Contains(TEXT(".")))
+	TMap<FString, TStrongObjectPtr<UNNEModelData>> Loaded;   // game thread; keeps loaded assets alive
+	TSet<FString> Failed;                                    // game thread; each failure is logged once
+	TMap<FString, UNNEModelData*> ForRenderThread;           // render thread
+
+	FString ObjectPath(const FString& Path)
 	{
 		// Accept "/Game/ML/Name" as well as the full object path "/Game/ML/Name.Name".
-		ModelData = LoadObject<UNNEModelData>(nullptr, *(ModelPath + TEXT(".") + FPaths::GetBaseFilename(ModelPath)));
-	}
-	if (!ModelData)
-	{
-		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: Failed to load %s"), *Name, *ModelPath);
-		return false;
+		return Path.Contains(TEXT(".")) ? Path : Path + TEXT(".") + FPaths::GetBaseFilename(Path);
 	}
 
+	/** Game thread: the model asset SL.Denoiser.Method needs, or an empty string. */
+	FString PathForMethod(int32 Method)
+	{
+		switch (static_cast<ESLDenoiserMethod>(Method))
+		{
+		case ESLDenoiserMethod::RayRepair:       return CVarSLRayRepairModel.GetValueOnGameThread();
+		case ESLDenoiserMethod::NBDirect:        return GSLNBDirectModelPath;
+		case ESLDenoiserMethod::RayRepairMotion: return CVarSLRayRepairMotionModel.GetValueOnGameThread();
+		default:                                 return FString();
+		}
+	}
+
+	/** Game thread: load Path once and hand it to the render thread. */
+	void Prepare(const FString& Path)
+	{
+		if (Path.IsEmpty() || Loaded.Contains(Path) || Failed.Contains(Path)) return;
+		UNNEModelData* Data = LoadObject<UNNEModelData>(nullptr, *ObjectPath(Path));
+		if (!Data)
+		{
+			UE_LOG(LogTemp, Error, TEXT("SLDenoiser: Failed to load NNE model asset %s"), *Path);
+			Failed.Add(Path);
+			return;
+		}
+		Loaded.Add(Path, TStrongObjectPtr<UNNEModelData>(Data));
+		ENQUEUE_RENDER_COMMAND(SLDenoiserModelReady)([Path, Data](FRHICommandListImmediate&)
+		{
+			ForRenderThread.Add(Path, Data);
+		});
+	}
+}
+
+// Every frame, before rendering and also while the game is paused (flythrough capture pauses it),
+// make sure the selected method's model is loaded.
+static FDelayedAutoRegisterHelper GSLDenoiserModelLoader(EDelayedRegisterRunPhase::EndOfEngineInit, []
+{
+	FCoreDelegates::OnBeginFrame.AddLambda([]
+	{
+		SLRayRepairModels::Prepare(SLRayRepairModels::PathForMethod(CVarSLDenoiserMethod.GetValueOnGameThread()));
+	});
+	FCoreDelegates::OnPreExit.AddLambda([]
+	{
+		SLRayRepairModels::Loaded.Empty();
+	});
+});
+
+static constexpr uint32 GSLRayRepairRawChannels = 10;
+static constexpr uint32 GSLRayRepairOutChannels = 3;
+static constexpr uint32 GSLRayRepairMotionChannels = 2;
+
+namespace SLRayRepair
+{
+	/** Index of the tensor called Name, or INDEX_NONE. */
+	int32 FindTensor(TConstArrayView<UE::NNE::FTensorDesc> Descs, const FString& Name)
+	{
+		return Descs.IndexOfByPredicate([&](const UE::NNE::FTensorDesc& D) { return D.GetName() == Name; });
+	}
+
+	FString ShapeString(TConstArrayView<int32> Dims)
+	{
+		return TEXT("[") + FString::JoinBy(Dims, TEXT(", "), [](int32 D) { return D < 0 ? FString(TEXT("?")) : FString::FromInt(D); }) + TEXT("]");
+	}
+}
+
+bool FSLDenoiserRayRepair::LoadModel(const FString& ModelPath, UNNEModelData* ModelData)
+{
 	TWeakInterfacePtr<INNERuntimeRDG> Runtime = UE::NNE::GetRuntime<INNERuntimeRDG>(TEXT("NNERuntimeORTDml"));
 	if (!Runtime.IsValid())
 	{
@@ -479,26 +578,95 @@ bool FSLDenoiserRayRepair::LoadModel(const FString& ModelPath)
 		return false;
 	}
 
-	// Still models have exactly one [1, 10, H, W] input. History models (motion_px,
-	// history_rgb) need frame-to-frame state and are not wired up yet.
+	// Match the signature by name. A model with a single input and output is a still
+	// model whatever its tensor names are (format v1 and rewrapped exports).
 	const TConstArrayView<UE::NNE::FTensorDesc> InputDescs = Instance->GetInputTensorDescs();
-	if (InputDescs.Num() != 1)
+	const TConstArrayView<UE::NNE::FTensorDesc> OutputDescs = Instance->GetOutputTensorDescs();
+	const bool bSingleIO = InputDescs.Num() == 1 && OutputDescs.Num() == 1;
+	const int32 NewBuffersInput = bSingleIO ? 0 : SLRayRepair::FindTensor(InputDescs, TEXT("ue_buffers"));
+	const int32 NewDenoisedOutput = bSingleIO ? 0 : SLRayRepair::FindTensor(OutputDescs, TEXT("denoised_rgb"));
+	if (NewBuffersInput == INDEX_NONE || NewDenoisedOutput == INDEX_NONE)
 	{
-		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: %s has %d inputs; only single-input (non-history) models are supported"),
-			*Name, *ModelPath, InputDescs.Num());
-		return false;
-	}
-	const UE::NNE::FSymbolicTensorShape& InShape = InputDescs[0].GetShape();
-	const TConstArrayView<int32> Dims = InShape.GetData();
-	if (Dims.Num() != 4 || (Dims[0] != 1 && Dims[0] != -1) || Dims[1] != (int32)GSLRayRepairRawChannels)
-	{
-		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: %s input is not a [1, %u, H, W] tensor"), *Name, *ModelPath, GSLRayRepairRawChannels);
+		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: %s has %d inputs and %d outputs but no ue_buffers input or denoised_rgb output"),
+			*Name, *ModelPath, InputDescs.Num(), OutputDescs.Num());
 		return false;
 	}
 
-	ModelInstance = Instance;
-	TensorSize    = FIntPoint::ZeroValue;
-	bDynamicSize  = Dims[2] < 0 || Dims[3] < 0;
+	const TConstArrayView<int32> Dims = InputDescs[NewBuffersInput].GetShape().GetData();
+	if (Dims.Num() != 4 || (Dims[0] != 1 && Dims[0] != -1) || Dims[1] != (int32)GSLRayRepairRawChannels)
+	{
+		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: %s ue_buffers is %s, not [1, %u, H, W]"),
+			*Name, *ModelPath, *SLRayRepair::ShapeString(Dims), GSLRayRepairRawChannels);
+		return false;
+	}
+	const bool bNewDynamicSize = Dims[2] < 0 || Dims[3] < 0;
+
+	// Every other input must be motion_px or a hidden_in<i> with a matching hidden_out<i>.
+	int32 NewMotionInput = INDEX_NONE;
+	TArray<FHiddenTensor> NewHidden;
+	TArray<UE::NNE::FTensorShape> NewStaticShapes;
+	NewStaticShapes.SetNum(InputDescs.Num());
+	for (int32 i = 0; i < InputDescs.Num(); ++i)
+	{
+		if (i == NewBuffersInput) continue;
+		const FString& InName = InputDescs[i].GetName();
+		const UE::NNE::FSymbolicTensorShape& InShape = InputDescs[i].GetShape();
+		if (!InShape.IsConcrete() || bNewDynamicSize)
+		{
+			UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: %s input %s is %s; recurrent and motion inputs need a fixed-size export"),
+				*Name, *ModelPath, *InName, *SLRayRepair::ShapeString(InShape.GetData()));
+			return false;
+		}
+		NewStaticShapes[i] = UE::NNE::FTensorShape::MakeFromSymbolic(InShape);
+
+		if (InName == TEXT("motion_px"))
+		{
+			const TConstArrayView<int32> M = InShape.GetData();
+			if (M.Num() != 4 || M[1] != (int32)GSLRayRepairMotionChannels || M[2] != Dims[2] || M[3] != Dims[3])
+			{
+				UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: %s motion_px is %s, expected [1, 2, %d, %d]"),
+					*Name, *ModelPath, *SLRayRepair::ShapeString(M), Dims[2], Dims[3]);
+				return false;
+			}
+			NewMotionInput = i;
+			continue;
+		}
+
+		if (!InName.StartsWith(TEXT("hidden_in")))
+		{
+			UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: %s has an unsupported input %s (expected ue_buffers, motion_px, hidden_in<i>)"),
+				*Name, *ModelPath, *InName);
+			return false;
+		}
+		const FString OutName = TEXT("hidden_out") + InName.RightChop(9);
+		const int32 Out = SLRayRepair::FindTensor(OutputDescs, OutName);
+		if (Out == INDEX_NONE || OutputDescs[Out].GetShape() != InShape)
+		{
+			UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: %s input %s %s has no output %s of the same shape"),
+				*Name, *ModelPath, *InName, *SLRayRepair::ShapeString(InShape.GetData()), *OutName);
+			return false;
+		}
+		NewHidden.Add({ i, Out, NewStaticShapes[i].Volume() });
+	}
+	if (OutputDescs.Num() != 1 + NewHidden.Num())
+	{
+		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: %s has %d outputs; expected denoised_rgb plus one hidden_out per hidden_in (%d)"),
+			*Name, *ModelPath, OutputDescs.Num(), NewHidden.Num());
+		return false;
+	}
+
+	ModelInstance     = Instance;
+	TensorSize        = FIntPoint::ZeroValue;
+	bDynamicSize      = bNewDynamicSize;
+	NumInputs         = InputDescs.Num();
+	NumOutputs        = OutputDescs.Num();
+	BuffersInput      = NewBuffersInput;
+	MotionInput       = NewMotionInput;
+	DenoisedOutput    = NewDenoisedOutput;
+	StaticInputShapes = MoveTemp(NewStaticShapes);
+	Hidden            = MoveTemp(NewHidden);
+	ResetHistory();
+
 	if (bDynamicSize)
 	{
 		UE_LOG(LogTemp, Display, TEXT("SLDenoiser%s: Loaded %s (dynamic resolution)"), *Name, *ModelPath);
@@ -511,14 +679,19 @@ bool FSLDenoiserRayRepair::LoadModel(const FString& ModelPath)
 		ModelInstance.Reset();
 		return false;
 	}
-	UE_LOG(LogTemp, Display, TEXT("SLDenoiser%s: Loaded %s (%dx%d)"), *Name, *ModelPath, TensorSize.X, TensorSize.Y);
+	uint64 HiddenFloats = 0;
+	for (const FHiddenTensor& H : Hidden) HiddenFloats += H.NumFloats;
+	UE_LOG(LogTemp, Display, TEXT("SLDenoiser%s: Loaded %s (%dx%d%s, %d recurrent tensors, %.1f MB state)"),
+		*Name, *ModelPath, TensorSize.X, TensorSize.Y, MotionInput != INDEX_NONE ? TEXT(", motion_px") : TEXT(""),
+		Hidden.Num(), HiddenFloats * sizeof(float) / (1024.0 * 1024.0));
 	return true;
 }
 
 bool FSLDenoiserRayRepair::ResizeTo(FIntPoint Size)
 {
-	TArray<UE::NNE::FTensorShape> InputShapes = { UE::NNE::FTensorShape::Make(
-		{ 1u, GSLRayRepairRawChannels, static_cast<uint32>(Size.Y), static_cast<uint32>(Size.X) }) };
+	TArray<UE::NNE::FTensorShape> InputShapes = StaticInputShapes;
+	InputShapes[BuffersInput] = UE::NNE::FTensorShape::Make(
+		{ 1u, GSLRayRepairRawChannels, static_cast<uint32>(Size.Y), static_cast<uint32>(Size.X) });
 	if (ModelInstance->SetInputTensorShapes(InputShapes) != UE::NNE::EResultStatus::Ok)
 	{
 		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: SetInputTensorShapes failed for %dx%d"), *Name, Size.X, Size.Y);
@@ -528,15 +701,23 @@ bool FSLDenoiserRayRepair::ResizeTo(FIntPoint Size)
 	// Output shapes are resolved here when the runtime can infer them; check the volume we bind.
 	const TConstArrayView<UE::NNE::FTensorShape> OutShapes = ModelInstance->GetOutputTensorShapes();
 	const uint64 Expected = uint64(GSLRayRepairOutChannels) * Size.X * Size.Y;
-	if (OutShapes.Num() > 0 && OutShapes[0].Volume() != Expected)
+	if (OutShapes.Num() > DenoisedOutput && OutShapes[DenoisedOutput].Volume() != Expected)
 	{
 		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: output has %llu values, expected [1, 3, %d, %d]"),
-			*Name, (unsigned long long)OutShapes[0].Volume(), Size.Y, Size.X);
+			*Name, (unsigned long long)OutShapes[DenoisedOutput].Volume(), Size.Y, Size.X);
 		TensorSize = FIntPoint::ZeroValue;
 		return false;
 	}
 	TensorSize = Size;
+	ResetHistory();
 	return true;
+}
+
+void FSLDenoiserRayRepair::ResetHistory()
+{
+	History.Reset();
+	HistoryFrame = 0;
+	HistoryViewKey = 0;
 }
 
 FScreenPassTexture FSLDenoiserRayRepair::Apply(
@@ -551,9 +732,22 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 	const FString ModelPath = GetModelPath();
 	if (ModelPath != LoadedPath)
 	{
+		// The game thread loads the asset (SLRayRepairModels::Prepare); wait for it.
+		UNNEModelData** ModelData = SLRayRepairModels::ForRenderThread.Find(ModelPath);
+		if (!ModelData)
+		{
+			if (WaitingPath != ModelPath)
+			{
+				UE_LOG(LogTemp, Display, TEXT("SLDenoiser%s: waiting for %s to load; passing through"), *Name, *ModelPath);
+				WaitingPath = ModelPath;
+			}
+			return Input;
+		}
+		WaitingPath.Reset();
 		LoadedPath = ModelPath;
 		ModelInstance.Reset();
-		bLoadFailed = !LoadModel(ModelPath);
+		ResetHistory();
+		bLoadFailed = !LoadModel(ModelPath, *ModelData);
 		LastWarnedSize = FIntPoint::ZeroValue;
 	}
 	if (bLoadFailed || !ModelInstance.IsValid()) return Input;
@@ -589,6 +783,11 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 	const FUintVector2 TensorSizeU(static_cast<uint32>(TensorSize.X), static_cast<uint32>(TensorSize.Y));
 	const FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(TensorSize, 8);
 
+	TArray<UE::NNE::FTensorBindingRDG> InputBindings;
+	InputBindings.SetNum(NumInputs);
+	TArray<UE::NNE::FTensorBindingRDG> OutputBindings;
+	OutputBindings.SetNum(NumOutputs);
+
 	// 1. Preprocess: scene color + decoded G-Buffer -> ue_buffers [1, 10, H, W]
 	FRDGBufferRef InputTensorBuffer = GraphBuilder.CreateBuffer(
 		FRDGBufferDesc::CreateBufferDesc(sizeof(float), GSLRayRepairRawChannels * Plane), TEXT("RayRepair.UEBuffers"));
@@ -605,25 +804,77 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 		TShaderMapRef<FSLRayRepairPreprocessCS> ComputeShader(GetGlobalShaderMap(FeatureLevel));
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("%sPreprocess", *Name), ComputeShader, Params, GroupCount);
 	}
+	InputBindings[BuffersInput].Buffer = InputTensorBuffer;
+
+	// 1b. motion_px [1, 2, H, W]: previous minus current pixel position
+	if (MotionInput != INDEX_NONE)
+	{
+		FRDGBufferRef MotionBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateBufferDesc(sizeof(float), GSLRayRepairMotionChannels * Plane), TEXT("RayRepair.MotionPx"));
+		FSLRayRepairMotionCS::FParameters* Params = GraphBuilder.AllocParameters<FSLRayRepairMotionCS::FParameters>();
+		Params->View          = View.ViewUniformBuffer;
+		Params->SceneTextures = Context.SceneTextures;
+		Params->ViewRectMin   = ViewRectMin;
+		Params->TensorSize    = TensorSizeU;
+		Params->OutputTensor  = GraphBuilder.CreateUAV(MotionBuffer, PF_R32_FLOAT);
+
+		TShaderMapRef<FSLRayRepairMotionCS> ComputeShader(GetGlobalShaderMap(FeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("%sMotion", *Name), ComputeShader, Params, GroupCount);
+		InputBindings[MotionInput].Buffer = MotionBuffer;
+	}
+
+	// 1c. Recurrent state: last frame's hidden_out, or zeros when there is no usable history.
+	// History only continues from the frame directly before this one, for the same view.
+	const uint64 FrameNumber = View.Family->FrameNumber;
+	const uint32 ViewKey = View.GetViewKey();
+	const bool bResetHistory = !Hidden.IsEmpty() && (History.Num() != Hidden.Num() || View.bCameraCut
+		|| HistoryFrame + 1 != FrameNumber || HistoryViewKey != ViewKey);
+	TArray<FRDGBufferRef, TInlineAllocator<8>> HiddenOut;
+	for (int32 h = 0; h < Hidden.Num(); ++h)
+	{
+		const FRDGBufferDesc Desc = FRDGBufferDesc::CreateBufferDesc(sizeof(float), static_cast<uint32>(Hidden[h].NumFloats));
+		FRDGBufferRef In;
+		if (bResetHistory)
+		{
+			In = GraphBuilder.CreateBuffer(Desc, TEXT("RayRepair.HiddenZero"));
+			AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(In, PF_R32_FLOAT), 0u);
+		}
+		else
+		{
+			In = GraphBuilder.RegisterExternalBuffer(History[h], TEXT("RayRepair.HiddenIn"));
+		}
+		InputBindings[Hidden[h].InputIndex].Buffer = In;
+
+		FRDGBufferRef Out = GraphBuilder.CreateBuffer(Desc, TEXT("RayRepair.HiddenOut"));
+		OutputBindings[Hidden[h].OutputIndex].Buffer = Out;
+		HiddenOut.Add(Out);
+	}
 
 	// 2. Inference
 	FRDGBufferRef OutputTensorBuffer = GraphBuilder.CreateBuffer(
 		FRDGBufferDesc::CreateBufferDesc(sizeof(float), GSLRayRepairOutChannels * Plane), TEXT("RayRepair.DenoisedRGB"));
-
-	TArray<UE::NNE::FTensorBindingRDG> InputBindings;
-	UE::NNE::FTensorBindingRDG InBinding;
-	InBinding.Buffer = InputTensorBuffer;
-	InputBindings.Add(InBinding);
-
-	TArray<UE::NNE::FTensorBindingRDG> OutputBindings;
-	UE::NNE::FTensorBindingRDG OutBinding;
-	OutBinding.Buffer = OutputTensorBuffer;
-	OutputBindings.Add(OutBinding);
+	OutputBindings[DenoisedOutput].Buffer = OutputTensorBuffer;
 
 	if (ModelInstance->EnqueueRDG(GraphBuilder, InputBindings, OutputBindings) != UE::NNE::EResultStatus::Ok)
 	{
 		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: EnqueueRDG failed; passing through"), *Name);
+		ResetHistory();
 		return Input;
+	}
+
+	++FramesRun;
+	if (!Hidden.IsEmpty() && !bResetHistory) ++FramesWithHistory;
+
+	// Keep this frame's hidden_out for the next frame.
+	if (!Hidden.IsEmpty())
+	{
+		History.SetNum(Hidden.Num());
+		for (int32 h = 0; h < Hidden.Num(); ++h)
+		{
+			GraphBuilder.QueueBufferExtraction(HiddenOut[h], &History[h]);
+		}
+		HistoryFrame = FrameNumber;
+		HistoryViewKey = ViewKey;
 	}
 
 	// 3. Postprocess: denoised_rgb -> full-resolution linear HDR scene color (no upsample)
@@ -649,8 +900,8 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 // ---------------------------------------------------------------------------
 ISLDenoiserPass* GetDenoiserForMethod(ESLDenoiserMethod Method)
 {
-	// Static singletons — each denoiser is stateless on the CPU side so a
-	// single instance shared across all frames is safe.
+	// Static singletons, one per method. Only a recurrent Ray Repair model keeps
+	// state between frames, and it resets that state when the view changes.
 	static FSLDenoiserNone               s_None;
 	static FSLDenoiserGaussianBlur       s_GaussianBlur;
 	static FSLDenoiserBilateralFilter    s_BilateralFilter;
@@ -661,6 +912,9 @@ ISLDenoiserPass* GetDenoiserForMethod(ESLDenoiserMethod Method)
 		[] { return GSLRayRepairModelPath_RenderThread; }, ESLRayRepairInputEncoding::FormatV1);
 	static FSLDenoiserRayRepair          s_NBDirect(TEXT("NBDirect"),
 		[] { return FString(GSLNBDirectModelPath); }, ESLRayRepairInputEncoding::NoiseBase);
+	// Method 7 is the same pass with a recurrent model; the instance keeps that model's hidden state.
+	static FSLDenoiserRayRepair          s_RayRepairMotion(TEXT("RayRepairMotion"),
+		[] { return GSLRayRepairMotionModelPath_RenderThread; }, ESLRayRepairInputEncoding::NoiseBase);
 
 	switch (Method)
 	{
@@ -681,6 +935,9 @@ ISLDenoiserPass* GetDenoiserForMethod(ESLDenoiserMethod Method)
 
 	case ESLDenoiserMethod::NBDirect:
 		return &s_NBDirect;
+
+	case ESLDenoiserMethod::RayRepairMotion:
+		return &s_RayRepairMotion;
 
 	case ESLDenoiserMethod::None:
 	default:

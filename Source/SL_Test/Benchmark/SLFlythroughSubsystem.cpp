@@ -203,7 +203,9 @@ void USLFlythroughSubsystem::RegisterMethods()
         M.bIsGT = M.bAccumulate = Definition.Action == ESLComparisonAction::Reference;
         M.SPP = M.bIsGT ? 512 : 1;
         M.Backend = SLRenderingMethods::GetBackend(Definition);
-        M.WarmUpFrames = (M.Backend == ESLGMRenderBackend::SVGF || M.Backend == ESLGMRenderBackend::LumenDLSSRR) ? 32 : 1;
+        M.WarmUpFrames = (M.Backend == ESLGMRenderBackend::SVGF || M.Backend == ESLGMRenderBackend::LumenDLSSRR) ? 32
+            // The recurrent model starts from zero hidden state; let it settle on the first pose.
+            : M.DenoiserMethod == 7 ? 8 : 1;
         M.CVarOverrides.Add({TEXT("SL.PathTracer.ResetEveryFrame"), M.bAccumulate ? TEXT("0") : TEXT("1")});
         Methods.Add(MoveTemp(M));
     }

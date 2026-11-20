@@ -20,6 +20,8 @@
 #include "ScreenPass.h"
 #include "RenderGraphBuilder.h"
 #include "SceneTexturesConfig.h"   // FSceneTextureShaderParameters
+#include "NNETypes.h"              // UE::NNE::FTensorShape
+#include <atomic>
 
 // ---------------------------------------------------------------------------
 // Denoiser method enum — mirrors the SL.Denoiser.Method CVar integer values.
@@ -46,6 +48,12 @@ enum class ESLDenoiserMethod : int32
 
 	/** nb_direct: NoiseBase-trained Ray Repair U-Net (/Game/ML/nb_direct, NoiseBase input encoding) */
 	NBDirect = 6,
+
+	/**
+	 * Recurrent, motion-aware Ray Repair U-Net (NoiseBase input encoding, SL.Denoiser.RayRepairMotion.Model).
+	 * Keeps hidden state across frames and reads a motion_px input.
+	 */
+	RayRepairMotion = 7,
 };
 
 // ---------------------------------------------------------------------------
@@ -332,12 +340,24 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// Ray Repair Denoisers (methods 5 and 6)
+// Ray Repair Denoisers (methods 5, 6 and 7)
 //
-// Run format v1 exports from neural-denoiser (denoiser/export_ue.py), or
-// models rewrapped by Scripts/rewrap_rayrepair_onnx.py:
+// Run format v1 exports from neural-denoiser (denoiser/export_ue.py), models
+// rewrapped by Scripts/rewrap_rayrepair_onnx.py, or recurrent exports from
+// denoiser/export_onnx_ue.py (neural-denoiser docs/UE_INTEGRATION.md):
 //   input  ue_buffers   [1, 10, H, W]  color(3) base_color(3) normal(3) depth(1)
+//   input  motion_px    [1,  2, H, W]  optional; previous minus current pixel position
+//   input  hidden_in<i>                optional; recurrent state from the last frame
 //   output denoised_rgb [1,  3, H, W]  linear HDR, same exposure as color
+//   output hidden_out<i>               one per hidden_in<i>, same shape
+// Inputs and outputs are matched by name. Recurrent models keep their hidden
+// state in GPU buffers between frames and start from zeros after a camera
+// cut, a skipped frame, a different view or a model reload.
+//
+// Motion-aware exports warp the hidden state with ONNX GridSample. DirectML's
+// GridSample reads past the end of its input and page-faults on exact-size RDG
+// buffers, so run such exports through Scripts/replace_gridsample_onnx.py
+// (same result, gather-based) before importing them.
 // All normalisation happens inside the ONNX graph; the shaders only copy
 // and decode buffers. The input encoding decides what channels 6-9 hold:
 //   FormatV1   world-space normal, z-depth in cm         (export_ue.py, --data ue)
@@ -364,6 +384,25 @@ class FSLRayRepairPreprocessCS : public FGlobalShader
 		SHADER_PARAMETER(FUintVector2, ViewRectMin)
 		SHADER_PARAMETER(FUintVector2, TensorSize)
 		SHADER_PARAMETER(uint32, InputEncoding)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, OutputTensor)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P)
+	{
+		return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5);
+	}
+};
+
+class FSLRayRepairMotionCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FSLRayRepairMotionCS);
+	SHADER_USE_PARAMETER_STRUCT(FSLRayRepairMotionCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureShaderParameters, SceneTextures)
+		SHADER_PARAMETER(FUintVector2, ViewRectMin)
+		SHADER_PARAMETER(FUintVector2, TensorSize)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, OutputTensor)
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -409,9 +448,22 @@ public:
 		const FSceneView&     View,
 		const FSLDenoiserContext& Context) override;
 
+	/** Frames on which the model ran, and how many of those continued last frame's recurrent state. Any thread. */
+	uint32 GetFramesRun() const { return FramesRun.load(); }
+	uint32 GetFramesWithHistory() const { return FramesWithHistory.load(); }
+
 private:
-	bool LoadModel(const FString& ModelPath);
+	/** One recurrent state tensor: hidden_in<i> -> model -> hidden_out<i>, carried to the next frame. */
+	struct FHiddenTensor
+	{
+		int32 InputIndex = INDEX_NONE;
+		int32 OutputIndex = INDEX_NONE;
+		uint64 NumFloats = 0;
+	};
+
+	bool LoadModel(const FString& ModelPath, class UNNEModelData* ModelData);
 	bool ResizeTo(FIntPoint Size);
+	void ResetHistory();
 
 	const FString Name;
 	const TFunction<FString()> GetModelPath;
@@ -419,11 +471,29 @@ private:
 
 	// Render thread only
 	FString LoadedPath;
+	FString WaitingPath;                       // model asset not handed over by the game thread yet
 	bool bLoadFailed = false;
 	bool bDynamicSize = false;                 // model input has symbolic H, W
 	TSharedPtr<UE::NNE::IModelInstanceRDG> ModelInstance;
 	FIntPoint TensorSize = FIntPoint::ZeroValue;   // current input H x W (as X = W, Y = H)
 	FIntPoint LastWarnedSize = FIntPoint::ZeroValue;
+
+	// Model signature, as indices into the model's input / output tensor lists
+	int32 NumInputs = 0;
+	int32 NumOutputs = 0;
+	int32 BuffersInput = INDEX_NONE;           // ue_buffers
+	int32 MotionInput = INDEX_NONE;            // motion_px, motion-aware models only
+	int32 DenoisedOutput = INDEX_NONE;         // denoised_rgb
+	TArray<UE::NNE::FTensorShape> StaticInputShapes;   // shapes of the non-ue_buffers inputs, by input index
+	TArray<FHiddenTensor> Hidden;              // empty for still (non-recurrent) models
+
+	// Recurrent state (render thread only)
+	TArray<TRefCountPtr<FRDGPooledBuffer>> History;    // hidden_out<i> of the last frame, one per Hidden entry
+	uint64 HistoryFrame = 0;                   // View.Family->FrameNumber that produced History
+	uint32 HistoryViewKey = 0;                 // view that produced History
+
+	std::atomic<uint32> FramesRun{ 0 };
+	std::atomic<uint32> FramesWithHistory{ 0 };
 };
 
 // ---------------------------------------------------------------------------

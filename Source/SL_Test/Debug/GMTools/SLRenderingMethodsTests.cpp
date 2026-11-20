@@ -19,7 +19,7 @@ bool FSLRenderingMethodsTest::RunTest(const FString& Parameters)
     Config->Entries.Add(Restore);
     Config->StandardizeRenderingMethods();
     Config->StandardizeRenderingMethods();
-    TestEqual(TEXT("Normalization is idempotent and preserves Restore"), Config->Entries.Num(), 8);
+    TestEqual(TEXT("Normalization is idempotent and preserves Restore"), Config->Entries.Num(), SLRenderingMethods::Get().Num() + 1);
     TestTrue(TEXT("Restore remains after the method list"), Config->Entries.Last().Action == ESLComparisonAction::Restore);
     for (int32 Index = 0; Index < SLRenderingMethods::Get().Num(); ++Index)
     {
@@ -42,7 +42,7 @@ bool FSLRenderingMethodsTest::RunTest(const FString& Parameters)
         TestEqual(TEXT("OIDN denoises one sample"), OIDN->Profile.SamplesPerPixel, 1);
         TestFalse(TEXT("OIDN is not the accumulated reference"), OIDN->Profile.bAccumulate);
     }
-    for (const auto& Pair : TArray<TPair<FName, FString>>{{TEXT("Ours"), TEXT("5")}, {TEXT("KPN_Direct"), TEXT("6")}})
+    for (const auto& Pair : TArray<TPair<FName, FString>>{{TEXT("Ours"), TEXT("5")}, {TEXT("Ours_Motion"), TEXT("7")}, {TEXT("KPN_Direct"), TEXT("6")}})
     {
         const auto* Profile = Config->FindProfile(Pair.Key);
         const auto* Setting = Profile ? Profile->RenderSettings.FindByPredicate([](const FSLGMRenderSetting& S) { return S.Name == TEXT("SL.Denoiser.Method"); }) : nullptr;

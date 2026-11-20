@@ -1,0 +1,54 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// SLRayRepairMotion.usf
+//
+// Writes the Ray Repair motion input "motion_px" [1, 2, H, W], float32, NCHW
+// planar (element (c, y, x) at c*H*W + y*W + x):
+//
+//   ch 0  previous pixel x minus current pixel x, in pixels (x right)
+//   ch 1  previous pixel y minus current pixel y, in pixels (y down)
+//
+// Same velocity-else-camera-reprojection rule as SLGuideProbe.usf: pixels
+// with base-pass velocity (moving objects) use it; everything else is
+// reprojected with the camera through View.ClipToPrevClip. The recurrent
+// model warps its hidden state along this field (grid_sample inside the ONNX
+// graph); pixels that come from off-screen get zero history there.
+//
+// Used by:
+//   SL.Denoiser.Method 7 (recurrent, motion-aware Ray Repair)
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"   // LookupDeviceZ, DecodeVelocityFromTexture
+
+uint2 ViewRectMin;
+uint2 TensorSize;                      // (W, H) of the model input == view rect size
+RWBuffer<float> OutputTensor;          // 2 * H * W floats
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 Id : SV_DispatchThreadID)
+{
+    if (any(Id.xy >= TensorSize)) return;
+
+    uint2  Pixel      = ViewRectMin + Id.xy;
+    float2 BufferUV   = (float2(Pixel) + 0.5) * View.BufferSizeAndInvSize.zw;
+    float2 ViewportUV = (float2(Id.xy) + 0.5) / float2(TensorSize);
+    float2 ScreenPos  = ViewportUV * float2(2, -2) + float2(-1, 1);
+
+    // Camera-only motion: where this surface point was on screen last frame.
+    float  DeviceZ  = LookupDeviceZ(BufferUV);
+    float4 PrevClip = mul(float4(ScreenPos, DeviceZ, 1), View.ClipToPrevClip);
+    float2 DeltaUV  = (PrevClip.xy / PrevClip.w - ScreenPos) * float2(0.5, -0.5);
+
+    // Object motion, where the base pass wrote velocity. UE stores
+    // current minus previous screen position (y up); flip to previous minus current in UV.
+    float4 Encoded = SceneTexturesStruct.GBufferVelocityTexture.Load(int3(Pixel, 0));
+    if (Encoded.x > 0)
+        DeltaUV = DecodeVelocityFromTexture(Encoded).xy * float2(-0.5, 0.5);
+
+    float2 MotionPx = DeltaUV * float2(TensorSize);
+    if (any(!IsFinite(MotionPx))) MotionPx = 0;
+
+    uint Plane = TensorSize.x * TensorSize.y;
+    uint I     = Id.y * TensorSize.x + Id.x;
+    OutputTensor[0 * Plane + I] = MotionPx.x;
+    OutputTensor[1 * Plane + I] = MotionPx.y;
+}

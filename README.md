@@ -16,9 +16,10 @@ The project provides two workflows:
 
 The former Neural Placeholder is preserved as the `raw-inputs` diagnostic capture command. NNE Candy is a style-transfer model,
 not a validated denoising model. These are experimental demonstration methods.
-RayRepair (method 5) and NB Direct (method 6) run the team's neural denoisers
+RayRepair (method 5), NB Direct (method 6) and RayRepair Motion (method 7, the
+recurrent motion-aware model) run the team's neural denoisers
 from [neural-denoiser](https://github.com/The-Ray-Repairers/neural-denoiser);
-see [Neural denoisers](#neural-denoisers-methods-5-and-6).
+see [Neural denoisers](#neural-denoisers-methods-5-6-and-7).
 Hardware ray tracing is required for normal benchmarks. A synthetic noise
 fallback supports pipeline testing without a ray-tracing GPU.
 
@@ -69,9 +70,10 @@ button and returns movement/look input to the viewport. Click that button or ent
 exits the live comparison overlay.
 
 Rendering Comparisons, Active Method, and Flythrough Benchmark share this order:
-**1spp, 512spp, SVGF, DLSS, Ours, KPN/Direct, Open Image Denoise**.
+**1spp, 512spp, SVGF, DLSS, Ours, Ours (motion), KPN/Direct, Open Image Denoise**.
 Active Method selects the same full rendering profiles as Rendering Comparisons.
-DLSS uses Lumen + DLSS Ray Reconstruction. Ours uses RayRepair (custom pass 5); KPN/Direct uses NB Direct (custom pass 6).
+DLSS uses Lumen + DLSS Ray Reconstruction. Ours uses RayRepair (custom pass 5); Ours (motion) uses
+RayRepair Motion (custom pass 7); KPN/Direct uses NB Direct (custom pass 6).
 Availability tooltips identify missing model assets. Single-view references are separate from flythrough GT runs. Each
 saved reference contains `output.png` and `capture.txt` under:
 
@@ -234,6 +236,7 @@ UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScr
 | `SVGF` | 1-sample path tracing with same-frame guide buffers and SVGF filtering. |
 | `DLSS` | Lumen + DLSS Ray Reconstruction; requires supported NVIDIA hardware and DX12. |
 | `Ours` | RayRepair format v1 model from `SL.Denoiser.RayRepair.Model` (method 5). |
+| `Ours (motion)` | Recurrent, motion-aware Ray Repair U-Net from `SL.Denoiser.RayRepairMotion.Model` (method 7); results in `Ours_Motion`. Warms up 8 frames on the first pose. |
 | `KPN/Direct` | NB Direct, the NoiseBase-trained Ray Repair U-Net at `/Game/ML/nb_direct` (method 6). |
 | `Open Image Denoise` | Engine OIDN spatial denoiser on 1-sample path tracing, using albedo and normal guides. |
 
@@ -443,8 +446,9 @@ relevant rendering settings and restores them afterward.
 | `SL.PathTracer.ResetEveryFrame` | `1` | Reset accumulation every frame; `0` permits accumulation. |
 | `SL.PathTracer.TargetSPP` | `1` | Set hardware path-tracing samples or the synthetic fallback's noise scaling. |
 | `SL.NoiseFallback.Scale` | `1.0` | Synthetic noise intensity; `0` disables injected noise. |
-| `SL.Denoiser.Method` | `0` | Custom/debug pass: `0` none, `1` Gaussian, `2` bilateral, `3` diagnostic grid, `4` NNE Candy, `5` RayRepair (Ours), `6` NB Direct (KPN/Direct). SVGF, DLSS and OIDN use GM renderer profiles rather than this CVar. |
+| `SL.Denoiser.Method` | `0` | Custom/debug pass: `0` none, `1` Gaussian, `2` bilateral, `3` diagnostic grid, `4` NNE Candy, `5` RayRepair (Ours), `6` NB Direct (KPN/Direct), `7` RayRepair Motion (Ours (motion)). SVGF, DLSS and OIDN use GM renderer profiles rather than this CVar. |
 | `SL.Denoiser.RayRepair.Model` | `/Game/ML/RayRepair_v1_1920x1080` | NNE model asset for Ours/method 5 (format v1 export from `export_ue.py`); changing it reloads the model. |
+| `SL.Denoiser.RayRepairMotion.Model` | `/Game/ML/rayrepair_motion_s3area_1920x1080_dmlsafe` | NNE model asset for Ours (motion)/method 7 (recurrent export from `export_onnx_ue.py`, converted with `Scripts/replace_gridsample_onnx.py`); changing it reloads the model and clears its state. |
 | `SL.Denoiser.GaussianBlur.Sigma` | `1.5` | Gaussian standard deviation in pixels; larger values blur more. |
 | `SL.Denoiser.Bilateral.SigmaSpatial` | `2.0` | Bilateral spatial neighborhood scale. |
 | `SL.Denoiser.Bilateral.SigmaColor` | `0.1` | Bilateral color similarity scale; smaller values preserve edges more strongly. |
@@ -455,17 +459,20 @@ images in the 0-255 range. Methods 5 and 6 lock it as well, so pre-exposed HDR i
 stays on one scale between frames. The active custom denoising method is displayed
 in the viewport.
 
-### Neural denoisers (methods 5 and 6)
+### Neural denoisers (methods 5, 6 and 7)
 
-Both run a Ray Repair ONNX model through NNE (`NNERuntimeORTDml`) on the
+All three run a Ray Repair ONNX model through NNE (`NNERuntimeORTDml`) on the
 pre-tonemap linear-HDR scene colour, at full view-rect resolution. The model takes
 `ue_buffers` `[1,10,H,W]` (colour, base colour, normal, depth) and returns
-`denoised_rgb` `[1,3,H,W]`; all normalisation happens inside the graph.
+`denoised_rgb` `[1,3,H,W]`; all normalisation happens inside the graph. Inputs and
+outputs are matched by name. Model assets are loaded on the game thread when their
+method is selected, then handed to the render thread.
 
 | Method | Model | Channels 6-9 written by `SLRayRepairPreprocess.usf` |
 | --- | --- | --- |
 | `5` RayRepair | `SL.Denoiser.RayRepair.Model`, a format v1 export (`export_ue.py`, trained with `--data ue`) | World-space normal, z-depth (cm) |
 | `6` NB Direct | `/Game/ML/nb_direct`, neural-denoiser `runs/nb_direct` (direct U-Net trained on NoiseBase) | Camera-basis normal `[n·forward, n·right, n·up]`, camera distance (cm) |
+| `7` RayRepair Motion | `SL.Denoiser.RayRepairMotion.Model`, the recurrent motion-aware checkpoint exported by `export_onnx_ue.py` | Camera-basis normal, camera distance (cm), as method 6 |
 
 Models with symbolic height/width follow the viewport size. Static exports must
 match the view rect exactly (`r.ScreenPercentage 100` and a matching window);
@@ -485,6 +492,40 @@ The standardized GM UI and benchmark registry expose this model as **KPN/Direct*
 python Scripts/rewrap_rayrepair_onnx.py nb_direct.onnx nb_direct_noisebase.onnx --encoding noisebase
 UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScriptPlugin -script="<project>/Scripts/import_nb_direct.py C:/path/to/nb_direct_noisebase.onnx" -unattended -nosplash
 ```
+
+**Recurrent motion-aware model (method 7).** See neural-denoiser
+`docs/UE_INTEGRATION.md` for the tensor contract. Besides `ue_buffers` it takes
+`motion_px` `[1,2,H,W]` (previous minus current pixel position, written by
+`SLRayRepairMotion.usf` from base-pass velocity, else camera reprojection) and five
+recurrent tensors `hidden_in0..4`, and returns `hidden_out0..4` next to
+`denoised_rgb`. The pass keeps last frame's `hidden_out` in GPU buffers and binds it
+as this frame's `hidden_in`; it starts from zeros after a camera cut, a skipped
+frame, a different view, a resize or a model reload (about 55 MB of state for the
+1920x1080 export). The export has a fixed size, so the view rect must be exactly
+1920x1080 (`r.ScreenPercentage 100`, for example `r.SetRes 1920x1080w`); otherwise
+the pass logs an error and passes the noisy frame through. Auto-exposure is locked,
+as for methods 4-6.
+
+The exported graph warps its hidden state with ONNX `GridSample`. In UE 5.8
+(ONNX Runtime 1.24.1, DirectML 1.15.4) DirectML's `GridSample` reads past the end of
+its input, which page-faults the GPU (`DXGI_ERROR_DEVICE_HUNG`) on Unreal's
+exact-size buffers. Convert every motion export before importing it;
+`replace_gridsample_onnx.py` swaps each `GridSample` for an equivalent gather-based
+bilinear sampler and, with `--verify`, checks the result against the original on the
+CPU (needs `pip install onnx onnxruntime`):
+
+```bash
+python Scripts/replace_gridsample_onnx.py rayrepair_motion_s3area_1920x1080.onnx rayrepair_motion_s3area_1920x1080_dmlsafe.onnx --verify
+UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScriptPlugin -script="<project>/Scripts/import_nne_model.py C:/path/to/rayrepair_motion_s3area_1920x1080_dmlsafe.onnx" -unattended -nosplash
+```
+
+The colour-fixed export (`..._et_1920x1080.onnx`) is a drop-in replacement: convert
+and import it the same way, then point `SL.Denoiser.RayRepairMotion.Model` at it.
+`SL.Denoiser.RayRepairMotion.Model` (editor context, `-RenderOffscreen -dx12`) checks
+the asset's signature and runs three recurrent frames on DirectML and on the CPU
+runtime, including one frame of far off-screen motion. `SL.Denoiser.RayRepairMotion.InGame`
+(a 1920x1080 game) checks that the live pass runs every frame and carries its state;
+the header of `SLRayRepairMotionTests.cpp` has the command line.
 
 Use forward slashes in the `.onnx` path: the commandlet unescapes backslashes.
 The automation test `SL.Denoiser.NBDirectModel` runs the asset on DirectML through
@@ -550,9 +591,11 @@ is defined in C++; camera paths come from recordings or Level Sequences.
 | `Source/SL_Test/Benchmark/SLComparison*` | Interactive rendering profiles, references, and live comparison. |
 | `Source/SL_Test/Debug/GMTools/` | GM configuration, commands, panel, and comparison widgets. |
 | `Source/SL_Test/SLPathTracerSubsystem.*` | Startup path tracing, sampling controls, and fallback integration. |
-| `Source/SL_Test/SLDenoiser*`, `Shaders/` | Filter implementations and shader passes, including the NNE neural denoisers (methods 4-6). |
+| `Source/SL_Test/SLDenoiser*`, `Shaders/` | Filter implementations and shader passes, including the NNE neural denoisers (methods 4-7). |
 | `Source/SL_Test/SLNBDirectModelTests.cpp` | DirectML-versus-CPU check of `/Game/ML/nb_direct`. |
+| `Source/SL_Test/SLRayRepairMotionTests.cpp` | Recurrent model contract, DirectML-versus-CPU frames, and the live in-game check (method 7). |
 | `Scripts/rewrap_rayrepair_onnx.py`, `Scripts/import_nb_direct.py` | Ray Repair ONNX re-encoding and nb_direct import/GM registration. |
+| `Scripts/replace_gridsample_onnx.py`, `Scripts/import_nne_model.py` | DirectML-safe conversion of motion exports, and a generic ONNX-to-NNE import. |
 | `Source/SL_Test/SL_Test.Build.cs` | Module dependencies. |
 
 ### Shader development

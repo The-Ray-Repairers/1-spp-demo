@@ -19,14 +19,16 @@ inline int32 GetDenoiserMethod(FName Id)
 {
     if (Id == TEXT("Ours")) return 5;
     if (Id == TEXT("KPN_Direct")) return 6;
+    if (Id == TEXT("Ours_Motion")) return 7;
     return 0;
 }
 
 inline bool CheckModelAvailable(int32 Method, FText& Reason)
 {
     Reason = FText::GetEmpty();
-    if (Method != 5 && Method != 6) return true;
-    const auto* Model = IConsoleManager::Get().FindConsoleVariable(TEXT("SL.Denoiser.RayRepair.Model"));
+    if (Method < 5 || Method > 7) return true;
+    const TCHAR* ModelVariable = Method == 7 ? TEXT("SL.Denoiser.RayRepairMotion.Model") : TEXT("SL.Denoiser.RayRepair.Model");
+    const auto* Model = IConsoleManager::Get().FindConsoleVariable(ModelVariable);
     const FString Path = Method == 6 ? TEXT("/Game/ML/nb_direct") : (Model ? Model->GetString() : FString());
     if (!Path.IsEmpty() && FPackageName::DoesPackageExist(FPackageName::ObjectPathToPackageName(Path))) return true;
     Reason = FText::FromString(TEXT("Neural model asset is missing: ") + Path);
@@ -49,6 +51,7 @@ inline const TArray<FMethod>& Get()
         {TEXT("SVGF"), TEXT("SVGF"), ESLComparisonAction::SVGF, TEXT("")},
         {TEXT("DLSS"), TEXT("DLSS"), ESLComparisonAction::RR, TEXT("")},
         {TEXT("Ours"), TEXT("Ours"), ESLComparisonAction::ApplyProfile, TEXT("")},
+        {TEXT("Ours_Motion"), TEXT("Ours (motion)"), ESLComparisonAction::ApplyProfile, TEXT("")},
         {TEXT("KPN_Direct"), TEXT("KPN/Direct"), ESLComparisonAction::ApplyProfile, TEXT("")},
         {TEXT("OpenImageDenoise"), TEXT("Open Image Denoise"), ESLComparisonAction::ApplyProfile, TEXT("")}
     };

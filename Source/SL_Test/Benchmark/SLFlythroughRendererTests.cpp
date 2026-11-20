@@ -1,6 +1,7 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "SLFlythroughSubsystem.h"
 #include "SLComparisonView.h"
+#include "Debug/GMTools/SLRenderingMethods.h"
 #include "Engine/World.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/Paths.h"
@@ -15,21 +16,29 @@ bool FSLFlythroughRendererTest::RunTest(const FString& Parameters)
     if (!TestNotNull(TEXT("Test world"), World)) return false;
     auto* Capture = NewObject<USLFlythroughSubsystem>(World);
     Capture->RegisterMethods();
-    TestEqual(TEXT("Seven methods retained"), Capture->Methods.Num(), 7);
-    const auto& SVGF = Capture->Methods[2];
-    const auto& DLSS = Capture->Methods[3];
+    TestEqual(TEXT("Every shared method retained"), Capture->Methods.Num(), SLRenderingMethods::Get().Num());
+    auto Find = [&](const TCHAR* Name) -> const FSLFlythroughMethod&
+    {
+        const FSLFlythroughMethod* M = Capture->Methods.FindByPredicate([&](const FSLFlythroughMethod& X) { return X.Name == Name; });
+        check(M);
+        return *M;
+    };
+    const auto& SVGF = Find(TEXT("SVGF"));
+    const auto& DLSS = Find(TEXT("DLSS"));
     TestTrue(TEXT("SVGF uses the guide backend"), SVGF.Backend == ESLGMRenderBackend::SVGF);
     TestTrue(TEXT("DLSS uses the Lumen backend"), DLSS.Backend == ESLGMRenderBackend::LumenDLSSRR);
     TestTrue(TEXT("Integrated methods have no implementation blocker"), SVGF.UnavailableReason.IsEmpty() && DLSS.UnavailableReason.IsEmpty());
     TestEqual(TEXT("SVGF warm-up"), SVGF.WarmUpFrames, 32);
     TestEqual(TEXT("DLSS warm-up"), DLSS.WarmUpFrames, 32);
     TestFalse(TEXT("DLSS must not wait for path tracer accumulation"), DLSS.bAccumulate);
-    const auto& OIDN = Capture->Methods[6];
+    const auto& OIDN = Find(TEXT("OpenImageDenoise"));
     TestTrue(TEXT("OIDN uses the engine denoiser backend"), OIDN.Backend == ESLGMRenderBackend::OpenImageDenoise);
     TestTrue(TEXT("OIDN has no implementation blocker"), OIDN.UnavailableReason.IsEmpty());
     TestEqual(TEXT("Spatial OIDN needs no temporal settling"), OIDN.WarmUpFrames, 1);
-    TestEqual(TEXT("Ours routes to RayRepair"), Capture->Methods[4].DenoiserMethod, 5);
-    TestEqual(TEXT("KPN/Direct routes to NB Direct"), Capture->Methods[5].DenoiserMethod, 6);
+    TestEqual(TEXT("Ours routes to RayRepair"), Find(TEXT("Ours")).DenoiserMethod, 5);
+    TestEqual(TEXT("KPN/Direct routes to NB Direct"), Find(TEXT("KPN_Direct")).DenoiserMethod, 6);
+    TestEqual(TEXT("Ours (motion) routes to RayRepairMotion"), Find(TEXT("Ours_Motion")).DenoiserMethod, 7);
+    TestEqual(TEXT("Recurrent model settles before the first frame"), Find(TEXT("Ours_Motion")).WarmUpFrames, 8);
     FText Reason;
     TestFalse(TEXT("Unknown method remains blocked"), Capture->IsMethodAvailable(INDEX_NONE, Reason));
     TestFalse(TEXT("Unavailable reason supplied"), Reason.IsEmpty());
