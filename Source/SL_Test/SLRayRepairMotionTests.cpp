@@ -11,7 +11,8 @@
 // SL.Denoiser.RayRepairMotion.InGame
 //   Client context, in a 1920x1080 game. Switches the live renderer to method 7 while the camera
 //   turns, checks that the model runs every frame and carries its hidden state, and logs the
-//   wall-clock frame time with method 0 and method 7. Waits for shader compilation first; add
+//   wall-clock frame time with method 0 and method 7. Then takes an SL.Denoiser.RayRepair.Dump and
+//   checks the files it writes (Saved/RayRepairDump). Waits for shader compilation first; add
 //   -dpcvars=r.RayTracing.NonBlockingPipelineCreation=0 so the path tracer does not render its black
 //   fallback while ray tracing pipelines compile. For example (no window with -RenderOffscreen):
 //     UnrealEditor.exe SL_Test.uproject /Game/Levels/LVL_RT_Room -game -RenderOffscreen -dx12 -windowed -ResX=1920 -ResY=1080 -ForceRes
@@ -36,6 +37,8 @@
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
+#include "HAL/FileManager.h"
+#include "Misc/FileHelper.h"
 #if WITH_EDITOR
 #include "ShaderCompiler.h"
 #endif
@@ -302,6 +305,8 @@ namespace SLRayRepairMotionTest
 		uint32 HistoryAtStart = 0;
 		double MeasureStart = 0.0;
 		double FrameMs[2] = { 0.0, 0.0 };       // mean wall-clock time per frame, method 0 and method 7
+		FString DumpBefore;                     // last dump folder before this test asked for one
+		int32 DumpWaitFrames = 0;
 		double Started = FPlatformTime::Seconds();
 	};
 
@@ -333,6 +338,40 @@ bool FSLRayRepairMotionInGameStep::Update()
 		FRotator R = PC->GetControlRotation();
 		R.Yaw += 0.15f;
 		PC->SetControlRotation(R);
+	}
+
+	// Stage 4: wait for the tensor dump requested at the end of stage 3, then check it.
+	if (State->Stage == 4)
+	{
+		const FString Folder = FSLDenoiserRayRepair::GetLastDumpFolder();
+		if (Folder.IsEmpty() || Folder == State->DumpBefore)
+		{
+			if (++State->DumpWaitFrames < 600) return false;
+			Test->AddError(TEXT("SL.Denoiser.RayRepair.Dump wrote nothing within 600 frames"));
+			SetMethod(0);
+			return true;
+		}
+		static const TCHAR* Files[] = { TEXT("ue_buffers.npy"), TEXT("motion_px.npy"), TEXT("hidden_in0.npy"),
+			TEXT("hidden_in4.npy"), TEXT("denoised_rgb.npy"), TEXT("meta.json") };
+		for (const TCHAR* File : Files)
+		{
+			Test->TestTrue(FString::Printf(TEXT("Dump has %s"), File), IFileManager::Get().FileSize(*(Folder / File)) > 0);
+		}
+		// ue_buffers is [1, 10, 1080, 1920] float32 after a 128-byte .npy header.
+		Test->TestEqual(TEXT("ue_buffers.npy size"), IFileManager::Get().FileSize(*(Folder / TEXT("ue_buffers.npy"))),
+			int64(128) + int64(10) * W * H * 4);
+		FString Meta;
+		FFileHelper::LoadFileToString(Meta, *(Folder / TEXT("meta.json")));
+		Test->TestTrue(TEXT("meta.json records the pre-exposure"), Meta.Contains(TEXT("\"pre_exposure\": ")) && !Meta.Contains(TEXT("\"pre_exposure\": null")));
+		Test->TestTrue(TEXT("meta.json records a continued recurrent state"), Meta.Contains(TEXT("\"state_reset_this_frame\": false")));
+		const int32 Denoised = Meta.Find(TEXT("\"denoised_rgb\": {"));
+		const FString DenoisedAll = Denoised == INDEX_NONE ? FString() : Meta.Mid(Denoised, Meta.Find(TEXT("}"), ESearchCase::CaseSensitive, ESearchDir::FromStart, Meta.Find(TEXT("\"all\""), ESearchCase::CaseSensitive, ESearchDir::FromStart, Denoised)) - Denoised + 1);
+		Test->AddInfo(TEXT("denoised_rgb ") + DenoisedAll);
+		Test->TestTrue(TEXT("denoised_rgb has no NaN or Inf"), DenoisedAll.EndsWith(TEXT("\"nan\": 0, \"inf\": 0}")));
+		Test->TestFalse(TEXT("denoised_rgb is not all zero"), DenoisedAll.Contains(TEXT("\"max\": 0.0,")));
+		Test->AddInfo(TEXT("Tensor dump: ") + Folder);
+		SetMethod(0);
+		return true;
 	}
 
 	// Stages, each ending after its frame count:
@@ -372,8 +411,9 @@ bool FSLRayRepairMotionInGameStep::Update()
 		Test->TestTrue(TEXT("Hidden state carries from frame to frame"), WithHistory + 2 >= Run && Run > 0);
 		Test->AddInfo(FString::Printf(TEXT("Wall-clock frame time: method 0 %.1f ms, method 7 %.1f ms (mean of %d frames each)"),
 			State->FrameMs[0], State->FrameMs[1], MeasureFrames));
-		SetMethod(0);
-		return true;
+		State->DumpBefore = FSLDenoiserRayRepair::GetLastDumpFolder();
+		GEngine->Exec(nullptr, TEXT("SL.Denoiser.RayRepair.Dump"));
+		break;
 	}
 	}
 	++State->Stage;

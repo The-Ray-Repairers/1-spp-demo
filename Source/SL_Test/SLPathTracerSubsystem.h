@@ -48,6 +48,10 @@ public:
 private:
 	TSharedPtr<FSLPathTracerResetViewExtension, ESPMode::ThreadSafe> ResetViewExtension;
 
+	/** SL.Denoiser.Method seen by the last Tick; the neural methods (4-7) lock auto-exposure while active. */
+	int32 LastMethodInt = -1;
+	bool bLockedExposure = false;
+
 	/**
 	 * Non-null only when hardware ray tracing is unavailable.
 	 * Injects Poisson shot noise before the tonemapper so that the viewport

@@ -5,8 +5,11 @@
 // planar, linear HDR at the same exposure as the input color) straight into
 // the full-resolution scene color, before tonemapping. No upsample pass.
 //
+// SL.Denoiser.RayRepair.Debug 2-4 bind ue_buffers here instead, with FirstChannel 0, 3 or 6, to
+// show the network's input colour, base colour or normals through the same path.
+//
 // Used by:
-//   SL.Denoiser.Method 5
+//   SL.Denoiser.Method 5, 6, 7
 
 #include "/Engine/Public/Platform.ush"
 
@@ -14,6 +17,9 @@ Buffer<float> InputTensor;             // 3 * H * W floats
 RWTexture2D<float4> OutputTexture;     // same desc as SceneColor
 uint2 ViewRectMin;
 uint2 TensorSize;                      // (W, H)
+uint FirstChannel;                     // tensor channel shown as red; green and blue follow
+float Scale;                           // output = value * Scale + Bias (1, 0 for denoised_rgb)
+float Bias;
 
 [numthreads(8, 8, 1)]
 void MainCS(uint3 Id : SV_DispatchThreadID)
@@ -23,6 +29,7 @@ void MainCS(uint3 Id : SV_DispatchThreadID)
     uint Plane = TensorSize.x * TensorSize.y;
     uint I     = Id.y * TensorSize.x + Id.x;
 
-    OutputTexture[ViewRectMin + Id.xy] =
-        float4(InputTensor[I], InputTensor[Plane + I], InputTensor[2 * Plane + I], 1.0);
+    uint C = FirstChannel * Plane + I;
+    float3 Value = float3(InputTensor[C], InputTensor[C + Plane], InputTensor[C + 2 * Plane]);
+    OutputTexture[ViewRectMin + Id.xy] = float4(Value * Scale + Bias, 1.0);
 }

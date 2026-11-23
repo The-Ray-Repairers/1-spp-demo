@@ -468,6 +468,30 @@ pre-tonemap linear-HDR scene colour, at full view-rect resolution. The model tak
 outputs are matched by name. Model assets are loaded on the game thread when their
 method is selected, then handed to the render thread.
 
+The path tracer does not run the base pass, so on path traced frames the G-Buffer
+holds no base colour, normals or velocity (base colour reads 0 everywhere). The
+pass therefore takes base colour (channels 3-5) and normals (6-8) from the path
+tracer's own guide buffers, `FPathTracingResources::Albedo` and `Normal`. These
+are the first-hit albedo and world normal Unreal's path tracing denoisers use, so
+a mirror shows the albedo of what it reflects. They need
+`r.PathTracing.OutputPostProcessResources 1`, the default. Rasterised frames (the
+software fallback) still read the G-Buffer. Depth comes from scene depth in both
+cases.
+
+When the pass cannot run it shows the noisy frame and says why in red on screen.
+The usual reason is a view size that a fixed-size export does not match. PIE in the
+level viewport cannot be resized, so use a New Editor Window or Standalone Game.
+
+Diagnostics:
+
+| Command | What it does |
+| --- | --- |
+| `SL.Denoiser.RayRepair.Debug 1` | Shows `denoised_rgb`, plus a green on-screen line confirming the model ran this frame (frame count, recurrent state). |
+| `SL.Denoiser.RayRepair.Debug 2` | Shows `ue_buffers` channels 0-2, the colour the network receives, through the same postprocess pass. It must look exactly like method 0; if it does not, the problem is in the pre/postprocess passes, not the network. |
+| `SL.Denoiser.RayRepair.Debug 3` / `4` | Shows base colour (channels 3-5) / normals (6-8, `* 0.5 + 0.5`). Base colour should be clean; grain here reaches the network. |
+| `SL.Denoiser.RayRepair.Dump [frames]` | After an optional delay, writes one frame of the active model's tensors to `Saved/RayRepairDump/<method>_<time>/`: `ue_buffers`, `motion_px`, `hidden_in0..4` and `denoised_rgb`, as float32 NCHW `.npy` files (`numpy.load`). Also writes `meta.json` with shapes, per-channel min/max/mean/NaN counts, pre-exposure and exposure settings. Running the same ONNX on these inputs offline must reproduce `denoised_rgb`. |
+| `stat gpu` | `SL Ray Repair (pre + NNE + post)` is the GPU time of the whole pass. |
+
 | Method | Model | Channels 6-9 written by `SLRayRepairPreprocess.usf` |
 | --- | --- | --- |
 | `5` RayRepair | `SL.Denoiser.RayRepair.Model`, a format v1 export (`export_ue.py`, trained with `--data ue`) | World-space normal, z-depth (cm) |
@@ -495,8 +519,11 @@ UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScr
 
 **Recurrent motion-aware model (method 7).** See neural-denoiser
 `docs/UE_INTEGRATION.md` for the tensor contract. Besides `ue_buffers` it takes
-`motion_px` `[1,2,H,W]` (previous minus current pixel position, written by
-`SLRayRepairMotion.usf` from base-pass velocity, else camera reprojection) and five
+`motion_px` `[1,2,H,W]`, the previous pixel position minus the current one, written by
+`SLRayRepairMotion.usf`. Camera motion uses the pass's own copy of last frame's
+camera, because `View.PrevViewInfo` repeats the current camera while the world is
+paused, as it is during flythrough capture. Path traced frames have no velocity
+buffer, so objects that move are given camera motion only. It also takes five
 recurrent tensors `hidden_in0..4`, and returns `hidden_out0..4` next to
 `denoised_rgb`. The pass keeps last frame's `hidden_out` in GPU buffers and binds it
 as this frame's `hidden_in`; it starts from zeros after a camera cut, a skipped
@@ -521,11 +548,16 @@ UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScr
 
 The colour-fixed export (`..._et_1920x1080.onnx`) is a drop-in replacement: convert
 and import it the same way, then point `SL.Denoiser.RayRepairMotion.Model` at it.
+With `rayrepair_motion_s3area_1920x1080`, UE's `denoised_rgb` matches the ONNX run
+offline on the same dumped inputs to 2e-5. Its output is 20-30% darker than its
+input, losing the most red, at every input brightness from x0.25 to x64. That is
+the model's known colour bias, not the integration.
 `SL.Denoiser.RayRepairMotion.Model` (editor context, `-RenderOffscreen -dx12`) checks
 the asset's signature and runs three recurrent frames on DirectML and on the CPU
 runtime, including one frame of far off-screen motion. `SL.Denoiser.RayRepairMotion.InGame`
-(a 1920x1080 game) checks that the live pass runs every frame and carries its state;
-the header of `SLRayRepairMotionTests.cpp` has the command line.
+(a 1920x1080 game) checks that the live pass runs every frame and carries its state,
+then takes a tensor dump and checks its files. The header of
+`SLRayRepairMotionTests.cpp` has the command line.
 
 Use forward slashes in the `.onnx` path: the commandlet unescapes backslashes.
 The automation test `SL.Denoiser.NBDirectModel` runs the asset on DirectML through

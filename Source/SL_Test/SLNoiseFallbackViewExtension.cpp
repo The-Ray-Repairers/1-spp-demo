@@ -11,6 +11,9 @@ extern TAutoConsoleVariable<int32> CVarSLDenoiserMethod;
 #include "PixelShaderUtils.h"     // FPixelShaderUtils::AddFullscreenPass  (RenderCore/Public)
 #include "RenderGraphUtils.h"     // RDG utility passes                    (RenderCore/Public)
 #include "HAL/IConsoleManager.h"
+#include "PostProcess/PostProcessInputs.h"   // FPostProcessingInputs::PathTracingResources (Renderer/Internal)
+#include "Benchmark/SLGuideProbe.h"          // FSLGuideCapture
+#include "Engine/World.h"
 
 // -----------------------------------------------------------------------
 // Console variable — lets developers tune or disable the noise at runtime.
@@ -39,6 +42,34 @@ FSLNoiseFallbackViewExtension::FSLNoiseFallbackViewExtension(
 	const FAutoRegister& AutoRegister, UWorld* InWorld, bool bInInjectNoise)
 	: FWorldSceneViewExtension(AutoRegister, InWorld), bInjectNoise(bInInjectNoise)
 {
+	if (InWorld)
+	{
+		GuideCapture = MakeUnique<FSLGuideCapture>(InWorld->GetFeatureLevel());
+	}
+}
+
+FSLNoiseFallbackViewExtension::~FSLNoiseFallbackViewExtension() = default;
+
+void FSLNoiseFallbackViewExtension::BeginRenderViewFamily(FSceneViewFamily& InViewFamily)
+{
+	if (GuideCapture && SLRayRepairWantsGuidePass())
+	{
+		GuideCapture->AddToViewFamily(InViewFamily);
+	}
+}
+
+void FSLNoiseFallbackViewExtension::PrePostProcessPass_RenderThread(
+	FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessingInputs& Inputs)
+{
+	// Runs earlier in the same render graph as the post-processing callback below, which does not get
+	// these. A new frame drops last frame's entries; their RDG textures belong to a finished graph.
+	const uint64 Frame = View.Family->FrameNumber;
+	PathTracerGuides.RemoveAll([&](const FPathTracerGuides& G) { return G.Frame != Frame || G.View == &View; });
+	const FPathTracingResources& Resources = Inputs.PathTracingResources;
+	if (View.Family->EngineShowFlags.PathTracing && Resources.bPostProcessEnabled && Resources.Albedo && Resources.Normal)
+	{
+		PathTracerGuides.Add({ &View, Frame, Resources.Albedo, Resources.Normal });
+	}
 }
 
 void FSLNoiseFallbackViewExtension::SubscribeToPostProcessingPass(
@@ -144,6 +175,22 @@ FScreenPassTexture FSLNoiseFallbackViewExtension::ApplyNoise_RenderThread(
 	FSLDenoiserContext DenoiserContext;
 	DenoiserContext.SceneColor    = NoisyOutput;
 	DenoiserContext.SceneTextures = Inputs.SceneTextures;
+	for (const FPathTracerGuides& Guides : PathTracerGuides)
+	{
+		if (Guides.View == &View && Guides.Frame == View.Family->FrameNumber)
+		{
+			DenoiserContext.PathTracerAlbedo = Guides.Albedo;
+			DenoiserContext.PathTracerNormal = Guides.Normal;
+		}
+	}
+	FSLGuideTextures BasePassGuides;
+	if (GuideCapture && GuideCapture->GetTextures(GraphBuilder, View.Family->FrameNumber, BasePassGuides))
+	{
+		DenoiserContext.GuideNormalDepth = BasePassGuides.NormalDepth;
+		DenoiserContext.GuideDiffuse     = BasePassGuides.Diffuse;
+		DenoiserContext.GuideBaseColor   = BasePassGuides.BaseColor;
+		DenoiserContext.GuideMotion      = BasePassGuides.Motion;
+	}
 
     const FScreenPassTexture Filtered = GetActiveDenoiser()->Apply(GraphBuilder, View, DenoiserContext);
     const int32 Method = CVarSLDenoiserMethod.GetValueOnRenderThread();

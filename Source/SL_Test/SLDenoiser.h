@@ -21,6 +21,7 @@
 #include "RenderGraphBuilder.h"
 #include "SceneTexturesConfig.h"   // FSceneTextureShaderParameters
 #include "NNETypes.h"              // UE::NNE::FTensorShape
+#include "RHIGPUReadback.h"        // FRHIGPUBufferReadback (tensor dumps)
 #include <atomic>
 
 // ---------------------------------------------------------------------------
@@ -83,7 +84,30 @@ struct FSLDenoiserContext
 	 * May be empty if scene textures were not available at the call-site.
 	 */
 	FSceneTextureShaderParameters SceneTextures;
+
+	/**
+	 * The path tracer's own guide buffers for this frame (FPathTracingResources), or null when the frame was
+	 * not path traced. The path tracer skips the base pass, so with it the G-Buffer above holds no base colour,
+	 * normals or velocity. Both are view-rect sized with their origin at (0, 0):
+	 *   PathTracerAlbedo  first-hit albedo, the guide Unreal's own path tracing denoisers use
+	 *   PathTracerNormal  first-hit world-space normal
+	 */
+	FRDGTextureRef PathTracerAlbedo = nullptr;
+	FRDGTextureRef PathTracerNormal = nullptr;
+
+	/**
+	 * First-hit G-Buffer guides from the SLGuides depth + base pass (FSLGuideCapture), rendered only while a
+	 * Ray Repair method that wants them is active (SLRayRepairWantsGuidePass). Null otherwise. View-rect sized,
+	 * origin (0, 0). See FSLGuideTextures for the channel layout.
+	 */
+	FRDGTextureRef GuideNormalDepth = nullptr;
+	FRDGTextureRef GuideDiffuse = nullptr;
+	FRDGTextureRef GuideBaseColor = nullptr;
+	FRDGTextureRef GuideMotion = nullptr;
 };
+
+/** Game thread: whether SL.Denoiser.Method and SL.Denoiser.RayRepair.Albedo need the SLGuides base pass this frame. */
+bool SLRayRepairWantsGuidePass();
 
 // ---------------------------------------------------------------------------
 // ISLDenoiserPass
@@ -384,7 +408,11 @@ class FSLRayRepairPreprocessCS : public FGlobalShader
 		SHADER_PARAMETER(FUintVector2, ViewRectMin)
 		SHADER_PARAMETER(FUintVector2, TensorSize)
 		SHADER_PARAMETER(uint32, InputEncoding)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, GuideAlbedo)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, GuideNormal)
+		SHADER_PARAMETER(uint32, UseGuides)                            // 1: base colour and normal from the textures above
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, OutputTensor)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, ViewInfo)     // [PreExposure, 1 / PreExposure], for dumps
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P)
@@ -403,6 +431,10 @@ class FSLRayRepairMotionCS : public FGlobalShader
 		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureShaderParameters, SceneTextures)
 		SHADER_PARAMETER(FUintVector2, ViewRectMin)
 		SHADER_PARAMETER(FUintVector2, TensorSize)
+		SHADER_PARAMETER(FMatrix44f, ClipToPrevClip)   // this frame's clip space to last frame's, computed by the pass
+		SHADER_PARAMETER(uint32, UseVelocity)          // 0 when path tracing: the base pass that writes velocity did not run
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, GuideMotion)   // SLGuides motion: xy delta UV, z 1 where it is object velocity
+		SHADER_PARAMETER(uint32, UseGuideMotion)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, OutputTensor)
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -422,6 +454,9 @@ class FSLRayRepairPostprocessCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
 		SHADER_PARAMETER(FUintVector2, ViewRectMin)
 		SHADER_PARAMETER(FUintVector2, TensorSize)
+		SHADER_PARAMETER(uint32, FirstChannel)   // 0 for denoised_rgb; debug views show other ue_buffers channels
+		SHADER_PARAMETER(float, Scale)
+		SHADER_PARAMETER(float, Bias)
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P)
@@ -452,6 +487,20 @@ public:
 	uint32 GetFramesRun() const { return FramesRun.load(); }
 	uint32 GetFramesWithHistory() const { return FramesWithHistory.load(); }
 
+	/**
+	 * What the pass did on its last frame, for the on-screen status. Empty until it first runs.
+	 * bProblem is set when it passed the noisy frame through (wrong view size, missing model, ...). Any thread.
+	 */
+	FString GetStatus(bool& bProblem) const
+	{
+		FScopeLock Lock(&StatusLock);
+		bProblem = bStatusProblem;
+		return Status;
+	}
+
+	/** Folder of the last completed SL.Denoiser.RayRepair.Dump, or empty. Any thread. */
+	static FString GetLastDumpFolder();
+
 private:
 	/** One recurrent state tensor: hidden_in<i> -> model -> hidden_out<i>, carried to the next frame. */
 	struct FHiddenTensor
@@ -464,6 +513,19 @@ private:
 	bool LoadModel(const FString& ModelPath, class UNNEModelData* ModelData);
 	bool ResizeTo(FIntPoint Size);
 	void ResetHistory();
+	void SetStatus(const FString& NewStatus, bool bNewProblem);
+
+	/** One tensor of a pending SL.Denoiser.RayRepair.Dump, copied back from the GPU. */
+	struct FDumpTensor
+	{
+		FString TensorName;
+		TArray<int64> Shape;                       // NCHW
+		uint32 NumBytes = 0;
+		TUniquePtr<FRHIGPUBufferReadback> Readback;
+	};
+	void QueueDump(FRDGBuilder& GraphBuilder, TArray<FDumpTensor>&& Tensors, TConstArrayView<FRDGBufferRef> Buffers,
+		FRDGBufferRef ViewInfoBuffer, const FString& Meta);
+	void PollDump();
 
 	const FString Name;
 	const TFunction<FString()> GetModelPath;
@@ -477,6 +539,8 @@ private:
 	TSharedPtr<UE::NNE::IModelInstanceRDG> ModelInstance;
 	FIntPoint TensorSize = FIntPoint::ZeroValue;   // current input H x W (as X = W, Y = H)
 	FIntPoint LastWarnedSize = FIntPoint::ZeroValue;
+	bool bWarnedNoGuides = false;
+	FString GuideSource;                       // where base colour and normals came from last frame, for status and dumps
 
 	// Model signature, as indices into the model's input / output tensor lists
 	int32 NumInputs = 0;
@@ -492,8 +556,25 @@ private:
 	uint64 HistoryFrame = 0;                   // View.Family->FrameNumber that produced History
 	uint32 HistoryViewKey = 0;                 // view that produced History
 
+	// Last frame's camera, for motion_px. Kept here rather than read from View.PrevViewInfo, which repeats the
+	// current camera while the world is paused (the flythrough capture pauses it and moves the camera).
+	FMatrix PrevViewProjection = FMatrix::Identity;   // world to clip, without TAA jitter
+	uint64 PrevCameraFrame = 0;
+	uint32 PrevCameraViewKey = 0;
+
 	std::atomic<uint32> FramesRun{ 0 };
 	std::atomic<uint32> FramesWithHistory{ 0 };
+
+	// Tensor dump in flight (render thread only)
+	TArray<FDumpTensor> PendingDump;
+	TUniquePtr<FRHIGPUBufferReadback> PendingViewInfo;
+	FString PendingDumpFolder;
+	FString PendingDumpMeta;                   // JSON fields known when the dump was queued
+
+	mutable FCriticalSection StatusLock;
+	FString Status;
+	bool bStatusProblem = false;
+	FString LastStatus_RenderThread;           // avoids locking every frame
 };
 
 // ---------------------------------------------------------------------------

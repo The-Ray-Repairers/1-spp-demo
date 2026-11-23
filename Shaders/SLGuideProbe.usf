@@ -7,7 +7,8 @@ void MainPS(float4 Position : SV_Position,
     out float4 NormalDepth : SV_Target0,
     out float4 Diffuse : SV_Target1,
     out float4 Emission : SV_Target2,
-    out float4 Motion : SV_Target3)
+    out float4 Motion : SV_Target3,
+    out float4 BaseColor : SV_Target4)
 {
     float2 UV = Position.xy * View.BufferSizeAndInvSize.zw;
     FGBufferData G = GetGBufferData(UV);
@@ -23,4 +24,5 @@ void MainPS(float4 Position : SV_Position,
     Diffuse = float4(G.DiffuseColor, G.ShadingModelID);
     Emission = float4(CalcSceneColor(UV) * View.OneOverPreExposure, 0);
     Motion = float4(DeltaUV, HasVelocity, 0);
+    BaseColor = float4(G.BaseColor, G.Metallic);
 }

@@ -5,8 +5,11 @@
 // float32, NCHW planar (element (c, y, x) at c*H*W + y*W + x):
 //
 //   ch 0-2  color       linear HDR scene color, 1 spp, pre-exposed (before tonemapping)
-//   ch 3-5  base_color  linear material base color, [0, 1]
-//   ch 6-8  normal      InputEncoding 0: world-space unit normal, decoded to [-1, 1]
+//   ch 3-5  base_color  path traced frames: the SLGuides base pass's diffuse colour or base colour, or the
+//                       path tracer's albedo (SL.Denoiser.RayRepair.Albedo, bound as GuideAlbedo);
+//                       otherwise the G-Buffer base color. Linear, [0, 1]
+//   ch 6-8  normal      (from the same source as base_color; zero where the camera ray hit nothing)
+//                       InputEncoding 0: world-space unit normal, decoded to [-1, 1]
 //                       InputEncoding 1: same normal in the camera basis
 //                                        [n.forward, n.right, n.up] (NoiseBase)
 //   ch 9    depth       InputEncoding 0: linear scene depth along the camera forward axis, cm
@@ -16,6 +19,8 @@
 // happen inside the ONNX graph (neural-denoiser denoiser/ue_format.py, or
 // Scripts/rewrap_rayrepair_onnx.py --encoding noisebase).
 //
+// The path tracer does not run the base pass, so when it renders the frame the G-Buffer is empty
+// (base colour 0, one constant normal): those channels must come from guide buffers.
 // G-Buffer decode via GetGBufferData assumes the legacy layout, which this
 // project gets from r.Substrate.ProjectGBufferFormat=0 (blendable GBuffer).
 //
@@ -29,7 +34,11 @@ Texture2D<float4> SceneColorTexture;
 uint2 ViewRectMin;
 uint2 TensorSize;                      // (W, H) of the model input == view rect size
 uint InputEncoding;                    // 0 = format v1, 1 = NoiseBase
+Texture2D<float4> GuideAlbedo;         // view-rect sized, origin (0, 0); rgb used
+Texture2D<float4> GuideNormal;         // world space in xyz
+uint UseGuides;
 RWBuffer<float> OutputTensor;          // 10 * H * W floats
+RWBuffer<float> ViewInfo;              // 2 floats: PreExposure, 1 / PreExposure (read back by tensor dumps)
 
 // Sky / far plane distance for the NoiseBase encoding; log(1 + 1/d) is ~0 there.
 static const float SkyDistanceCm = 1e8;
@@ -38,13 +47,32 @@ static const float SkyDistanceCm = 1e8;
 void MainCS(uint3 Id : SV_DispatchThreadID)
 {
     if (any(Id.xy >= TensorSize)) return;
+    if (all(Id.xy == 0))
+    {
+        // Scene colour is pre-exposed: ch 0-2 hold radiance * PreExposure.
+        ViewInfo[0] = View.PreExposure;
+        ViewInfo[1] = View.OneOverPreExposure;
+    }
 
     uint2  Pixel    = ViewRectMin + Id.xy;
     float2 BufferUV = (float2(Pixel) + 0.5) * View.BufferSizeAndInvSize.zw;
 
     float3 Color = SceneColorTexture.Load(int3(Pixel, 0)).rgb;
-    FGBufferData GBuffer = GetGBufferData(BufferUV);
-    float3 Normal = GBuffer.WorldNormal;
+    float3 BaseColor;
+    float3 Normal;
+    if (UseGuides != 0)
+    {
+        BaseColor = GuideAlbedo.Load(int3(Id.xy, 0)).rgb;
+        float3 N = GuideNormal.Load(int3(Id.xy, 0)).xyz;
+        float Len = length(N);
+        Normal = Len > 1e-4 && LookupDeviceZ(BufferUV) > 0.0 ? N / Len : float3(0, 0, 0);
+    }
+    else
+    {
+        FGBufferData GBuffer = GetGBufferData(BufferUV);
+        BaseColor = GBuffer.BaseColor;
+        Normal = GBuffer.WorldNormal;
+    }
     float Depth = CalcSceneDepth(BufferUV);
 
     if (InputEncoding == 1)
@@ -69,9 +97,9 @@ void MainCS(uint3 Id : SV_DispatchThreadID)
     OutputTensor[0 * Plane + I] = Color.r;
     OutputTensor[1 * Plane + I] = Color.g;
     OutputTensor[2 * Plane + I] = Color.b;
-    OutputTensor[3 * Plane + I] = GBuffer.BaseColor.r;
-    OutputTensor[4 * Plane + I] = GBuffer.BaseColor.g;
-    OutputTensor[5 * Plane + I] = GBuffer.BaseColor.b;
+    OutputTensor[3 * Plane + I] = BaseColor.r;
+    OutputTensor[4 * Plane + I] = BaseColor.g;
+    OutputTensor[5 * Plane + I] = BaseColor.b;
     OutputTensor[6 * Plane + I] = Normal.x;
     OutputTensor[7 * Plane + I] = Normal.y;
     OutputTensor[8 * Plane + I] = Normal.z;

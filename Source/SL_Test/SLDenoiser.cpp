@@ -28,6 +28,12 @@
 #include "Misc/CoreDelegates.h"
 #include "Misc/DelayedAutoRegister.h"
 #include "UObject/StrongObjectPtr.h"
+#include "Async/Async.h"
+#include "Engine/Engine.h"           // GEngine->AddOnScreenDebugMessage
+#include "HAL/FileManager.h"
+#include "Misc/DateTime.h"
+#include "Misc/FileHelper.h"
+#include "ProfilingDebugging/RealtimeGPUProfiler.h"
 
 // ---------------------------------------------------------------------------
 // Console variables
@@ -100,6 +106,55 @@ static TAutoConsoleVariable<FString> CVarSLRayRepairMotionModel(
 		});
 	}),
 	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarSLRayRepairDebug(
+	TEXT("SL.Denoiser.RayRepair.Debug"),
+	0,
+	TEXT("Debug view for the Ray Repair neural denoisers (SL.Denoiser.Method 5, 6, 7). The model still runs.\n")
+	TEXT(" 0: denoised_rgb (default)\n")
+	TEXT(" 1: denoised_rgb, plus an on-screen line saying whether the model ran this frame\n")
+	TEXT(" 2: ue_buffers ch 0-2, the noisy colour the model receives. Must look exactly like method 0; if it\n")
+	TEXT("    does not, the problem is in the pre/postprocess passes, not the network\n")
+	TEXT(" 3: ue_buffers ch 3-5, base colour. Should be clean; grain here reaches the network as noise\n")
+	TEXT(" 4: ue_buffers ch 6-8, normals (* 0.5 + 0.5)\n")
+	TEXT("Problems (wrong view size, model failed to load) are always shown on screen."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarSLRayRepairAlbedo(
+	TEXT("SL.Denoiser.RayRepair.Albedo"),
+	0,
+	TEXT("Base colour (ue_buffers ch 3-5) and normals (ch 6-8) for the Ray Repair neural denoisers on path traced frames.\n")
+	TEXT("The path tracer skips the base pass, so 0 and 1 render it once more each frame (the SLGuides custom pass).\n")
+	TEXT(" 0: first-hit diffuse colour, base colour * (1 - metallic), and shading normal. NoiseBase's albedo (default)\n")
+	TEXT(" 1: first-hit base colour and shading normal\n")
+	TEXT(" 2: the path tracer's denoiser albedo and normal. No extra pass, but mirrors take the albedo and normal of\n")
+	TEXT("    what they reflect"),
+	ECVF_RenderThreadSafe);
+
+bool SLRayRepairWantsGuidePass()
+{
+	const int32 Method = CVarSLDenoiserMethod.GetValueOnGameThread();
+	return Method >= int32(ESLDenoiserMethod::RayRepair) && Method <= int32(ESLDenoiserMethod::RayRepairMotion)
+		&& CVarSLRayRepairAlbedo.GetValueOnGameThread() != 2;
+}
+
+/** Frames to wait before the requested dump; -1 when none is requested. */
+static std::atomic<int32> GSLRayRepairDumpDelay{ -1 };
+static FAutoConsoleCommand GSLRayRepairDumpCommand(
+	TEXT("SL.Denoiser.RayRepair.Dump"),
+	TEXT("Write one frame of the active Ray Repair model's tensors (SL.Denoiser.Method 5, 6, 7) to\n")
+	TEXT("Saved/RayRepairDump/<method>_<time>/: ue_buffers, motion_px, hidden_in<i> and denoised_rgb as\n")
+	TEXT("float32 NCHW .npy files (numpy.load), plus meta.json with shapes, per-channel min/max/mean and the\n")
+	TEXT("pre-exposure. Running the same ONNX on these inputs offline must reproduce denoised_rgb.\n")
+	TEXT("Optional argument: frames to wait first (default 0)."),
+	FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
+	{
+		const int32 Delay = Args.Num() > 0 ? FMath::Max(0, FCString::Atoi(*Args[0])) : 0;
+		GSLRayRepairDumpDelay = Delay;
+		UE_LOG(LogTemp, Display, TEXT("SLDenoiser: dumping the Ray Repair tensors in %d frames"), Delay);
+	}));
+
+DECLARE_GPU_STAT_NAMED(SLRayRepair, TEXT("SL Ray Repair (pre + NNE + post)"));
 
 /** Gaussian kernel standard deviation in pixels. */
 static TAutoConsoleVariable<float> CVarSLGaussianBlurSigma(
@@ -535,7 +590,20 @@ static FDelayedAutoRegisterHelper GSLDenoiserModelLoader(EDelayedRegisterRunPhas
 {
 	FCoreDelegates::OnBeginFrame.AddLambda([]
 	{
-		SLRayRepairModels::Prepare(SLRayRepairModels::PathForMethod(CVarSLDenoiserMethod.GetValueOnGameThread()));
+		const int32 Method = CVarSLDenoiserMethod.GetValueOnGameThread();
+		SLRayRepairModels::Prepare(SLRayRepairModels::PathForMethod(Method));
+
+		// Say on screen when the selected neural method is passing the noisy frame through.
+		if (GEngine && Method >= int32(ESLDenoiserMethod::RayRepair) && Method <= int32(ESLDenoiserMethod::RayRepairMotion))
+		{
+			bool bProblem = false;
+			const FString Status = static_cast<FSLDenoiserRayRepair*>(
+				GetDenoiserForMethod(static_cast<ESLDenoiserMethod>(Method)))->GetStatus(bProblem);
+			if (!Status.IsEmpty() && (bProblem || CVarSLRayRepairDebug.GetValueOnGameThread() > 0))
+			{
+				GEngine->AddOnScreenDebugMessage(0xA014, 0.f, bProblem ? FColor::Red : FColor::Green, Status);
+			}
+		}
 	});
 	FCoreDelegates::OnPreExit.AddLambda([]
 	{
@@ -559,6 +627,161 @@ namespace SLRayRepair
 	{
 		return TEXT("[") + FString::JoinBy(Dims, TEXT(", "), [](int32 D) { return D < 0 ? FString(TEXT("?")) : FString::FromInt(D); }) + TEXT("]");
 	}
+}
+
+namespace SLRayRepairDump
+{
+	FCriticalSection LastFolderLock;
+	FString LastFolder;
+
+	/** numpy .npy, format 1.0: little-endian float32, C order. */
+	bool WriteNpy(const FString& Path, TConstArrayView<int64> Shape, TConstArrayView<float> Values)
+	{
+		FString Dims = FString::JoinBy(Shape, TEXT(", "), [](int64 D) { return LexToString(D); });
+		if (Shape.Num() == 1) Dims += TEXT(",");
+		FString Header = FString::Printf(TEXT("{'descr': '<f4', 'fortran_order': False, 'shape': (%s), }"), *Dims);
+		const int32 Unpadded = 10 + Header.Len() + 1;   // magic + version + length + header + newline
+		Header += FString::ChrN((64 - Unpadded % 64) % 64, TEXT(' ')) + TEXT("\n");
+
+		TUniquePtr<FArchive> File(IFileManager::Get().CreateFileWriter(*Path));
+		if (!File) return false;
+		uint8 Prefix[10] = { 0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0, uint8(Header.Len() & 0xFF), uint8(Header.Len() >> 8) };
+		File->Serialize(Prefix, sizeof(Prefix));
+		const FTCHARToUTF8 Utf8(*Header);
+		File->Serialize(const_cast<ANSICHAR*>(Utf8.Get()), Utf8.Length());
+		File->Serialize(const_cast<float*>(Values.GetData()), Values.Num() * sizeof(float));
+		return File->Close();
+	}
+
+	FString Number(double V)
+	{
+		return FMath::IsFinite(V) ? FString::SanitizeFloat(V) : FString(TEXT("null"));
+	}
+
+	/** {"min", "max", "mean", "nan", "inf"} over Values. Means use finite values only. */
+	FString Stats(TConstArrayView<float> Values)
+	{
+		double Min = TNumericLimits<double>::Max(), Max = -TNumericLimits<double>::Max(), Sum = 0.0;
+		int64 NaN = 0, Inf = 0, Finite = 0;
+		for (float V : Values)
+		{
+			if (FMath::IsNaN(V)) { ++NaN; continue; }
+			if (!FMath::IsFinite(V)) { ++Inf; continue; }
+			Min = FMath::Min(Min, double(V)); Max = FMath::Max(Max, double(V)); Sum += V; ++Finite;
+		}
+		if (Finite == 0) Min = Max = Sum = 0.0;
+		return FString::Printf(TEXT("{\"min\": %s, \"max\": %s, \"mean\": %s, \"nan\": %lld, \"inf\": %lld}"),
+			*Number(Min), *Number(Max), *Number(Finite ? Sum / Finite : 0.0), NaN, Inf);
+	}
+}
+
+FString FSLDenoiserRayRepair::GetLastDumpFolder()
+{
+	FScopeLock Lock(&SLRayRepairDump::LastFolderLock);
+	return SLRayRepairDump::LastFolder;
+}
+
+void FSLDenoiserRayRepair::SetStatus(const FString& NewStatus, bool bNewProblem)
+{
+	if (NewStatus == LastStatus_RenderThread) return;
+	LastStatus_RenderThread = NewStatus;
+	FScopeLock Lock(&StatusLock);
+	Status = NewStatus;
+	bStatusProblem = bNewProblem;
+}
+
+void FSLDenoiserRayRepair::QueueDump(FRDGBuilder& GraphBuilder, TArray<FDumpTensor>&& Tensors,
+	TConstArrayView<FRDGBufferRef> Buffers, FRDGBufferRef ViewInfoBuffer, const FString& Meta)
+{
+	check(Tensors.Num() == Buffers.Num());
+	for (int32 i = 0; i < Tensors.Num(); ++i)
+	{
+		FDumpTensor& T = Tensors[i];
+		T.NumBytes = static_cast<uint32>(Buffers[i]->Desc.GetSize());
+		T.Readback = MakeUnique<FRHIGPUBufferReadback>(FName(*(TEXT("SLRayRepairDump.") + T.TensorName)));
+		AddEnqueueCopyPass(GraphBuilder, T.Readback.Get(), Buffers[i], T.NumBytes);
+	}
+	PendingViewInfo = MakeUnique<FRHIGPUBufferReadback>(TEXT("SLRayRepairDump.ViewInfo"));
+	AddEnqueueCopyPass(GraphBuilder, PendingViewInfo.Get(), ViewInfoBuffer, 2 * sizeof(float));
+	PendingDump = MoveTemp(Tensors);
+	PendingDumpMeta = Meta;
+	PendingDumpFolder = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("RayRepairDump")
+		/ FString::Printf(TEXT("%s_%s"), *Name, *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"))));
+}
+
+void FSLDenoiserRayRepair::PollDump()
+{
+	if (PendingDump.IsEmpty() || !PendingViewInfo->IsReady()) return;
+	for (const FDumpTensor& T : PendingDump)
+	{
+		if (!T.Readback->IsReady()) return;
+	}
+
+	struct FData { FString TensorName; TArray<int64> Shape; TArray<float> Values; };
+	TArray<FData> Data;
+	for (FDumpTensor& T : PendingDump)
+	{
+		FData& D = Data.AddDefaulted_GetRef();
+		D.TensorName = T.TensorName;
+		D.Shape = T.Shape;
+		D.Values.SetNumUninitialized(T.NumBytes / sizeof(float));
+		FMemory::Memcpy(D.Values.GetData(), T.Readback->Lock(T.NumBytes), T.NumBytes);
+		T.Readback->Unlock();
+	}
+	float ViewInfo[2];
+	FMemory::Memcpy(ViewInfo, PendingViewInfo->Lock(sizeof(ViewInfo)), sizeof(ViewInfo));
+	PendingViewInfo->Unlock();
+	PendingDump.Reset();
+	PendingViewInfo.Reset();
+
+	const FString Meta = PendingDumpMeta + FString::Printf(TEXT(",\n  \"pre_exposure\": %s"), *SLRayRepairDump::Number(ViewInfo[0]));
+	// Writing ~200 MB takes a moment; do it off the render thread.
+	AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [Folder = PendingDumpFolder, Meta, Data = MoveTemp(Data), LogName = Name]()
+	{
+		IFileManager::Get().MakeDirectory(*Folder, true);
+		FString Tensors;
+		bool bOk = true;
+		for (const FData& D : Data)
+		{
+			bOk &= SLRayRepairDump::WriteNpy(Folder / (D.TensorName + TEXT(".npy")), D.Shape, D.Values);
+
+			// Per-channel statistics for the image tensors, whole-tensor for the hidden state.
+			FString Channels;
+			const int64 C = D.Shape.Num() == 4 ? D.Shape[1] : 1;
+			const int64 Plane = D.Values.Num() / FMath::Max<int64>(C, 1);
+			if (C <= 10)
+			{
+				for (int64 c = 0; c < C; ++c)
+				{
+					const FString Stat = SLRayRepairDump::Stats(TConstArrayView<float>(D.Values.GetData() + c * Plane, Plane));
+					Channels += (c ? TEXT(", ") : TEXT("")) + Stat;
+					UE_LOG(LogTemp, Display, TEXT("SLDenoiser%s dump: %s ch %lld %s"), *LogName, *D.TensorName, c, *Stat);
+				}
+			}
+			const FString All = SLRayRepairDump::Stats(D.Values);
+			if (C > 10) UE_LOG(LogTemp, Display, TEXT("SLDenoiser%s dump: %s %s"), *LogName, *D.TensorName, *All);
+			Tensors += FString::Printf(TEXT("%s\n    \"%s\": {\"file\": \"%s.npy\", \"shape\": [%s], \"all\": %s%s}"),
+				Tensors.IsEmpty() ? TEXT("") : TEXT(","), *D.TensorName, *D.TensorName,
+				*FString::JoinBy(D.Shape, TEXT(", "), [](int64 V) { return LexToString(V); }), *All,
+				Channels.IsEmpty() ? TEXT("") : *(TEXT(", \"channels\": [") + Channels + TEXT("]")));
+		}
+		const FString Json = TEXT("{\n") + Meta + TEXT(",\n  \"layout\": \"float32 little-endian NCHW; element (c, y, x) at c*H*W + y*W + x. ")
+			TEXT("ue_buffers ch 0-2 = scene colour * pre_exposure (linear, before tonemapping), 3-5 base colour, ")
+			TEXT("6-8 normal, 9 depth (see SLRayRepairPreprocess.usf); motion_px = previous minus current pixel position, ")
+			TEXT("x right, y down; hidden_in<i> = the recurrent state this frame received (zeros after a reset)\",\n  \"tensors\": {")
+			+ Tensors + TEXT("\n  }\n}\n");
+		bOk &= FFileHelper::SaveStringToFile(Json, *(Folder / TEXT("meta.json")));
+		UE_LOG(LogTemp, Display, TEXT("SLDenoiser%s: %s the tensor dump to %s"), *LogName, bOk ? TEXT("wrote") : TEXT("FAILED to write"), *Folder);
+		{
+			FScopeLock Lock(&SLRayRepairDump::LastFolderLock);
+			SLRayRepairDump::LastFolder = bOk ? Folder : FString();
+		}
+		AsyncTask(ENamedThreads::GameThread, [Folder, bOk]
+		{
+			if (GEngine) GEngine->AddOnScreenDebugMessage(0xA015, 10.f, bOk ? FColor::Green : FColor::Red,
+				FString::Printf(TEXT("Ray Repair tensor dump %s %s"), bOk ? TEXT("written to") : TEXT("FAILED:"), *Folder));
+		});
+	});
 }
 
 bool FSLDenoiserRayRepair::LoadModel(const FString& ModelPath, UNNEModelData* ModelData)
@@ -727,6 +950,7 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 {
 	const FScreenPassTexture& Input = Context.SceneColor;
 	if (!Input.IsValid()) return Input;
+	PollDump();
 
 	// 0. Load the model and create the instance once (again if the asset path changes)
 	const FString ModelPath = GetModelPath();
@@ -741,6 +965,7 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 				UE_LOG(LogTemp, Display, TEXT("SLDenoiser%s: waiting for %s to load; passing through"), *Name, *ModelPath);
 				WaitingPath = ModelPath;
 			}
+			SetStatus(FString::Printf(TEXT("%s: loading %s; showing the noisy frame"), *Name, *ModelPath), false);
 			return Input;
 		}
 		WaitingPath.Reset();
@@ -750,7 +975,11 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 		bLoadFailed = !LoadModel(ModelPath, *ModelData);
 		LastWarnedSize = FIntPoint::ZeroValue;
 	}
-	if (bLoadFailed || !ModelInstance.IsValid()) return Input;
+	if (bLoadFailed || !ModelInstance.IsValid())
+	{
+		SetStatus(FString::Printf(TEXT("%s: could not load %s (see the log); showing the noisy frame"), *Name, *ModelPath), true);
+		return Input;
+	}
 
 	// Dynamic models follow the view rect; static exports must match it exactly.
 	const FIntRect ViewRect = Input.ViewRect;
@@ -767,6 +996,9 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 					*Name, ViewRect.Width(), ViewRect.Height(), TensorSize.X, TensorSize.Y);
 				LastWarnedSize = ViewRect.Size();
 			}
+			SetStatus(FString::Printf(TEXT("%s is NOT running: the view is %dx%d but the model only runs at %dx%d, so this is the noisy frame.\n")
+				TEXT("Play in a New Editor Window or Standalone Game and enter r.SetRes %dx%dw (PIE in the viewport cannot change size)."),
+				*Name, ViewRect.Width(), ViewRect.Height(), TensorSize.X, TensorSize.Y, TensorSize.X, TensorSize.Y), true);
 			return Input;
 		}
 	}
@@ -774,9 +1006,11 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 	if (!Context.SceneTextures.SceneTextures)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("SLDenoiser%s: scene textures unavailable; passing through"), *Name);
+		SetStatus(FString::Printf(TEXT("%s: scene textures unavailable; showing the noisy frame"), *Name), true);
 		return Input;
 	}
 
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, SLRayRepair, "SLRayRepair %s", *Name);
 	const ERHIFeatureLevel::Type FeatureLevel = View.FeatureLevel;
 	const uint32 Plane = static_cast<uint32>(TensorSize.X) * static_cast<uint32>(TensorSize.Y);
 	const FUintVector2 ViewRectMin(static_cast<uint32>(ViewRect.Min.X), static_cast<uint32>(ViewRect.Min.Y));
@@ -788,9 +1022,13 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 	TArray<UE::NNE::FTensorBindingRDG> OutputBindings;
 	OutputBindings.SetNum(NumOutputs);
 
+	// Guide textures are view-rect sized; use one only if it covers the tensor.
+	auto Fits = [&](FRDGTextureRef T) { return T && T->Desc.Extent.X >= TensorSize.X && T->Desc.Extent.Y >= TensorSize.Y; };
+
 	// 1. Preprocess: scene color + decoded G-Buffer -> ue_buffers [1, 10, H, W]
 	FRDGBufferRef InputTensorBuffer = GraphBuilder.CreateBuffer(
 		FRDGBufferDesc::CreateBufferDesc(sizeof(float), GSLRayRepairRawChannels * Plane), TEXT("RayRepair.UEBuffers"));
+	FRDGBufferRef ViewInfoBuffer = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateBufferDesc(sizeof(float), 2), TEXT("RayRepair.ViewInfo"));
 	{
 		FSLRayRepairPreprocessCS::FParameters* Params = GraphBuilder.AllocParameters<FSLRayRepairPreprocessCS::FParameters>();
 		Params->View              = View.ViewUniformBuffer;
@@ -799,7 +1037,38 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 		Params->ViewRectMin       = ViewRectMin;
 		Params->TensorSize        = TensorSizeU;
 		Params->InputEncoding     = static_cast<uint32>(Encoding);
+		// Path traced frames have no G-Buffer. Take base colour and normals from the SLGuides base pass,
+		// else from the path tracer's own guides (SL.Denoiser.RayRepair.Albedo).
+		const int32 AlbedoMode = CVarSLRayRepairAlbedo.GetValueOnRenderThread();
+		FRDGTextureRef GuideAlbedo = nullptr, GuideNormal = nullptr;
+		if (AlbedoMode != 2 && Fits(Context.GuideNormalDepth) && Fits(Context.GuideDiffuse) && Fits(Context.GuideBaseColor))
+		{
+			GuideAlbedo = AlbedoMode == 1 ? Context.GuideBaseColor : Context.GuideDiffuse;
+			GuideNormal = Context.GuideNormalDepth;
+			GuideSource = AlbedoMode == 1 ? TEXT("base colour, base pass") : TEXT("diffuse colour, base pass");
+		}
+		else if (Fits(Context.PathTracerAlbedo) && Fits(Context.PathTracerNormal))
+		{
+			GuideAlbedo = Context.PathTracerAlbedo;
+			GuideNormal = Context.PathTracerNormal;
+			GuideSource = AlbedoMode == 2 ? TEXT("path tracer albedo") : TEXT("path tracer albedo (base pass guides missing)");
+		}
+		else
+		{
+			GuideSource = View.Family->EngineShowFlags.PathTracing ? TEXT("EMPTY G-Buffer (no guides)") : TEXT("G-Buffer");
+		}
+		FRDGTextureRef Black = GSystemTextures.GetBlackDummy(GraphBuilder);
+		Params->GuideAlbedo = GuideAlbedo ? GuideAlbedo : Black;
+		Params->GuideNormal = GuideNormal ? GuideNormal : Black;
+		Params->UseGuides   = GuideAlbedo ? 1u : 0u;
+		if (!GuideAlbedo && View.Family->EngineShowFlags.PathTracing && !bWarnedNoGuides)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("SLDenoiser%s: path traced frame without base pass or path tracer guides; ")
+				TEXT("base colour and normals come from the empty G-Buffer"), *Name);
+			bWarnedNoGuides = true;
+		}
 		Params->OutputTensor      = GraphBuilder.CreateUAV(InputTensorBuffer, PF_R32_FLOAT);
+		Params->ViewInfo          = GraphBuilder.CreateUAV(ViewInfoBuffer, PF_R32_FLOAT);
 
 		TShaderMapRef<FSLRayRepairPreprocessCS> ComputeShader(GetGlobalShaderMap(FeatureLevel));
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("%sPreprocess", *Name), ComputeShader, Params, GroupCount);
@@ -807,6 +1076,7 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 	InputBindings[BuffersInput].Buffer = InputTensorBuffer;
 
 	// 1b. motion_px [1, 2, H, W]: previous minus current pixel position
+	FRDGBufferRef MotionTensorBuffer = nullptr;
 	if (MotionInput != INDEX_NONE)
 	{
 		FRDGBufferRef MotionBuffer = GraphBuilder.CreateBuffer(
@@ -816,11 +1086,25 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 		Params->SceneTextures = Context.SceneTextures;
 		Params->ViewRectMin   = ViewRectMin;
 		Params->TensorSize    = TensorSizeU;
+		// Clip space to last frame's clip space, from this pass's own record of the camera. Doubles, then one
+		// cast of the (well-conditioned) product, so large world coordinates do not lose precision.
+		const FViewMatrices& Matrices = View.ViewMatrices;
+		const FMatrix ViewProjection = Matrices.GetWorldToView() * Matrices.GetViewToClipNoAA();
+		const bool bHavePrevCamera = PrevCameraFrame + 1 == View.Family->FrameNumber && PrevCameraViewKey == View.GetViewKey();
+		Params->ClipToPrevClip = FMatrix44f(bHavePrevCamera ? ViewProjection.Inverse() * PrevViewProjection : FMatrix::Identity);
+		Params->UseVelocity    = View.Family->EngineShowFlags.PathTracing ? 0u : 1u;
+		const bool bGuideMotion = Fits(Context.GuideMotion);
+		Params->GuideMotion    = bGuideMotion ? Context.GuideMotion : GSystemTextures.GetBlackDummy(GraphBuilder);
+		Params->UseGuideMotion = bGuideMotion ? 1u : 0u;
+		PrevViewProjection = ViewProjection;
+		PrevCameraFrame    = View.Family->FrameNumber;
+		PrevCameraViewKey  = View.GetViewKey();
 		Params->OutputTensor  = GraphBuilder.CreateUAV(MotionBuffer, PF_R32_FLOAT);
 
 		TShaderMapRef<FSLRayRepairMotionCS> ComputeShader(GetGlobalShaderMap(FeatureLevel));
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("%sMotion", *Name), ComputeShader, Params, GroupCount);
 		InputBindings[MotionInput].Buffer = MotionBuffer;
+		MotionTensorBuffer = MotionBuffer;
 	}
 
 	// 1c. Recurrent state: last frame's hidden_out, or zeros when there is no usable history.
@@ -829,7 +1113,7 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 	const uint32 ViewKey = View.GetViewKey();
 	const bool bResetHistory = !Hidden.IsEmpty() && (History.Num() != Hidden.Num() || View.bCameraCut
 		|| HistoryFrame + 1 != FrameNumber || HistoryViewKey != ViewKey);
-	TArray<FRDGBufferRef, TInlineAllocator<8>> HiddenOut;
+	TArray<FRDGBufferRef, TInlineAllocator<8>> HiddenIn, HiddenOut;
 	for (int32 h = 0; h < Hidden.Num(); ++h)
 	{
 		const FRDGBufferDesc Desc = FRDGBufferDesc::CreateBufferDesc(sizeof(float), static_cast<uint32>(Hidden[h].NumFloats));
@@ -844,6 +1128,7 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 			In = GraphBuilder.RegisterExternalBuffer(History[h], TEXT("RayRepair.HiddenIn"));
 		}
 		InputBindings[Hidden[h].InputIndex].Buffer = In;
+		HiddenIn.Add(In);
 
 		FRDGBufferRef Out = GraphBuilder.CreateBuffer(Desc, TEXT("RayRepair.HiddenOut"));
 		OutputBindings[Hidden[h].OutputIndex].Buffer = Out;
@@ -858,12 +1143,60 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 	if (ModelInstance->EnqueueRDG(GraphBuilder, InputBindings, OutputBindings) != UE::NNE::EResultStatus::Ok)
 	{
 		UE_LOG(LogTemp, Error, TEXT("SLDenoiser%s: EnqueueRDG failed; passing through"), *Name);
+		SetStatus(FString::Printf(TEXT("%s: NNE EnqueueRDG failed (see the log); showing the noisy frame"), *Name), true);
 		ResetHistory();
 		return Input;
 	}
 
-	++FramesRun;
-	if (!Hidden.IsEmpty() && !bResetHistory) ++FramesWithHistory;
+	const uint32 Run = ++FramesRun;
+	const uint32 WithHistory = (!Hidden.IsEmpty() && !bResetHistory) ? ++FramesWithHistory : FramesWithHistory.load();
+	const int32 DebugView = CVarSLRayRepairDebug.GetValueOnRenderThread();
+	static const TCHAR* DebugViewNames[] = { TEXT("denoised_rgb"), TEXT("denoised_rgb"),
+		TEXT("DEBUG: input colour (ue_buffers 0-2)"), TEXT("DEBUG: base colour (ue_buffers 3-5)"), TEXT("DEBUG: normals (ue_buffers 6-8)") };
+	SetStatus(FString::Printf(TEXT("%s ran at %dx%d: %u frames%s. Albedo/normals: %s. Showing %s"), *Name, TensorSize.X, TensorSize.Y, Run,
+		Hidden.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(", recurrent state carried on %u"), WithHistory),
+		*GuideSource, DebugViewNames[FMath::Clamp(DebugView, 0, 4)]), false);
+
+	// SL.Denoiser.RayRepair.Dump: copy this frame's tensors back to the CPU (written once they arrive).
+	if (PendingDump.IsEmpty() && GSLRayRepairDumpDelay.load() >= 0 && GSLRayRepairDumpDelay.fetch_sub(1) == 0)
+	{
+		const int64 W = TensorSize.X, H = TensorSize.Y;
+		TArray<FDumpTensor> Tensors;
+		TArray<FRDGBufferRef> Buffers;
+		auto Add = [&](const FString& TensorName, TArray<int64> Shape, FRDGBufferRef Buffer)
+		{
+			FDumpTensor& T = Tensors.AddDefaulted_GetRef();
+			T.TensorName = TensorName;
+			T.Shape = MoveTemp(Shape);
+			Buffers.Add(Buffer);
+		};
+		Add(TEXT("ue_buffers"), { 1, GSLRayRepairRawChannels, H, W }, InputTensorBuffer);
+		if (MotionTensorBuffer) Add(TEXT("motion_px"), { 1, GSLRayRepairMotionChannels, H, W }, MotionTensorBuffer);
+		for (int32 h = 0; h < Hidden.Num(); ++h)
+		{
+			TArray<int64> Shape;
+			for (uint32 D : StaticInputShapes[Hidden[h].InputIndex].GetData()) Shape.Add(D);
+			Add(FString::Printf(TEXT("hidden_in%d"), h), MoveTemp(Shape), HiddenIn[h]);
+		}
+		Add(TEXT("denoised_rgb"), { 1, GSLRayRepairOutChannels, H, W }, OutputTensorBuffer);
+
+		auto CVarInt = [](const TCHAR* CVarName)
+		{
+			const IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(CVarName);
+			return Var ? Var->GetInt() : -1;
+		};
+		const FString Meta = FString::Printf(
+			TEXT("  \"method\": \"%s\",\n  \"model\": \"%s\",\n  \"frame\": %llu,\n  \"view_rect\": [%d, %d, %d, %d],\n")
+			TEXT("  \"state_reset_this_frame\": %s,\n  \"frames_run\": %u,\n  \"frames_with_history\": %u,\n")
+			TEXT("  \"r.DefaultFeature.AutoExposure\": %d,\n  \"r.EyeAdaptationQuality\": %d,\n  \"r.PathTracing.SamplesPerPixel\": %d,\n")
+			TEXT("  \"SL.Denoiser.RayRepair.Debug\": %d,\n  \"albedo_normal_source\": \"%s\""),
+			*Name, *ModelPath, (unsigned long long)FrameNumber, ViewRect.Min.X, ViewRect.Min.Y, ViewRect.Max.X, ViewRect.Max.Y,
+			(Hidden.IsEmpty() || bResetHistory) ? TEXT("true") : TEXT("false"), Run, WithHistory,
+			CVarInt(TEXT("r.DefaultFeature.AutoExposure")), CVarInt(TEXT("r.EyeAdaptationQuality")),
+			CVarInt(TEXT("r.PathTracing.SamplesPerPixel")), DebugView, *GuideSource);
+		QueueDump(GraphBuilder, MoveTemp(Tensors), Buffers, ViewInfoBuffer, Meta);
+		UE_LOG(LogTemp, Display, TEXT("SLDenoiser%s: dumping frame %llu"), *Name, (unsigned long long)FrameNumber);
+	}
 
 	// Keep this frame's hidden_out for the next frame.
 	if (!Hidden.IsEmpty())
@@ -883,10 +1216,15 @@ FScreenPassTexture FSLDenoiserRayRepair::Apply(
 	FRDGTextureRef OutputTexture = GraphBuilder.CreateTexture(OutputDesc, TEXT("RayRepair.Output"));
 	{
 		FSLRayRepairPostprocessCS::FParameters* Params = GraphBuilder.AllocParameters<FSLRayRepairPostprocessCS::FParameters>();
-		Params->InputTensor   = GraphBuilder.CreateSRV(OutputTensorBuffer, PF_R32_FLOAT);
+		// Debug views 2-4 show ue_buffers through the same pass instead of the network's output.
+		const bool bShowInput = DebugView >= 2 && DebugView <= 4;
+		Params->InputTensor   = GraphBuilder.CreateSRV(bShowInput ? InputTensorBuffer : OutputTensorBuffer, PF_R32_FLOAT);
 		Params->OutputTexture = GraphBuilder.CreateUAV(OutputTexture);
 		Params->ViewRectMin   = ViewRectMin;
 		Params->TensorSize    = TensorSizeU;
+		Params->FirstChannel  = bShowInput ? 3u * (DebugView - 2) : 0u;
+		Params->Scale         = DebugView == 4 ? 0.5f : 1.f;
+		Params->Bias          = DebugView == 4 ? 0.5f : 0.f;
 
 		TShaderMapRef<FSLRayRepairPostprocessCS> ComputeShader(GetGlobalShaderMap(FeatureLevel));
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("%sPostprocess", *Name), ComputeShader, Params, GroupCount);

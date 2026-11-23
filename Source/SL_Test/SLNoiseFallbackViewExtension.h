@@ -61,7 +61,8 @@ public:
 
 	// FSceneViewExtensionBase overrides
 	virtual void SetupView(FSceneViewFamily& InViewFamily, FSceneView& InView) override {}
-	virtual void BeginRenderViewFamily(FSceneViewFamily& InViewFamily) override {}
+	/** Requests the SLGuides base pass when a Ray Repair method needs first-hit G-Buffer data. */
+	virtual void BeginRenderViewFamily(FSceneViewFamily& InViewFamily) override;
 
 	/**
 	 * Called once per frame (render thread) when UE is deciding which
@@ -69,6 +70,9 @@ public:
 	 * EPostProcessingPass::MotionBlur so our noise fires in linear-HDR space,
 	 * before the tonemapper.
 	 */
+	/** Keeps this frame's path tracer guide buffers (albedo, normal) for the denoiser. */
+	virtual void PrePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessingInputs& Inputs) override;
+
 	virtual void SubscribeToPostProcessingPass(
 		EPostProcessingPass Pass,
 		const FSceneView& View,
@@ -78,6 +82,22 @@ public:
 private:
 	const bool bInjectNoise;
 	int32 LastExecutedMethod = INDEX_NONE;
+
+	/** Path tracer guides from PrePostProcessPass_RenderThread, for the same view and frame only (render thread). */
+	struct FPathTracerGuides
+	{
+		const FSceneView* View = nullptr;
+		uint64 Frame = 0;
+		FRDGTextureRef Albedo = nullptr;
+		FRDGTextureRef Normal = nullptr;
+	};
+	TArray<FPathTracerGuides, TInlineAllocator<2>> PathTracerGuides;
+
+	/** First-hit G-Buffer guides for path traced frames (see FSLGuideCapture). */
+	TUniquePtr<class FSLGuideCapture> GuideCapture;
+
+public:
+	virtual ~FSLNoiseFallbackViewExtension();
     TAtomic<float> ComparisonPosition{-1.f};
 	/**
 	 * The actual noise pass, executed as a post-process callback.

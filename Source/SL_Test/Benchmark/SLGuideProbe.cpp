@@ -61,7 +61,7 @@ protected:
         Frame->Number = View.Family->FrameNumber;
         Frame->Textures.Reset();
         const TCHAR* Names[] = {TEXT("SLGuides.NormalDepth"), TEXT("SLGuides.Diffuse"),
-            TEXT("SLGuides.Emission"), TEXT("SLGuides.Motion")};
+            TEXT("SLGuides.Emission"), TEXT("SLGuides.Motion"), TEXT("SLGuides.BaseColor")};
         auto* Params = GraphBuilder.AllocParameters<FSLGuidePS::FParameters>();
         Params->View = View.ViewUniformBuffer;
         Params->SceneTextures = CreateSceneTextureUniformBuffer(GraphBuilder, &View.GetSceneTextures(), View.GetFeatureLevel(), ESceneTextureSetupMode::All);
@@ -85,7 +85,7 @@ public:
     FSLGuideDenoiser(TSharedPtr<FSLGuideFrame, ESPMode::ThreadSafe> InFrame) : Frame(MoveTemp(InFrame)) {}
     virtual void AddPasses(FRDGBuilder& Graph, const FSceneView& View, const FInputs& Inputs) const override
     {
-        const bool bSameFrame = Frame->Graph == &Graph && Frame->Number == View.Family->FrameNumber && Frame->Textures.Num() == 4
+        const bool bSameFrame = Frame->Graph == &Graph && Frame->Number == View.Family->FrameNumber && Frame->Textures.Num() >= 4
             && Frame->Textures[0]->Desc.Extent == Inputs.ColorTex->Desc.Extent;
         if (!bSameFrame)
         {
@@ -117,6 +117,50 @@ private:
     mutable FSLSVGFFilter Filter;
 };
 
+namespace SLGuides
+{
+    /** Queues the SLGuides custom render pass for the family's single view, with the main view's camera. */
+    void AddPass(FSceneViewFamily& Family, FSceneViewStateInterface* ViewState, const TSharedPtr<FSLGuideFrame, ESPMode::ThreadSafe>& Frame)
+    {
+        const FSceneView& View = *Family.Views[0];
+        FSceneInterface::FCustomRenderPassRendererInput Input;
+        Input.ViewLocation = View.ViewMatrices.GetViewOrigin();
+        Input.ViewRotationMatrix = View.ViewMatrices.GetWorldToView().RemoveTranslation();
+        Input.ProjectionMatrix = View.ViewMatrices.GetViewToClip();
+        Input.ViewStateInterface = ViewState;
+        Input.EngineShowFlags.SetUnlitViewmode(false);
+        Input.CustomRenderPass = new FSLGuidePass(View.UnscaledViewRect.Size(), Frame);
+        Family.Scene->AddCustomRenderPass(&Family, Input);
+    }
+}
+
+FSLGuideCapture::FSLGuideCapture(ERHIFeatureLevel::Type FeatureLevel)
+    : Frame(MakeShared<FSLGuideFrame, ESPMode::ThreadSafe>())
+{
+    ViewState.Allocate(FeatureLevel);
+}
+
+FSLGuideCapture::~FSLGuideCapture()
+{
+    ViewState.Destroy();
+}
+
+void FSLGuideCapture::AddToViewFamily(FSceneViewFamily& Family)
+{
+    if (!Family.bIsMainViewFamily || !Family.EngineShowFlags.PathTracing || Family.Views.Num() != 1 || !Family.Scene) return;
+    SLGuides::AddPass(Family, ViewState.GetReference(), Frame);
+}
+
+bool FSLGuideCapture::GetTextures(const FRDGBuilder& GraphBuilder, uint32 FrameNumber, FSLGuideTextures& Out) const
+{
+    if (Frame->Graph != &GraphBuilder || Frame->Number != FrameNumber || Frame->Textures.Num() < 5) return false;
+    Out.NormalDepth = Frame->Textures[0];
+    Out.Diffuse     = Frame->Textures[1];
+    Out.Motion      = Frame->Textures[3];
+    Out.BaseColor   = Frame->Textures[4];
+    return true;
+}
+
 FSLGuideProbe::FSLGuideProbe(const FAutoRegister& Register, UWorld* World)
     : FWorldSceneViewExtension(Register, World), Frame(MakeShared<FSLGuideFrame, ESPMode::ThreadSafe>())
 {
@@ -139,15 +183,7 @@ void FSLGuideProbe::SetComparisonPosition(float Position)
 void FSLGuideProbe::BeginRenderViewFamily(FSceneViewFamily& Family)
 {
     if (!Family.bIsMainViewFamily || !Family.EngineShowFlags.PathTracing || Family.Views.Num() != 1) return;
-    const FSceneView& View = *Family.Views[0];
-    FSceneInterface::FCustomRenderPassRendererInput Input;
-    Input.ViewLocation = View.ViewMatrices.GetViewOrigin();
-    Input.ViewRotationMatrix = View.ViewMatrices.GetWorldToView().RemoveTranslation();
-    Input.ProjectionMatrix = View.ViewMatrices.GetViewToClip();
-    Input.ViewStateInterface = GuideViewState.GetReference();
-    Input.EngineShowFlags.SetUnlitViewmode(false);
-    Input.CustomRenderPass = new FSLGuidePass(View.UnscaledViewRect.Size(), Frame);
-    Family.Scene->AddCustomRenderPass(&Family, Input);
+    SLGuides::AddPass(Family, GuideViewState.GetReference(), Frame);
 }
 
 bool FSLGuideProbe::HasMissingInputs() const { return Frame->MissingInputs.Load(); }

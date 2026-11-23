@@ -9,6 +9,7 @@
 #include "HAL/IConsoleManager.h"
 #include "Kismet/KismetRenderingLibrary.h"
 #include "RenderUtils.h"
+#include "RenderingThread.h"
 #include "SceneView.h"
 
 static TAutoConsoleVariable<int32> CVarSLPathTracerAutoEnable(
@@ -71,6 +72,16 @@ void USLPathTracerSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void USLPathTracerSubsystem::Deinitialize()
 {
+	// Do not leave the editor viewport (or the next play session) with exposure locked by this world.
+	if (bLockedExposure)
+	{
+		if (IConsoleVariable* AutoExposureCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.DefaultFeature.AutoExposure")))
+		{
+			AutoExposureCVar->Set(1, ECVF_SetByConsole);
+		}
+		bLockedExposure = false;
+	}
+	if (NoiseFallbackViewExtension) FlushRenderingCommands();
 	NoiseFallbackViewExtension.Reset();
 	ResetViewExtension.Reset();
 
@@ -140,7 +151,7 @@ void USLPathTracerSubsystem::Tick(float DeltaTime)
 	{
 		const int32 MethodInt = CVarSLDenoiserMethod.GetValueOnGameThread();
 		
-		static int32 LastMethodInt = -1;
+		// Per world, so a new play session starts from the method it actually has.
 		if (MethodInt != LastMethodInt)
 		{
 			// NNE Candy Model requires fixed exposure since it's trained on display-referred sRGB.
@@ -148,7 +159,8 @@ void USLPathTracerSubsystem::Tick(float DeltaTime)
 			// pre-exposed SceneColor only stays on one scale frame to frame when exposure is locked too.
 			if (IConsoleVariable* AutoExposureCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.DefaultFeature.AutoExposure")))
 			{
-				AutoExposureCVar->Set(MethodInt >= 4 && MethodInt <= 7 ? 0 : 1, ECVF_SetByConsole);
+				bLockedExposure = MethodInt >= 4 && MethodInt <= 7;
+				AutoExposureCVar->Set(bLockedExposure ? 0 : 1, ECVF_SetByConsole);
 			}
 			LastMethodInt = MethodInt;
 		}
