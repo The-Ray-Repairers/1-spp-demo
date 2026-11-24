@@ -55,3 +55,17 @@ DefaultEngine.ini.bak
 Thumbs.db
 Desktop.ini
 .DS_Store
+ue-mcp.local.yml
+
+# UE MCP integration
+**/Plugins/UE_MCP_Bridge/
+ue-mcp.yml
+.ue-mcp/
+.mcp.json
+
+# Large third-party content kept local only (share outside git)
+/Content/Ft_Gothic_castle/
+/Content/AssassinGirl/
+
+# Per-run MRG config snapshots written by Scripts/mrg/render_dataset.py
+/Content/RayRepair/Cinematics/MRGConfig/Runs/

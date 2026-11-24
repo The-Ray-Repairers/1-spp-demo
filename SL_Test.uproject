@@ -17,6 +17,10 @@
 	],
 	"Plugins": [
 		{
+			"Name": "PythonScriptPlugin",
+			"Enabled": true
+		},
+		{
 			"Name": "OpenImageDenoise",
 			"Enabled": true,
 			"PlatformAllowList": ["Win64"]
@@ -28,6 +32,22 @@
 				"Win64"
 			],
 			"MarketplaceURL": "https://www.unrealengine.com/marketplace/en-US/product/nvidia-dlss"
+		},
+		{
+			"Name": "Niagara",
+			"Enabled": true
+		},
+		{
+			"Name": "PCG",
+			"Enabled": true
+		},
+		{
+			"Name": "EnhancedInput",
+			"Enabled": true
+		},
+		{
+			"Name": "GameplayAbilities",
+			"Enabled": true
 		},
 		{
 			"Name": "ModelingToolsEditorMode",
