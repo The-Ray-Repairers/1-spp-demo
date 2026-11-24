@@ -88,9 +88,11 @@ static TAutoConsoleVariable<FString> CVarSLRayRepairModel(
  * denoiser/export_onnx_ue.py (docs/UE_INTEGRATION.md), passed through
  * Scripts/replace_gridsample_onnx.py so DirectML never runs GridSample. It takes ue_buffers in the
  * NoiseBase encoding, motion_px and hidden_in0..4, and returns denoised_rgb and hidden_out0..4.
- * The colour-fixed export (..._et_1920x1080), converted the same way, is a drop-in replacement.
+ * The default is the colour-fixed export (rayrepair_energy=tile, ..._et_1920x1080). The original
+ * export (/Game/ML/rayrepair_motion_s3area_1920x1080_dmlsafe) has the same signature but darkens
+ * its output by 20-30%.
  */
-static FString GSLRayRepairMotionModelPath_RenderThread = TEXT("/Game/ML/rayrepair_motion_s3area_1920x1080_dmlsafe");
+static FString GSLRayRepairMotionModelPath_RenderThread = TEXT("/Game/ML/rayrepair_motion_s3area_et_1920x1080_dmlsafe");
 static TAutoConsoleVariable<FString> CVarSLRayRepairMotionModel(
 	TEXT("SL.Denoiser.RayRepairMotion.Model"),
 	GSLRayRepairMotionModelPath_RenderThread,
@@ -122,11 +124,12 @@ static TAutoConsoleVariable<int32> CVarSLRayRepairDebug(
 
 static TAutoConsoleVariable<int32> CVarSLRayRepairAlbedo(
 	TEXT("SL.Denoiser.RayRepair.Albedo"),
-	0,
+	1,
 	TEXT("Base colour (ue_buffers ch 3-5) and normals (ch 6-8) for the Ray Repair neural denoisers on path traced frames.\n")
 	TEXT("The path tracer skips the base pass, so 0 and 1 render it once more each frame (the SLGuides custom pass).\n")
-	TEXT(" 0: first-hit diffuse colour, base colour * (1 - metallic), and shading normal. NoiseBase's albedo (default)\n")
-	TEXT(" 1: first-hit base colour and shading normal\n")
+	TEXT(" 0: first-hit diffuse colour, base colour * (1 - metallic), and shading normal. NoiseBase's definition, but\n")
+	TEXT("    metals get albedo 0 and the model breaks down on them\n")
+	TEXT(" 1: first-hit base colour and shading normal, as neural-denoiser docs/UE_INTEGRATION.md specifies (default)\n")
 	TEXT(" 2: the path tracer's denoiser albedo and normal. No extra pass, but mirrors take the albedo and normal of\n")
 	TEXT("    what they reflect"),
 	ECVF_RenderThreadSafe);

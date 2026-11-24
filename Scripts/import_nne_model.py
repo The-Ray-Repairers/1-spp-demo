@@ -9,8 +9,9 @@ The destination folder defaults to /Game/ML and the asset name to the file name 
 Use forward slashes in the .onnx path: the commandlet unescapes backslashes.
 
 Example: the recurrent motion-aware model for SL.Denoiser.Method 7
-  .../import_nne_model.py C:/path/to/rayrepair_motion_s3area_1920x1080.onnx
-creates /Game/ML/rayrepair_motion_s3area_1920x1080, the default of SL.Denoiser.RayRepairMotion.Model.
+  .../import_nne_model.py C:/path/to/rayrepair_motion_s3area_et_1920x1080_dmlsafe.onnx
+creates /Game/ML/rayrepair_motion_s3area_et_1920x1080_dmlsafe, the default of SL.Denoiser.RayRepairMotion.Model
+(convert the export with Scripts/replace_gridsample_onnx.py first).
 """
 import os
 import sys

@@ -448,7 +448,7 @@ relevant rendering settings and restores them afterward.
 | `SL.NoiseFallback.Scale` | `1.0` | Synthetic noise intensity; `0` disables injected noise. |
 | `SL.Denoiser.Method` | `0` | Custom/debug pass: `0` none, `1` Gaussian, `2` bilateral, `3` diagnostic grid, `4` NNE Candy, `5` RayRepair (Ours), `6` NB Direct (KPN/Direct), `7` RayRepair Motion (Ours (motion)). SVGF, DLSS and OIDN use GM renderer profiles rather than this CVar. |
 | `SL.Denoiser.RayRepair.Model` | `/Game/ML/RayRepair_v1_1920x1080` | NNE model asset for Ours/method 5 (format v1 export from `export_ue.py`); changing it reloads the model. |
-| `SL.Denoiser.RayRepairMotion.Model` | `/Game/ML/rayrepair_motion_s3area_1920x1080_dmlsafe` | NNE model asset for Ours (motion)/method 7 (recurrent export from `export_onnx_ue.py`, converted with `Scripts/replace_gridsample_onnx.py`); changing it reloads the model and clears its state. |
+| `SL.Denoiser.RayRepairMotion.Model` | `/Game/ML/rayrepair_motion_s3area_et_1920x1080_dmlsafe` | NNE model asset for Ours (motion)/method 7 (recurrent export from `export_onnx_ue.py`, converted with `Scripts/replace_gridsample_onnx.py`); changing it reloads the model and clears its state. The default is the colour-fixed export; `/Game/ML/rayrepair_motion_s3area_1920x1080_dmlsafe` is the original, darker one. |
 | `SL.Denoiser.GaussianBlur.Sigma` | `1.5` | Gaussian standard deviation in pixels; larger values blur more. |
 | `SL.Denoiser.Bilateral.SigmaSpatial` | `2.0` | Bilateral spatial neighborhood scale. |
 | `SL.Denoiser.Bilateral.SigmaColor` | `0.1` | Bilateral color similarity scale; smaller values preserve edges more strongly. |
@@ -469,14 +469,22 @@ outputs are matched by name. Model assets are loaded on the game thread when the
 method is selected, then handed to the render thread.
 
 The path tracer does not run the base pass, so on path traced frames the G-Buffer
-holds no base colour, normals or velocity (base colour reads 0 everywhere). The
-pass therefore takes base colour (channels 3-5) and normals (6-8) from the path
-tracer's own guide buffers, `FPathTracingResources::Albedo` and `Normal`. These
-are the first-hit albedo and world normal Unreal's path tracing denoisers use, so
-a mirror shows the albedo of what it reflects. They need
-`r.PathTracing.OutputPostProcessResources 1`, the default. Rasterised frames (the
-software fallback) still read the G-Buffer. Depth comes from scene depth in both
-cases.
+holds no base colour, normals or velocity (base colour reads 0 everywhere). While
+method 5, 6 or 7 is active, the view extension therefore renders the main view's
+depth and base pass once more each frame. This is the same `SLGuides` custom render
+pass SVGF uses (`FSLGuideCapture` in `Benchmark/SLGuideProbe.cpp`). Base colour
+(channels 3-5), normals (6-8) and object velocity for `motion_px` come from it.
+`SL.Denoiser.RayRepair.Albedo` picks the albedo:
+
+| Value | Base colour channels | Notes |
+| --- | --- | --- |
+| `1` (default) | First-hit base colour, with the shading normal | What neural-denoiser `docs/UE_INTEGRATION.md` specifies. |
+| `0` | First-hit diffuse colour, base colour x (1 - metallic) | NoiseBase's definition of albedo, but metals get 0. On the room scene the model then breaks down on the metal cylinder and sphere. |
+| `2` | The path tracer's denoiser albedo and normal (`FPathTracingResources`) | No extra pass. These guides follow mirror reflections, so a mirror shows the albedo and normals of what it reflects. Needs `r.PathTracing.OutputPostProcessResources 1`, the default. |
+
+Rasterised frames (the software fallback) read the G-Buffer directly. Depth comes
+from scene depth in every case. The on-screen status (`SL.Denoiser.RayRepair.Debug 1`)
+and dumps (`albedo_normal_source` in `meta.json`) name the source that was used.
 
 When the pass cannot run it shows the noisy frame and says why in red on screen.
 The usual reason is a view size that a fixed-size export does not match. PIE in the
@@ -522,8 +530,8 @@ UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScr
 `motion_px` `[1,2,H,W]`, the previous pixel position minus the current one, written by
 `SLRayRepairMotion.usf`. Camera motion uses the pass's own copy of last frame's
 camera, because `View.PrevViewInfo` repeats the current camera while the world is
-paused, as it is during flythrough capture. Path traced frames have no velocity
-buffer, so objects that move are given camera motion only. It also takes five
+paused, as it is during flythrough capture. Pixels where the `SLGuides` base pass
+wrote velocity (moving objects) use that velocity instead. It also takes five
 recurrent tensors `hidden_in0..4`, and returns `hidden_out0..4` next to
 `denoised_rgb`. The pass keeps last frame's `hidden_out` in GPU buffers and binds it
 as this frame's `hidden_in`; it starts from zeros after a camera cut, a skipped
@@ -542,16 +550,18 @@ bilinear sampler and, with `--verify`, checks the result against the original on
 CPU (needs `pip install onnx onnxruntime`):
 
 ```bash
-python Scripts/replace_gridsample_onnx.py rayrepair_motion_s3area_1920x1080.onnx rayrepair_motion_s3area_1920x1080_dmlsafe.onnx --verify
-UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScriptPlugin -script="<project>/Scripts/import_nne_model.py C:/path/to/rayrepair_motion_s3area_1920x1080_dmlsafe.onnx" -unattended -nosplash
+python Scripts/replace_gridsample_onnx.py rayrepair_motion_s3area_et_1920x1080.onnx rayrepair_motion_s3area_et_1920x1080_dmlsafe.onnx --verify
+UnrealEditor-Cmd.exe SL_Test.uproject -run=pythonscript -EnablePlugins=PythonScriptPlugin -script="<project>/Scripts/import_nne_model.py C:/path/to/rayrepair_motion_s3area_et_1920x1080_dmlsafe.onnx" -unattended -nosplash
 ```
 
-The colour-fixed export (`..._et_1920x1080.onnx`) is a drop-in replacement: convert
-and import it the same way, then point `SL.Denoiser.RayRepairMotion.Model` at it.
-With `rayrepair_motion_s3area_1920x1080`, UE's `denoised_rgb` matches the ONNX run
-offline on the same dumped inputs to 2e-5. Its output is 20-30% darker than its
-input, losing the most red, at every input brightness from x0.25 to x64. That is
-the model's known colour bias, not the integration.
+The default asset is the colour-fixed export (`rayrepair_energy=tile` in its ONNX
+metadata). The original export, `/Game/ML/rayrepair_motion_s3area_1920x1080_dmlsafe`,
+has the same inputs and outputs and is still in the project. On the same room
+flythrough frame, the original model's output is 0.71/0.83/0.80 (R/G/B) of its
+input's mean brightness, at every input brightness from x0.25 to x64. That is the
+model's own colour bias, not the integration. The `_et_` model gives 0.975/0.988/0.989.
+For both, UE's `denoised_rgb` matches the ONNX run offline on the same dumped
+inputs to 5e-5.
 `SL.Denoiser.RayRepairMotion.Model` (editor context, `-RenderOffscreen -dx12`) checks
 the asset's signature and runs three recurrent frames on DirectML and on the CPU
 runtime, including one frame of far off-screen motion. `SL.Denoiser.RayRepairMotion.InGame`
